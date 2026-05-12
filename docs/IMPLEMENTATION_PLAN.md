@@ -52,6 +52,11 @@ surface.
      reaches a `BRK`/zero byte near `$5003`, suggesting the next work is to
      inspect required OS/hardware initialization state rather than just adding
      opcodes.
+   - PORTB/self-test update: `$D301` is now modeled as an I/O latch that gates
+     the hidden self-test ROM. When bit 7 is clear, the OS ROM slice normally
+     hidden behind `$D000-$D7FF` appears at `$5000-$57FF`. The boot path now
+     executes real self-test ROM bytes at `$5003` and returns to OS code; the
+     current stop is the next missing CPU opcode, `$7D` at `$C4CD`.
 
 5. Trace infrastructure.
    - Add CLI flags:

@@ -6,6 +6,10 @@ pub const DEFAULT_CART_BASE: u16 = 0xA000;
 pub const OS_ROM_BASE: u16 = 0xC000;
 pub const IO_BASE: u16 = 0xD000;
 pub const IO_SIZE: usize = 0x0800;
+pub const SELF_TEST_BASE: u16 = 0x5000;
+pub const SELF_TEST_SIZE: usize = 0x0800;
+pub const PORTB: u16 = 0xD301;
+pub const PORTB_SELF_TEST_DISABLE: u8 = 0x80;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
 pub const OSS_TYPE_15_FIXED_BASE: u16 = 0xB000;
@@ -949,6 +953,8 @@ impl Bus {
                 (value, BusRegion::Cartridge)
             } else if let Some(value) = self.io.read(address) {
                 (value, BusRegion::Io)
+            } else if let Some(value) = self.read_self_test(address) {
+                (value, BusRegion::SelfTestRom)
             } else if let Some(os_rom) = self.os_rom.as_ref() {
                 if let Some(value) = os_rom.read(address) {
                     (value, BusRegion::OsRom)
@@ -961,6 +967,8 @@ impl Bus {
         } else if let Some(os_rom) = self.os_rom.as_ref() {
             if let Some(value) = self.io.read(address) {
                 (value, BusRegion::Io)
+            } else if let Some(value) = self.read_self_test(address) {
+                (value, BusRegion::SelfTestRom)
             } else if let Some(value) = os_rom.read(address) {
                 (value, BusRegion::OsRom)
             } else {
@@ -1020,6 +1028,21 @@ impl Bus {
             });
         }
     }
+
+    fn read_self_test(&self, address: u16) -> Option<u8> {
+        if !AddressRange::with_size(SELF_TEST_BASE, SELF_TEST_SIZE)
+            .expect("valid self-test range")
+            .contains(address)
+        {
+            return None;
+        }
+        if self.io.portb() & PORTB_SELF_TEST_DISABLE != 0 {
+            return None;
+        }
+
+        let os_address = IO_BASE.wrapping_add(address - SELF_TEST_BASE);
+        self.os_rom.as_ref()?.read(os_address)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1032,6 +1055,7 @@ pub enum BusAccess {
 pub enum BusRegion {
     Ram,
     Io,
+    SelfTestRom,
     OsRom,
     Cartridge,
     CartridgeControl,
@@ -1084,6 +1108,10 @@ impl IoRegion {
         }
         self.bytes[(address - self.range.start) as usize] = value;
         true
+    }
+
+    pub fn portb(&self) -> u8 {
+        self.read(PORTB).expect("PORTB is inside I/O range")
     }
 }
 
@@ -1548,6 +1576,25 @@ mod tests {
         bus.write(0xD301, 0x7F);
         assert_eq!(bus.read(0xD301), 0x7F);
         assert_eq!(bus.read(0xD800), 0xAA);
+    }
+
+    #[test]
+    fn portb_maps_self_test_rom_from_hidden_os_slice() {
+        let mut bus = Bus::default();
+        let mut os_rom = vec![0xAA; 0x4000];
+        os_rom[0x1000] = 0x4C;
+        os_rom[0x1001] = 0x09;
+        os_rom[0x1002] = 0x50;
+        bus.map_os_rom(0xC000, os_rom).unwrap();
+
+        assert_eq!(bus.io().portb(), 0xFF);
+        assert_eq!(bus.read(0x5000), 0x00);
+        bus.write(PORTB, 0x7F);
+        assert_eq!(bus.io().portb(), 0x7F);
+        assert_eq!(bus.read(0x5000), 0x4C);
+        assert_eq!(bus.read(0x5001), 0x09);
+        assert_eq!(bus.read(0x5002), 0x50);
+        assert_eq!(bus.read(0xD000), 0xFF);
     }
 
     #[test]
