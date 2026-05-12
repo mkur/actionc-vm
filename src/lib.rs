@@ -10,6 +10,8 @@ pub const SELF_TEST_BASE: u16 = 0x5000;
 pub const SELF_TEST_SIZE: usize = 0x0800;
 pub const PORTB: u16 = 0xD301;
 pub const PORTB_SELF_TEST_DISABLE: u8 = 0x80;
+pub const ANTIC_VCOUNT: u16 = 0xD40B;
+pub const RTCLOK_LOW: u16 = 0x0014;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
 pub const OSS_TYPE_15_FIXED_BASE: u16 = 0xB000;
@@ -285,6 +287,15 @@ impl Cpu {
                 self.set_zn(self.registers.a);
                 self.cycles += 3;
             }
+            0x06 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.set_flag(StatusFlags::CARRY, value & 0x80 != 0);
+                let result = value << 1;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 5;
+            }
             0x09 => {
                 let value = self.fetch_byte(bus);
                 self.registers.a |= value;
@@ -297,6 +308,13 @@ impl Cpu {
                 self.registers.a = value << 1;
                 self.set_zn(self.registers.a);
                 self.cycles += 2;
+            }
+            0x0D => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.registers.a |= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
             }
             0x0E => {
                 let address = self.fetch_word(bus);
@@ -322,6 +340,23 @@ impl Cpu {
                 self.registers.pc = target;
                 self.cycles += 6;
             }
+            0x26 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                let carry_in = u8::from(self.flag(StatusFlags::CARRY));
+                self.set_flag(StatusFlags::CARRY, value & 0x80 != 0);
+                let result = (value << 1) | carry_in;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 5;
+            }
+            0x25 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.registers.a &= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 3;
+            }
             0x29 => {
                 let value = self.fetch_byte(bus);
                 self.registers.a &= value;
@@ -336,6 +371,24 @@ impl Cpu {
                 self.set_flag(StatusFlags::OVERFLOW, value & 0x40 != 0);
                 self.cycles += 4;
             }
+            0x2D => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.registers.a &= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
+            }
+            0x30 => {
+                self.branch(bus, self.flag(StatusFlags::NEGATIVE), 2, 3);
+            }
+            0x31 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indirect_y(bus, zp);
+                let value = bus.read(address);
+                self.registers.a &= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 5;
+            }
             0x38 => {
                 self.set_flag(StatusFlags::CARRY, true);
                 self.cycles += 2;
@@ -349,9 +402,20 @@ impl Cpu {
                 self.set_zn(result);
                 self.cycles += 5;
             }
+            0x48 => {
+                self.push(bus, self.registers.a);
+                self.cycles += 3;
+            }
             0x49 => {
                 let value = self.fetch_byte(bus);
                 self.registers.a ^= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 2;
+            }
+            0x4A => {
+                let value = self.registers.a;
+                self.set_flag(StatusFlags::CARRY, value & 0x01 != 0);
+                self.registers.a = value >> 1;
                 self.set_zn(self.registers.a);
                 self.cycles += 2;
             }
@@ -403,6 +467,13 @@ impl Cpu {
                 self.set_flag(StatusFlags::INTERRUPT_DISABLE, true);
                 self.cycles += 2;
             }
+            0x7D => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address);
+                self.adc(value);
+                self.cycles += 4;
+            }
             0x84 => {
                 let address = self.fetch_byte(bus) as u16;
                 bus.write(address, self.registers.y);
@@ -451,6 +522,11 @@ impl Cpu {
                 let address = self.indirect_y(bus, zp);
                 bus.write(address, self.registers.a);
                 self.cycles += 6;
+            }
+            0x98 => {
+                self.registers.a = self.registers.y;
+                self.set_zn(self.registers.a);
+                self.cycles += 2;
             }
             0x99 => {
                 let base = self.fetch_word(bus);
@@ -542,6 +618,14 @@ impl Cpu {
                 self.set_zn(value);
                 self.cycles += 5;
             }
+            0xB5 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                self.registers.a = value;
+                self.set_zn(value);
+                self.cycles += 4;
+            }
             0xB9 => {
                 let base = self.fetch_word(bus);
                 let address = base.wrapping_add(self.registers.y as u16);
@@ -563,6 +647,14 @@ impl Cpu {
                 let address = base.wrapping_add(self.registers.x as u16);
                 let value = bus.read(address);
                 self.registers.a = value;
+                self.set_zn(value);
+                self.cycles += 4;
+            }
+            0xBE => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.y as u16);
+                let value = bus.read(address);
+                self.registers.x = value;
                 self.set_zn(value);
                 self.cycles += 4;
             }
@@ -619,6 +711,13 @@ impl Cpu {
                 self.set_flag(StatusFlags::DECIMAL, false);
                 self.cycles += 2;
             }
+            0xD9 => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.y as u16);
+                let value = bus.read(address);
+                self.compare(self.registers.a, value);
+                self.cycles += 4;
+            }
             0xE0 => {
                 let value = self.fetch_byte(bus);
                 self.compare(self.registers.x, value);
@@ -642,8 +741,26 @@ impl Cpu {
                 self.set_zn(self.registers.x);
                 self.cycles += 2;
             }
+            0xE9 => {
+                let value = self.fetch_byte(bus);
+                self.sbc(value);
+                self.cycles += 2;
+            }
             0xEA => {
                 self.cycles += 2;
+            }
+            0xED => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.sbc(value);
+                self.cycles += 4;
+            }
+            0xEE => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address).wrapping_add(1);
+                bus.write(address, value);
+                self.set_zn(value);
+                self.cycles += 6;
             }
             0xF0 => {
                 self.branch(bus, self.flag(StatusFlags::ZERO), 2, 3);
@@ -730,6 +847,22 @@ impl Cpu {
         self.set_flag(
             StatusFlags::OVERFLOW,
             (lhs ^ result) & (value ^ result) & 0x80 != 0,
+        );
+        self.registers.a = result;
+        self.set_zn(result);
+    }
+
+    fn sbc(&mut self, value: u8) {
+        let borrow = u8::from(!self.flag(StatusFlags::CARRY));
+        let lhs = self.registers.a;
+        let result = lhs.wrapping_sub(value).wrapping_sub(borrow);
+        self.set_flag(
+            StatusFlags::CARRY,
+            (lhs as u16) >= (value as u16 + borrow as u16),
+        );
+        self.set_flag(
+            StatusFlags::OVERFLOW,
+            (lhs ^ result) & (lhs ^ value) & 0x80 != 0,
         );
         self.registers.a = result;
         self.set_zn(result);
@@ -880,6 +1013,7 @@ pub struct Bus {
     watchpoints: Vec<AddressRange>,
     events: Vec<BusEvent>,
     last_data: u8,
+    vcount: u8,
 }
 
 impl Default for Bus {
@@ -892,6 +1026,7 @@ impl Default for Bus {
             watchpoints: Vec::new(),
             events: Vec::new(),
             last_data: 0,
+            vcount: 0,
         }
     }
 }
@@ -951,7 +1086,7 @@ impl Bus {
         let (value, region) = if let Some(cartridge) = self.cartridge.as_ref() {
             if let Some(value) = cartridge.read(address) {
                 (value, BusRegion::Cartridge)
-            } else if let Some(value) = self.io.read(address) {
+            } else if let Some(value) = self.read_io(address) {
                 (value, BusRegion::Io)
             } else if let Some(value) = self.read_self_test(address) {
                 (value, BusRegion::SelfTestRom)
@@ -959,23 +1094,23 @@ impl Bus {
                 if let Some(value) = os_rom.read(address) {
                     (value, BusRegion::OsRom)
                 } else {
-                    (self.ram.read(address), BusRegion::Ram)
+                    (self.read_ram(address), BusRegion::Ram)
                 }
             } else {
-                (self.ram.read(address), BusRegion::Ram)
+                (self.read_ram(address), BusRegion::Ram)
             }
+        } else if let Some(value) = self.read_io(address) {
+            (value, BusRegion::Io)
+        } else if let Some(value) = self.read_self_test(address) {
+            (value, BusRegion::SelfTestRom)
         } else if let Some(os_rom) = self.os_rom.as_ref() {
-            if let Some(value) = self.io.read(address) {
-                (value, BusRegion::Io)
-            } else if let Some(value) = self.read_self_test(address) {
-                (value, BusRegion::SelfTestRom)
-            } else if let Some(value) = os_rom.read(address) {
+            if let Some(value) = os_rom.read(address) {
                 (value, BusRegion::OsRom)
             } else {
-                (self.ram.read(address), BusRegion::Ram)
+                (self.read_ram(address), BusRegion::Ram)
             }
         } else {
-            (self.ram.read(address), BusRegion::Ram)
+            (self.read_ram(address), BusRegion::Ram)
         };
 
         self.last_data = value;
@@ -1027,6 +1162,24 @@ impl Bus {
                 region,
             });
         }
+    }
+
+    fn read_io(&mut self, address: u16) -> Option<u8> {
+        if address == ANTIC_VCOUNT {
+            let value = self.vcount;
+            self.vcount = self.vcount.wrapping_add(1) & 0x7F;
+            return Some(value);
+        }
+
+        self.io.read(address)
+    }
+
+    fn read_ram(&mut self, address: u16) -> u8 {
+        let value = self.ram.read(address);
+        if address == RTCLOK_LOW {
+            self.ram.write(address, value.wrapping_add(1));
+        }
+        value
     }
 
     fn read_self_test(&self, address: u16) -> Option<u8> {
@@ -1598,6 +1751,29 @@ mod tests {
     }
 
     #[test]
+    fn bus_advances_antic_vcount_on_reads() {
+        let mut bus = Bus::default();
+
+        assert_eq!(bus.read(ANTIC_VCOUNT), 0x00);
+        assert_eq!(bus.read(ANTIC_VCOUNT), 0x01);
+        bus.vcount = 0x7F;
+        assert_eq!(bus.read(ANTIC_VCOUNT), 0x7F);
+        assert_eq!(bus.read(ANTIC_VCOUNT), 0x00);
+    }
+
+    #[test]
+    fn bus_advances_rtclok_low_on_reads() {
+        let mut bus = Bus::default();
+
+        assert_eq!(bus.read(RTCLOK_LOW), 0x00);
+        assert_eq!(bus.read(RTCLOK_LOW), 0x01);
+        bus.write(RTCLOK_LOW, 0xFE);
+        assert_eq!(bus.read(RTCLOK_LOW), 0xFE);
+        assert_eq!(bus.read(RTCLOK_LOW), 0xFF);
+        assert_eq!(bus.read(RTCLOK_LOW), 0x00);
+    }
+
+    #[test]
     fn bus_reads_banked_cartridge_window_without_os_overlap() {
         let image = LoadedImage::prepare(
             ImageKind::Cartridge,
@@ -1699,6 +1875,474 @@ mod tests {
         assert_eq!(bus.ram().read(0x0010), 0x42);
         assert_eq!(bus.ram().read(0x0011), 0x7F);
         assert_eq!(cpu.registers().pc, 0x0208);
+    }
+
+    #[test]
+    fn cpu_adc_absolute_x_updates_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x7F, // LDA #$7F
+                    0xA2, 0x02, // LDX #$02
+                    0x18, // CLC
+                    0x7D, 0x10, 0x03, // ADC $0310,X
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0312, 0x01);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x80);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert!(registers.status & StatusFlags::OVERFLOW.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::CARRY.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_ora_absolute_updates_accumulator_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x40, // LDA #$40
+                    0x0D, 0x20, 0x03, // ORA $0320
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0320, 0x80);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0xC0);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_rol_zero_page_rotates_through_carry() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0x38, // SEC
+                    0x26, 0x40, // ROL $40
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0040, 0x80);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(bus.ram().read(0x0040), 0x01);
+        assert!(registers.status & StatusFlags::CARRY.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_asl_zero_page_shifts_memory_left() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0x06, 0x40, // ASL $40
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0040, 0x40);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(bus.ram().read(0x0040), 0x80);
+        assert_eq!(registers.status & StatusFlags::CARRY.bits(), 0);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+    }
+
+    #[test]
+    fn cpu_inc_absolute_increments_memory() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xEE, 0x20, 0x03, // INC $0320
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0320, 0xFF);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(bus.ram().read(0x0320), 0x00);
+        assert!(registers.status & StatusFlags::ZERO.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_lsr_accumulator_shifts_right() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x01, // LDA #$01
+                    0x4A, // LSR A
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x00);
+        assert!(registers.status & StatusFlags::CARRY.bits() != 0);
+        assert!(registers.status & StatusFlags::ZERO.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_and_zero_page_updates_accumulator_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0xF0, // LDA #$F0
+                    0x25, 0x40, // AND $40
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0040, 0x80);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x80);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_and_absolute_updates_accumulator_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x0F, // LDA #$0F
+                    0x2D, 0x20, 0x03, // AND $0320
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0320, 0xF0);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x00);
+        assert!(registers.status & StatusFlags::ZERO.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_and_indirect_y_updates_accumulator_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0xF3, // LDA #$F3
+                    0xA0, 0x02, // LDY #$02
+                    0x31, 0x40, // AND ($40),Y
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0040, 0x20);
+        bus.ram_mut().write(0x0041, 0x03);
+        bus.ram_mut().write(0x0322, 0x0F);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x03);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_sbc_immediate_updates_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x80, // LDA #$80
+                    0x38, // SEC
+                    0xE9, 0x01, // SBC #$01
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x7F);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+        assert!(registers.status & StatusFlags::OVERFLOW.bits() != 0);
+        assert!(registers.status & StatusFlags::CARRY.bits() != 0);
+    }
+
+    #[test]
+    fn cpu_sbc_absolute_updates_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x10, // LDA #$10
+                    0x38, // SEC
+                    0xED, 0x20, 0x03, // SBC $0320
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0320, 0x20);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0xF0);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::CARRY.bits(), 0);
+        assert_eq!(registers.status & StatusFlags::OVERFLOW.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_bmi_branches_on_negative_flag() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x80, // LDA #$80
+                    0x30, 0x02, // BMI +2
+                    0xA9, 0x00, // skipped
+                    0xA9, 0x11, // LDA #$11
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers().a, 0x11);
+        assert_eq!(cpu.registers().pc, 0x0208);
+    }
+
+    #[test]
+    fn cpu_cmp_absolute_y_sets_compare_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x20, // LDA #$20
+                    0xA0, 0x03, // LDY #$03
+                    0xD9, 0x10, 0x03, // CMP $0310,Y
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0313, 0x20);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x20);
+        assert!(registers.status & StatusFlags::ZERO.bits() != 0);
+        assert!(registers.status & StatusFlags::CARRY.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_ldx_absolute_y_loads_indexed_value() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA0, 0x04, // LDY #$04
+                    0xBE, 0x10, 0x03, // LDX $0310,Y
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0314, 0x80);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.x, 0x80);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_lda_zero_page_x_loads_wrapped_value() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA2, 0x02, // LDX #$02
+                    0xB5, 0xFF, // LDA $FF,X
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0001, 0x44);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x44);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_tya_transfers_y_to_accumulator() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA0, 0x80, // LDY #$80
+                    0x98, // TYA
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x80);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_pha_pushes_accumulator_to_stack() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x44, // LDA #$44
+                    0x48, // PHA
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.ram().read(0x01FD), 0x44);
+        assert_eq!(cpu.registers().sp, 0xFC);
     }
 
     #[test]

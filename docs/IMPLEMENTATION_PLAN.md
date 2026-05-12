@@ -55,8 +55,13 @@ surface.
    - PORTB/self-test update: `$D301` is now modeled as an I/O latch that gates
      the hidden self-test ROM. When bit 7 is clear, the OS ROM slice normally
      hidden behind `$D000-$D7FF` appears at `$5000-$57FF`. The boot path now
-     executes real self-test ROM bytes at `$5003` and returns to OS code; the
-     current stop is the next missing CPU opcode, `$7D` at `$C4CD`.
+     executes real self-test ROM bytes at `$5003` and returns to OS code.
+   - Current boot update: added the next batch of 6502 opcodes discovered by
+     the reset path plus minimal `VCOUNT` (`$D40B`) and `RTCLOK` low-byte
+     (`$0014`) progress models. The VM now runs past the earlier unsupported
+     opcode stops; the current long-running stop is an OS poll loop around
+     `$F2FD-$F312` waiting on `$02FC` (`CH`, keyboard code) to change from
+     `$FF`.
 
 5. Trace infrastructure.
    - Add CLI flags:
