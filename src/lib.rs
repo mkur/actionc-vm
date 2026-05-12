@@ -4,7 +4,11 @@ use std::path::PathBuf;
 pub const RAM_SIZE: usize = 0x10000;
 pub const DEFAULT_CART_BASE: u16 = 0xA000;
 pub const OS_ROM_BASE: u16 = 0xC000;
+pub const IO_BASE: u16 = 0xD000;
+pub const IO_SIZE: usize = 0x0800;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
+pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
+pub const OSS_TYPE_15_FIXED_BASE: u16 = 0xB000;
 pub const CAR_HEADER_SIZE: usize = 16;
 pub const CAR_MAGIC: &[u8; 4] = b"CART";
 pub const RESET_VECTOR: u16 = 0xFFFC;
@@ -866,6 +870,7 @@ fn parse_car_container(bytes: &[u8]) -> (Option<CarHeader>, &[u8]) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bus {
     ram: Memory,
+    io: IoRegion,
     os_rom: Option<RomRegion>,
     cartridge: Option<Cartridge>,
     watchpoints: Vec<AddressRange>,
@@ -877,6 +882,7 @@ impl Default for Bus {
     fn default() -> Self {
         Self {
             ram: Memory::default(),
+            io: IoRegion::default(),
             os_rom: None,
             cartridge: None,
             watchpoints: Vec::new(),
@@ -901,6 +907,10 @@ impl Bus {
 
     pub fn os_rom(&self) -> Option<&RomRegion> {
         self.os_rom.as_ref()
+    }
+
+    pub fn io(&self) -> &IoRegion {
+        &self.io
     }
 
     pub fn add_watchpoint(&mut self, address: u16) {
@@ -937,6 +947,8 @@ impl Bus {
         let (value, region) = if let Some(cartridge) = self.cartridge.as_ref() {
             if let Some(value) = cartridge.read(address) {
                 (value, BusRegion::Cartridge)
+            } else if let Some(value) = self.io.read(address) {
+                (value, BusRegion::Io)
             } else if let Some(os_rom) = self.os_rom.as_ref() {
                 if let Some(value) = os_rom.read(address) {
                     (value, BusRegion::OsRom)
@@ -947,7 +959,9 @@ impl Bus {
                 (self.ram.read(address), BusRegion::Ram)
             }
         } else if let Some(os_rom) = self.os_rom.as_ref() {
-            if let Some(value) = os_rom.read(address) {
+            if let Some(value) = self.io.read(address) {
+                (value, BusRegion::Io)
+            } else if let Some(value) = os_rom.read(address) {
                 (value, BusRegion::OsRom)
             } else {
                 (self.ram.read(address), BusRegion::Ram)
@@ -967,6 +981,8 @@ impl Bus {
                 BusRegion::CartridgeControl
             } else if cartridge.contains(address) {
                 BusRegion::Cartridge
+            } else if self.io.write(address, value) {
+                BusRegion::Io
             } else if self
                 .os_rom
                 .as_ref()
@@ -977,6 +993,8 @@ impl Bus {
                 self.ram.write(address, value);
                 BusRegion::Ram
             }
+        } else if self.io.write(address, value) {
+            BusRegion::Io
         } else if self
             .os_rom
             .as_ref()
@@ -1013,6 +1031,7 @@ pub enum BusAccess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusRegion {
     Ram,
+    Io,
     OsRom,
     Cartridge,
     CartridgeControl,
@@ -1030,6 +1049,42 @@ pub struct BusEvent {
 pub struct RomRegion {
     range: AddressRange,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IoRegion {
+    range: AddressRange,
+    bytes: Vec<u8>,
+}
+
+impl Default for IoRegion {
+    fn default() -> Self {
+        Self {
+            range: AddressRange::with_size(IO_BASE, IO_SIZE).expect("valid I/O range"),
+            bytes: vec![0xFF; IO_SIZE],
+        }
+    }
+}
+
+impl IoRegion {
+    pub fn contains(&self, address: u16) -> bool {
+        self.range.contains(address)
+    }
+
+    pub fn read(&self, address: u16) -> Option<u8> {
+        if !self.contains(address) {
+            return None;
+        }
+        Some(self.bytes[(address - self.range.start) as usize])
+    }
+
+    pub fn write(&mut self, address: u16, value: u8) -> bool {
+        if !self.contains(address) {
+            return false;
+        }
+        self.bytes[(address - self.range.start) as usize] = value;
+        true
+    }
 }
 
 impl RomRegion {
@@ -1074,9 +1129,9 @@ impl Cartridge {
             return Err("cartridge payload is empty".to_string());
         }
 
-        let mapping = if header.is_some_and(|header| header.cartridge_type == 0x0F)
-            || payload.len() == 0x4000
-        {
+        let mapping = if header.is_some_and(|header| header.cartridge_type == 0x0F) {
+            CartridgeMapping::OssType15(OssType15Cartridge::new(base, payload)?)
+        } else if payload.len() == 0x4000 {
             CartridgeMapping::Banked8k(BankedCartridge::new(
                 base,
                 payload,
@@ -1103,6 +1158,7 @@ impl Cartridge {
                 active_bank: 0,
             },
             CartridgeMapping::Banked8k(cart) => cart.mapping_info(),
+            CartridgeMapping::OssType15(cart) => cart.mapping_info(),
         }
     }
 
@@ -1110,6 +1166,7 @@ impl Cartridge {
         match &self.mapping {
             CartridgeMapping::Linear(region) => region.contains(address),
             CartridgeMapping::Banked8k(cart) => cart.contains(address),
+            CartridgeMapping::OssType15(cart) => cart.contains(address),
         }
     }
 
@@ -1117,6 +1174,7 @@ impl Cartridge {
         match &self.mapping {
             CartridgeMapping::Linear(region) => region.read(address),
             CartridgeMapping::Banked8k(cart) => cart.read(address),
+            CartridgeMapping::OssType15(cart) => cart.read(address),
         }
     }
 
@@ -1124,6 +1182,7 @@ impl Cartridge {
         match &mut self.mapping {
             CartridgeMapping::Linear(_) => false,
             CartridgeMapping::Banked8k(cart) => cart.write_control(address, value),
+            CartridgeMapping::OssType15(cart) => cart.write_control(address, value),
         }
     }
 }
@@ -1132,6 +1191,76 @@ impl Cartridge {
 enum CartridgeMapping {
     Linear(RomRegion),
     Banked8k(BankedCartridge),
+    OssType15(OssType15Cartridge),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OssType15Cartridge {
+    bank_window: AddressRange,
+    fixed_window: AddressRange,
+    active_bank: usize,
+    payload: Vec<u8>,
+}
+
+impl OssType15Cartridge {
+    fn new(bank_window_start: u16, payload: Vec<u8>) -> Result<Self, String> {
+        if payload.len() != 0x4000 {
+            return Err(format!(
+                "OSS type 15 cartridge payload must be 16K, got {} byte(s)",
+                payload.len()
+            ));
+        }
+
+        Ok(Self {
+            bank_window: AddressRange::with_size(bank_window_start, OSS_TYPE_15_BANK_SIZE)?,
+            fixed_window: AddressRange::with_size(OSS_TYPE_15_FIXED_BASE, OSS_TYPE_15_BANK_SIZE)?,
+            active_bank: 0,
+            payload,
+        })
+    }
+
+    fn bank_count(&self) -> usize {
+        (self.payload.len() - OSS_TYPE_15_BANK_SIZE) / OSS_TYPE_15_BANK_SIZE
+    }
+
+    fn contains(&self, address: u16) -> bool {
+        self.bank_window.contains(address) || self.fixed_window.contains(address)
+    }
+
+    fn read(&self, address: u16) -> Option<u8> {
+        if self.fixed_window.contains(address) {
+            let offset = (address - self.fixed_window.start) as usize;
+            return self.payload.get(offset).copied();
+        }
+
+        if self.bank_window.contains(address) {
+            let window_offset = (address - self.bank_window.start) as usize;
+            let bank_offset =
+                OSS_TYPE_15_BANK_SIZE + self.active_bank * OSS_TYPE_15_BANK_SIZE + window_offset;
+            return self.payload.get(bank_offset).copied();
+        }
+
+        None
+    }
+
+    fn write_control(&mut self, address: u16, value: u8) -> bool {
+        if !(0xD500..=0xD5FF).contains(&address) {
+            return false;
+        }
+
+        self.active_bank = (value as usize) % self.bank_count();
+        true
+    }
+
+    fn mapping_info(&self) -> CartridgeMappingInfo {
+        CartridgeMappingInfo {
+            window_start: self.bank_window.start,
+            window_end: self.fixed_window.end,
+            bank_size: OSS_TYPE_15_BANK_SIZE,
+            bank_count: self.bank_count(),
+            active_bank: self.active_bank,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1365,7 +1494,15 @@ mod tests {
             ImageKind::Cartridge,
             PathBuf::from("action.car"),
             0xA000,
-            car_bytes(0x0F, &[0x11; 0x2000], &[0x22; 0x2000]),
+            car_bytes(
+                0x0F,
+                &[
+                    &[0x11; 0x1000],
+                    &[0x22; 0x1000],
+                    &[0x33; 0x1000],
+                    &[0x44; 0x1000],
+                ],
+            ),
         )
         .unwrap();
 
@@ -1384,8 +1521,8 @@ mod tests {
             Some(CartridgeMappingInfo {
                 window_start: 0xA000,
                 window_end: 0xBFFF,
-                bank_size: 0x2000,
-                bank_count: 2,
+                bank_size: 0x1000,
+                bank_count: 3,
                 active_bank: 0,
             })
         );
@@ -1402,24 +1539,46 @@ mod tests {
     }
 
     #[test]
+    fn bus_io_region_overrides_os_rom_hole() {
+        let mut bus = Bus::default();
+        bus.map_os_rom(0xC000, vec![0xAA; 0x4000]).unwrap();
+
+        assert_eq!(bus.read(0xCFFF), 0xAA);
+        assert_eq!(bus.read(0xD000), 0xFF);
+        bus.write(0xD301, 0x7F);
+        assert_eq!(bus.read(0xD301), 0x7F);
+        assert_eq!(bus.read(0xD800), 0xAA);
+    }
+
+    #[test]
     fn bus_reads_banked_cartridge_window_without_os_overlap() {
         let image = LoadedImage::prepare(
             ImageKind::Cartridge,
             PathBuf::from("action.car"),
             0xA000,
-            car_bytes(0x0F, &[0x11; 0x2000], &[0x22; 0x2000]),
+            car_bytes(
+                0x0F,
+                &[
+                    &[0x11; 0x1000],
+                    &[0x22; 0x1000],
+                    &[0x33; 0x1000],
+                    &[0x44; 0x1000],
+                ],
+            ),
         )
         .unwrap();
         let mut bus = Bus::default();
         bus.map_os_rom(0xC000, vec![0xCC; 0x4000]).unwrap();
         bus.install_cartridge(Cartridge::from_loaded_image(&image).unwrap());
 
-        assert_eq!(bus.read(0xA000), 0x11);
+        assert_eq!(bus.read(0xA000), 0x22);
+        assert_eq!(bus.read(0xAFFF), 0x22);
         assert_eq!(bus.read(0xBFFF), 0x11);
         assert_eq!(bus.read(0xC000), 0xCC);
 
         bus.write(0xD500, 0x01);
-        assert_eq!(bus.read(0xA000), 0x22);
+        assert_eq!(bus.read(0xA000), 0x33);
+        assert_eq!(bus.read(0xBFFF), 0x11);
         assert_eq!(bus.read(0xC000), 0xCC);
     }
 
@@ -1514,14 +1673,15 @@ mod tests {
         assert!(cpu.halted());
     }
 
-    fn car_bytes(cartridge_type: u32, bank0: &[u8], bank1: &[u8]) -> Vec<u8> {
+    fn car_bytes(cartridge_type: u32, chunks: &[&[u8]]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(CAR_MAGIC);
         bytes.extend_from_slice(&cartridge_type.to_be_bytes());
         bytes.extend_from_slice(&0x1234_5678u32.to_be_bytes());
         bytes.extend_from_slice(&[0; 4]);
-        bytes.extend_from_slice(bank0);
-        bytes.extend_from_slice(bank1);
+        for chunk in chunks {
+            bytes.extend_from_slice(chunk);
+        }
         bytes
     }
 }

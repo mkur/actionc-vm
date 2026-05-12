@@ -62,6 +62,14 @@ fn inspect(config: VmConfig) -> Result<(), String> {
             );
         }
     }
+    if let Some(cartridge) = vm.bus().cartridge() {
+        println!(
+            "visible cart vectors: INIT=${:04X} START=${:04X} FLAGS=${:04X}",
+            cart_word(cartridge, 0xBFFA),
+            cart_word(cartridge, 0xBFFC),
+            cart_word(cartridge, 0xBFFE)
+        );
+    }
     Ok(())
 }
 
@@ -375,6 +383,12 @@ fn print_step(step: &CpuStep) {
         "{:08} PC=${:04X} OP=${:02X} A=${:02X} X=${:02X} Y=${:02X} SP=${:02X} P=${:02X}",
         step.cycles, step.pc, step.opcode, regs.a, regs.x, regs.y, regs.sp, regs.status
     );
+}
+
+fn cart_word(cartridge: &action_compiler_vm::Cartridge, address: u16) -> u16 {
+    let lo = cartridge.read(address).unwrap_or(0xFF);
+    let hi = cartridge.read(address.wrapping_add(1)).unwrap_or(0xFF);
+    u16::from_le_bytes([lo, hi])
 }
 
 fn print_stop_report(
