@@ -12,6 +12,7 @@ pub const PORTB: u16 = 0xD301;
 pub const PORTB_SELF_TEST_DISABLE: u8 = 0x80;
 pub const ANTIC_VCOUNT: u16 = 0xD40B;
 pub const RTCLOK_LOW: u16 = 0x0014;
+pub const CH_KEY_CODE: u16 = 0x02FC;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
 pub const OSS_TYPE_15_FIXED_BASE: u16 = 0xB000;
@@ -339,6 +340,14 @@ impl Cpu {
                 self.set_flag(StatusFlags::CARRY, false);
                 self.cycles += 2;
             }
+            0x1D => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address);
+                self.registers.a |= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
+            }
             0x20 => {
                 let target = self.fetch_word(bus);
                 let return_address = self.registers.pc.wrapping_sub(1);
@@ -421,6 +430,14 @@ impl Cpu {
             0x38 => {
                 self.set_flag(StatusFlags::CARRY, true);
                 self.cycles += 2;
+            }
+            0x3D => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address);
+                self.registers.a &= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
             }
             0x46 => {
                 let address = self.fetch_byte(bus) as u16;
@@ -1098,6 +1115,7 @@ pub struct Bus {
     events: Vec<BusEvent>,
     last_data: u8,
     vcount: u8,
+    pending_key_code: Option<u8>,
 }
 
 impl Default for Bus {
@@ -1111,6 +1129,7 @@ impl Default for Bus {
             events: Vec::new(),
             last_data: 0,
             vcount: 0,
+            pending_key_code: None,
         }
     }
 }
@@ -1155,6 +1174,10 @@ impl Bus {
 
     pub fn clear_events(&mut self) {
         self.events.clear();
+    }
+
+    pub fn queue_key_code(&mut self, key_code: u8) {
+        self.pending_key_code = Some(key_code);
     }
 
     pub fn map_os_rom(&mut self, base: u16, bytes: Vec<u8>) -> Result<(), String> {
@@ -1259,6 +1282,12 @@ impl Bus {
     }
 
     fn read_ram(&mut self, address: u16) -> u8 {
+        if address == CH_KEY_CODE {
+            if let Some(key_code) = self.pending_key_code.take() {
+                return key_code;
+            }
+        }
+
         let value = self.ram.read(address);
         if address == RTCLOK_LOW {
             self.ram.write(address, value.wrapping_add(1));
@@ -1858,6 +1887,16 @@ mod tests {
     }
 
     #[test]
+    fn bus_returns_queued_key_code_once_from_ch() {
+        let mut bus = Bus::default();
+        bus.write(CH_KEY_CODE, 0xFF);
+        bus.queue_key_code(0x21);
+
+        assert_eq!(bus.read(CH_KEY_CODE), 0x21);
+        assert_eq!(bus.read(CH_KEY_CODE), 0xFF);
+    }
+
+    #[test]
     fn bus_reads_banked_cartridge_window_without_os_overlap() {
         let image = LoadedImage::prepare(
             ImageKind::Cartridge,
@@ -2011,6 +2050,35 @@ mod tests {
         let mut cpu = Cpu::default();
         cpu.reset(&mut bus);
 
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0xC0);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_ora_absolute_x_updates_accumulator_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x40, // LDA #$40
+                    0xA2, 0x02, // LDX #$02
+                    0x1D, 0x20, 0x03, // ORA $0320,X
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0322, 0x80);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
         cpu.step(&mut bus).unwrap();
         cpu.step(&mut bus).unwrap();
 
@@ -2247,6 +2315,35 @@ mod tests {
         let registers = cpu.registers();
         assert_eq!(registers.a, 0x03);
         assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_and_absolute_x_updates_accumulator_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0xF0, // LDA #$F0
+                    0xA2, 0x02, // LDX #$02
+                    0x3D, 0x20, 0x03, // AND $0320,X
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0322, 0x80);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x80);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
         assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
     }
 

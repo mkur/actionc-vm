@@ -58,10 +58,11 @@ surface.
      executes real self-test ROM bytes at `$5003` and returns to OS code.
    - Current boot update: added the next batch of 6502 opcodes discovered by
      the reset path plus minimal `VCOUNT` (`$D40B`) and `RTCLOK` low-byte
-     (`$0014`) progress models. The VM now runs past the earlier unsupported
-     opcode stops; the current long-running stop is an OS poll loop around
-     `$F2FD-$F312` waiting on `$02FC` (`CH`, keyboard code) to change from
-     `$FF`.
+     (`$0014`) progress models. A queued keyboard-code option (`--key-code`)
+     now lets the OS poll at `$F2FD-$F312` observe `$02FC` (`CH`) changing from
+     `$FF`; with `--key-code $21`, execution reaches Action! cartridge code and
+     currently spends the long run window in a cartridge loop around
+     `$532A-$532F`.
 
 5. Trace infrastructure.
    - Add CLI flags:

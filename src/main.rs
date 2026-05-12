@@ -83,6 +83,9 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     for watch_range in &options.watch_ranges {
         vm.bus_mut().add_watch_range(*watch_range);
     }
+    if let Some(key_code) = options.key_code {
+        vm.bus_mut().queue_key_code(key_code);
+    }
     vm.reset_cpu();
     println!(
         "compiler VM loaded {} image(s); reset PC=${:04X}",
@@ -162,6 +165,7 @@ struct CliOptions {
     history_len: usize,
     watchpoints: Vec<u16>,
     watch_ranges: Vec<AddressRange>,
+    key_code: Option<u8>,
 }
 
 impl Default for CliOptions {
@@ -175,6 +179,7 @@ impl Default for CliOptions {
             history_len: 64,
             watchpoints: Vec::new(),
             watch_ranges: Vec::new(),
+            key_code: None,
         }
     }
 }
@@ -194,6 +199,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut history_len = 64;
     let mut watchpoints = Vec::new();
     let mut watch_ranges = Vec::new();
+    let mut key_code = None;
     let mut index = 0;
 
     while index < args.len() {
@@ -234,6 +240,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 index += 1;
                 let value = required_value(&args, index, "--watch-range")?;
                 watch_ranges.push(parse_range(value)?);
+            }
+            "--key-code" => {
+                index += 1;
+                let value = required_value(&args, index, "--key-code")?;
+                key_code = Some(parse_byte(value)?);
             }
             "--preset" => {
                 index += 1;
@@ -284,6 +295,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         history_len,
         watchpoints,
         watch_ranges,
+        key_code,
     })
 }
 
@@ -334,6 +346,11 @@ fn parse_address(value: &str) -> Result<u16, String> {
     };
 
     parsed.map_err(|_| format!("invalid address `{value}`"))
+}
+
+fn parse_byte(value: &str) -> Result<u8, String> {
+    let parsed = parse_address(value)?;
+    u8::try_from(parsed).map_err(|_| format!("byte value `{value}` is outside $00-$FF"))
 }
 
 fn parse_range(value: &str) -> Result<AddressRange, String> {
@@ -471,7 +488,27 @@ fn print_help() {
          --history <n>        Recent instruction count in stop reports, default 64\n  \
          --watch <addr>       Record bus reads/writes at addr\n  \
          --watch-range <a:b>  Record bus reads/writes inside the range\n  \
+         --key-code <byte>    Queue one Atari keyboard code for CH ($02FC)\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_key_code_option() {
+        let options = parse_options(vec!["--key-code".to_string(), "$21".to_string()]).unwrap();
+
+        assert_eq!(options.key_code, Some(0x21));
+    }
+
+    #[test]
+    fn rejects_out_of_range_key_code() {
+        let err = parse_options(vec!["--key-code".to_string(), "$100".to_string()]).unwrap_err();
+
+        assert!(err.contains("outside $00-$FF"));
+    }
 }
