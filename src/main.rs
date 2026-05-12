@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use action_compiler_vm::{ACTION_OS_PRESET, ImageKind, VmConfig};
+use action_compiler_vm::{ACTION_OS_PRESET, CpuError, CpuStep, ImageKind, VmConfig};
 
 fn main() {
     if let Err(err) = run() {
@@ -22,7 +22,7 @@ fn run() -> Result<(), String> {
             print_help();
             Ok(())
         }
-        "inspect" => inspect(parse_options(args.collect())?),
+        "inspect" => inspect(parse_options(args.collect())?.config),
         "run" => run_vm(parse_options(args.collect())?),
         other => Err(format!("unknown command `{other}`")),
     }
@@ -61,22 +61,86 @@ fn inspect(config: VmConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn run_vm(config: VmConfig) -> Result<(), String> {
+fn run_vm(options: CliOptions) -> Result<(), String> {
+    let config = options.config;
     config.validate_for_execution()?;
-    let vm = config.load()?;
+    let mut vm = config.load()?;
+    for watchpoint in options.watchpoints {
+        vm.bus_mut().add_watchpoint(watchpoint);
+    }
+    vm.reset_cpu();
     println!(
-        "compiler VM skeleton loaded {} image(s); CPU execution is not implemented yet",
-        vm.images().len()
+        "compiler VM loaded {} image(s); reset PC=${:04X}",
+        vm.images().len(),
+        vm.cpu().registers().pc
+    );
+
+    for _ in 0..options.max_steps {
+        match vm.step_cpu() {
+            Ok(step) => {
+                if options.trace_pc {
+                    print_step(&step);
+                }
+            }
+            Err(CpuError::UnsupportedOpcode { pc, opcode }) => {
+                return Err(format!("unsupported opcode ${opcode:02X} at ${pc:04X}"));
+            }
+            Err(CpuError::Halted) => return Err("CPU halted".to_string()),
+        }
+    }
+
+    println!(
+        "stopped after {} step(s), cycles={}, PC=${:04X}",
+        options.max_steps,
+        vm.cpu().cycles(),
+        vm.cpu().registers().pc
     );
     Ok(())
 }
 
-fn parse_options(args: Vec<String>) -> Result<VmConfig, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliOptions {
+    config: VmConfig,
+    max_steps: u64,
+    trace_pc: bool,
+    watchpoints: Vec<u16>,
+}
+
+impl Default for CliOptions {
+    fn default() -> Self {
+        Self {
+            config: VmConfig::default(),
+            max_steps: 1_000,
+            trace_pc: false,
+            watchpoints: Vec::new(),
+        }
+    }
+}
+
+fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut config = VmConfig::default();
+    let mut max_steps = 1_000;
+    let mut trace_pc = false;
+    let mut watchpoints = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
         match args[index].as_str() {
+            "--max-cycles" | "--max-steps" => {
+                index += 1;
+                let value = required_value(&args, index, "--max-cycles")?;
+                max_steps = value
+                    .parse()
+                    .map_err(|_| format!("invalid max step count `{value}`"))?;
+            }
+            "--trace-pc" => {
+                trace_pc = true;
+            }
+            "--watch" => {
+                index += 1;
+                let address = required_value(&args, index, "--watch").and_then(parse_address)?;
+                watchpoints.push(address);
+            }
             "--preset" => {
                 index += 1;
                 let value = required_value(&args, index, "--preset")?;
@@ -117,7 +181,12 @@ fn parse_options(args: Vec<String>) -> Result<VmConfig, String> {
         index += 1;
     }
 
-    Ok(config)
+    Ok(CliOptions {
+        config,
+        max_steps,
+        trace_pc,
+        watchpoints,
+    })
 }
 
 fn apply_preset(config: &mut VmConfig, value: &str) -> Result<(), String> {
@@ -169,6 +238,14 @@ fn parse_address(value: &str) -> Result<u16, String> {
     parsed.map_err(|_| format!("invalid address `{value}`"))
 }
 
+fn print_step(step: &CpuStep) {
+    let regs = step.registers_before;
+    println!(
+        "{:08} PC=${:04X} OP=${:02X} A=${:02X} X=${:02X} Y=${:02X} SP=${:02X} P=${:02X}",
+        step.cycles, step.pc, step.opcode, regs.a, regs.x, regs.y, regs.sp, regs.status
+    );
+}
+
 fn print_help() {
     println!(
         "action-compiler-vm\n\n\
@@ -181,6 +258,9 @@ fn print_help() {
          --cart-base <addr>   Cartridge base address, default $A000\n  \
          --os <path>          Load an Atari OS ROM image at $C000\n  \
          --os-base <addr>     OS ROM base address, default $C000\n  \
+         --max-cycles <n>     Run at most n CPU steps, default 1000\n  \
+         --trace-pc           Print one line per executed instruction\n  \
+         --watch <addr>       Reserved for bus watchpoints\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );

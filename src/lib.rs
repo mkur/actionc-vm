@@ -7,6 +7,7 @@ pub const OS_ROM_BASE: u16 = 0xC000;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const CAR_HEADER_SIZE: usize = 16;
 pub const CAR_MAGIC: &[u8; 4] = b"CART";
+pub const RESET_VECTOR: u16 = 0xFFFC;
 pub const ACTION_OS_PRESET: MappingPreset = MappingPreset {
     name: "action-os",
     cartridge_base: DEFAULT_CART_BASE,
@@ -149,6 +150,7 @@ pub struct CompilerVm {
     bus: Bus,
     images: Vec<LoadedImage>,
     source: Option<Vec<u8>>,
+    cpu: Cpu,
 }
 
 impl Default for CompilerVm {
@@ -157,6 +159,7 @@ impl Default for CompilerVm {
             bus: Bus::default(),
             images: Vec::new(),
             source: None,
+            cpu: Cpu::default(),
         }
     }
 }
@@ -182,6 +185,22 @@ impl CompilerVm {
         self.source.as_deref()
     }
 
+    pub fn cpu(&self) -> &Cpu {
+        &self.cpu
+    }
+
+    pub fn cpu_mut(&mut self) -> &mut Cpu {
+        &mut self.cpu
+    }
+
+    pub fn reset_cpu(&mut self) {
+        self.cpu.reset(&mut self.bus);
+    }
+
+    pub fn step_cpu(&mut self) -> Result<CpuStep, CpuError> {
+        self.cpu.step(&mut self.bus)
+    }
+
     fn load_image(&mut self, kind: ImageKind, path: PathBuf, base: u16) -> Result<(), String> {
         let bytes = fs::read(&path)
             .map_err(|err| format!("failed to read image `{}`: {err}", path.display()))?;
@@ -195,6 +214,590 @@ impl CompilerVm {
         }
         self.images.push(image);
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cpu {
+    registers: CpuRegisters,
+    cycles: u64,
+    halted: bool,
+}
+
+impl Default for Cpu {
+    fn default() -> Self {
+        Self {
+            registers: CpuRegisters::default(),
+            cycles: 0,
+            halted: false,
+        }
+    }
+}
+
+impl Cpu {
+    pub fn registers(&self) -> CpuRegisters {
+        self.registers
+    }
+
+    pub fn cycles(&self) -> u64 {
+        self.cycles
+    }
+
+    pub fn halted(&self) -> bool {
+        self.halted
+    }
+
+    pub fn reset(&mut self, bus: &mut Bus) {
+        let lo = bus.read(RESET_VECTOR);
+        let hi = bus.read(RESET_VECTOR.wrapping_add(1));
+        self.registers = CpuRegisters {
+            pc: u16::from_le_bytes([lo, hi]),
+            sp: 0xFD,
+            status: StatusFlags::INTERRUPT_DISABLE.bits() | StatusFlags::UNUSED.bits(),
+            ..CpuRegisters::default()
+        };
+        self.cycles = 7;
+        self.halted = false;
+    }
+
+    pub fn step(&mut self, bus: &mut Bus) -> Result<CpuStep, CpuError> {
+        if self.halted {
+            return Err(CpuError::Halted);
+        }
+
+        let pc = self.registers.pc;
+        let registers_before = self.registers;
+        let opcode = self.fetch_byte(bus);
+
+        match opcode {
+            0x05 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.registers.a |= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 3;
+            }
+            0x09 => {
+                let value = self.fetch_byte(bus);
+                self.registers.a |= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 2;
+            }
+            0x0A => {
+                let value = self.registers.a;
+                self.set_flag(StatusFlags::CARRY, value & 0x80 != 0);
+                self.registers.a = value << 1;
+                self.set_zn(self.registers.a);
+                self.cycles += 2;
+            }
+            0x0E => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.set_flag(StatusFlags::CARRY, value & 0x80 != 0);
+                let result = value << 1;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 6;
+            }
+            0x10 => {
+                self.branch(bus, !self.flag(StatusFlags::NEGATIVE), 2, 3);
+            }
+            0x18 => {
+                self.set_flag(StatusFlags::CARRY, false);
+                self.cycles += 2;
+            }
+            0x20 => {
+                let target = self.fetch_word(bus);
+                let return_address = self.registers.pc.wrapping_sub(1);
+                self.push(bus, (return_address >> 8) as u8);
+                self.push(bus, return_address as u8);
+                self.registers.pc = target;
+                self.cycles += 6;
+            }
+            0x29 => {
+                let value = self.fetch_byte(bus);
+                self.registers.a &= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 2;
+            }
+            0x2C => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.set_flag(StatusFlags::ZERO, self.registers.a & value == 0);
+                self.set_flag(StatusFlags::NEGATIVE, value & 0x80 != 0);
+                self.set_flag(StatusFlags::OVERFLOW, value & 0x40 != 0);
+                self.cycles += 4;
+            }
+            0x38 => {
+                self.set_flag(StatusFlags::CARRY, true);
+                self.cycles += 2;
+            }
+            0x46 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.set_flag(StatusFlags::CARRY, value & 0x01 != 0);
+                let result = value >> 1;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 5;
+            }
+            0x49 => {
+                let value = self.fetch_byte(bus);
+                self.registers.a ^= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 2;
+            }
+            0x4C => {
+                let target = self.fetch_word(bus);
+                self.registers.pc = target;
+                self.cycles += 3;
+            }
+            0x58 => {
+                self.set_flag(StatusFlags::INTERRUPT_DISABLE, false);
+                self.cycles += 2;
+            }
+            0x60 => {
+                let lo = self.pop(bus);
+                let hi = self.pop(bus);
+                self.registers.pc = u16::from_le_bytes([lo, hi]).wrapping_add(1);
+                self.cycles += 6;
+            }
+            0x65 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.adc(value);
+                self.cycles += 3;
+            }
+            0x69 => {
+                let value = self.fetch_byte(bus);
+                self.adc(value);
+                self.cycles += 2;
+            }
+            0x6A => {
+                let carry_in = if self.flag(StatusFlags::CARRY) {
+                    0x80
+                } else {
+                    0x00
+                };
+                let old = self.registers.a;
+                self.set_flag(StatusFlags::CARRY, old & 0x01 != 0);
+                self.registers.a = (old >> 1) | carry_in;
+                self.set_zn(self.registers.a);
+                self.cycles += 2;
+            }
+            0x6C => {
+                let pointer = self.fetch_word(bus);
+                let target = self.read_indirect_6502_bug(bus, pointer);
+                self.registers.pc = target;
+                self.cycles += 5;
+            }
+            0x78 => {
+                self.set_flag(StatusFlags::INTERRUPT_DISABLE, true);
+                self.cycles += 2;
+            }
+            0x84 => {
+                let address = self.fetch_byte(bus) as u16;
+                bus.write(address, self.registers.y);
+                self.cycles += 3;
+            }
+            0x85 => {
+                let address = self.fetch_byte(bus) as u16;
+                bus.write(address, self.registers.a);
+                self.cycles += 3;
+            }
+            0x86 => {
+                let address = self.fetch_byte(bus) as u16;
+                bus.write(address, self.registers.x);
+                self.cycles += 3;
+            }
+            0x88 => {
+                self.registers.y = self.registers.y.wrapping_sub(1);
+                self.set_zn(self.registers.y);
+                self.cycles += 2;
+            }
+            0x8A => {
+                self.registers.a = self.registers.x;
+                self.set_zn(self.registers.a);
+                self.cycles += 2;
+            }
+            0x8C => {
+                let address = self.fetch_word(bus);
+                bus.write(address, self.registers.y);
+                self.cycles += 4;
+            }
+            0x8D => {
+                let address = self.fetch_word(bus);
+                bus.write(address, self.registers.a);
+                self.cycles += 4;
+            }
+            0x8E => {
+                let address = self.fetch_word(bus);
+                bus.write(address, self.registers.x);
+                self.cycles += 4;
+            }
+            0x90 => {
+                self.branch(bus, !self.flag(StatusFlags::CARRY), 2, 3);
+            }
+            0x91 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indirect_y(bus, zp);
+                bus.write(address, self.registers.a);
+                self.cycles += 6;
+            }
+            0x99 => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.y as u16);
+                bus.write(address, self.registers.a);
+                self.cycles += 5;
+            }
+            0x9A => {
+                self.registers.sp = self.registers.x;
+                self.cycles += 2;
+            }
+            0x9D => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                bus.write(address, self.registers.a);
+                self.cycles += 5;
+            }
+            0xA0 => {
+                let value = self.fetch_byte(bus);
+                self.registers.y = value;
+                self.set_zn(value);
+                self.cycles += 2;
+            }
+            0xA2 => {
+                let value = self.fetch_byte(bus);
+                self.registers.x = value;
+                self.set_zn(value);
+                self.cycles += 2;
+            }
+            0xA4 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.registers.y = value;
+                self.set_zn(value);
+                self.cycles += 3;
+            }
+            0xA5 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.registers.a = value;
+                self.set_zn(value);
+                self.cycles += 3;
+            }
+            0xA6 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.registers.x = value;
+                self.set_zn(value);
+                self.cycles += 3;
+            }
+            0xA8 => {
+                self.registers.y = self.registers.a;
+                self.set_zn(self.registers.y);
+                self.cycles += 2;
+            }
+            0xA9 => {
+                let value = self.fetch_byte(bus);
+                self.registers.a = value;
+                self.set_zn(value);
+                self.cycles += 2;
+            }
+            0xAA => {
+                self.registers.x = self.registers.a;
+                self.set_zn(self.registers.x);
+                self.cycles += 2;
+            }
+            0xAD => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.registers.a = value;
+                self.set_zn(value);
+                self.cycles += 4;
+            }
+            0xAE => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.registers.x = value;
+                self.set_zn(value);
+                self.cycles += 4;
+            }
+            0xB0 => {
+                self.branch(bus, self.flag(StatusFlags::CARRY), 2, 3);
+            }
+            0xB1 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indirect_y(bus, zp);
+                let value = bus.read(address);
+                self.registers.a = value;
+                self.set_zn(value);
+                self.cycles += 5;
+            }
+            0xB9 => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.y as u16);
+                let value = bus.read(address);
+                self.registers.a = value;
+                self.set_zn(value);
+                self.cycles += 4;
+            }
+            0xBC => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address);
+                self.registers.y = value;
+                self.set_zn(value);
+                self.cycles += 4;
+            }
+            0xBD => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address);
+                self.registers.a = value;
+                self.set_zn(value);
+                self.cycles += 4;
+            }
+            0xC0 => {
+                let value = self.fetch_byte(bus);
+                self.compare(self.registers.y, value);
+                self.cycles += 2;
+            }
+            0xC5 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.compare(self.registers.a, value);
+                self.cycles += 3;
+            }
+            0xC6 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address).wrapping_sub(1);
+                bus.write(address, value);
+                self.set_zn(value);
+                self.cycles += 5;
+            }
+            0xC8 => {
+                self.registers.y = self.registers.y.wrapping_add(1);
+                self.set_zn(self.registers.y);
+                self.cycles += 2;
+            }
+            0xC9 => {
+                let value = self.fetch_byte(bus);
+                self.compare(self.registers.a, value);
+                self.cycles += 2;
+            }
+            0xCA => {
+                self.registers.x = self.registers.x.wrapping_sub(1);
+                self.set_zn(self.registers.x);
+                self.cycles += 2;
+            }
+            0xCD => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.compare(self.registers.a, value);
+                self.cycles += 4;
+            }
+            0xD0 => {
+                self.branch(bus, !self.flag(StatusFlags::ZERO), 2, 3);
+            }
+            0xD1 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indirect_y(bus, zp);
+                let value = bus.read(address);
+                self.compare(self.registers.a, value);
+                self.cycles += 5;
+            }
+            0xD8 => {
+                self.set_flag(StatusFlags::DECIMAL, false);
+                self.cycles += 2;
+            }
+            0xE0 => {
+                let value = self.fetch_byte(bus);
+                self.compare(self.registers.x, value);
+                self.cycles += 2;
+            }
+            0xE4 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.compare(self.registers.x, value);
+                self.cycles += 3;
+            }
+            0xE6 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address).wrapping_add(1);
+                bus.write(address, value);
+                self.set_zn(value);
+                self.cycles += 5;
+            }
+            0xE8 => {
+                self.registers.x = self.registers.x.wrapping_add(1);
+                self.set_zn(self.registers.x);
+                self.cycles += 2;
+            }
+            0xEA => {
+                self.cycles += 2;
+            }
+            0xF0 => {
+                self.branch(bus, self.flag(StatusFlags::ZERO), 2, 3);
+            }
+            opcode => {
+                self.halted = true;
+                return Err(CpuError::UnsupportedOpcode { pc, opcode });
+            }
+        }
+
+        Ok(CpuStep {
+            pc,
+            opcode,
+            registers_before,
+            registers_after: self.registers,
+            cycles: self.cycles,
+        })
+    }
+
+    fn fetch_byte(&mut self, bus: &mut Bus) -> u8 {
+        let value = bus.read(self.registers.pc);
+        self.registers.pc = self.registers.pc.wrapping_add(1);
+        value
+    }
+
+    fn fetch_word(&mut self, bus: &mut Bus) -> u16 {
+        let lo = self.fetch_byte(bus);
+        let hi = self.fetch_byte(bus);
+        u16::from_le_bytes([lo, hi])
+    }
+
+    fn read_word(&mut self, bus: &mut Bus, address: u16) -> u16 {
+        let lo = bus.read(address);
+        let hi = bus.read(address.wrapping_add(1));
+        u16::from_le_bytes([lo, hi])
+    }
+
+    fn read_indirect_6502_bug(&mut self, bus: &mut Bus, address: u16) -> u16 {
+        let lo = bus.read(address);
+        let hi_address = (address & 0xFF00) | address.wrapping_add(1) & 0x00FF;
+        let hi = bus.read(hi_address);
+        u16::from_le_bytes([lo, hi])
+    }
+
+    fn indirect_y(&mut self, bus: &mut Bus, zp: u8) -> u16 {
+        let base = self.read_word(bus, zp as u16);
+        base.wrapping_add(self.registers.y as u16)
+    }
+
+    fn push(&mut self, bus: &mut Bus, value: u8) {
+        let address = 0x0100 | self.registers.sp as u16;
+        bus.write(address, value);
+        self.registers.sp = self.registers.sp.wrapping_sub(1);
+    }
+
+    fn pop(&mut self, bus: &mut Bus) -> u8 {
+        self.registers.sp = self.registers.sp.wrapping_add(1);
+        let address = 0x0100 | self.registers.sp as u16;
+        bus.read(address)
+    }
+
+    fn branch(&mut self, bus: &mut Bus, condition: bool, base_cycles: u64, branch_cycles: u64) {
+        let offset = self.fetch_byte(bus) as i8;
+        if condition {
+            self.registers.pc = self.registers.pc.wrapping_add_signed(offset as i16);
+            self.cycles += branch_cycles;
+        } else {
+            self.cycles += base_cycles;
+        }
+    }
+
+    fn compare(&mut self, register: u8, value: u8) {
+        let result = register.wrapping_sub(value);
+        self.set_flag(StatusFlags::CARRY, register >= value);
+        self.set_zn(result);
+    }
+
+    fn adc(&mut self, value: u8) {
+        let carry = u8::from(self.flag(StatusFlags::CARRY));
+        let lhs = self.registers.a;
+        let sum = lhs as u16 + value as u16 + carry as u16;
+        let result = sum as u8;
+        self.set_flag(StatusFlags::CARRY, sum > 0xFF);
+        self.set_flag(
+            StatusFlags::OVERFLOW,
+            (lhs ^ result) & (value ^ result) & 0x80 != 0,
+        );
+        self.registers.a = result;
+        self.set_zn(result);
+    }
+
+    fn set_zn(&mut self, value: u8) {
+        self.set_flag(StatusFlags::ZERO, value == 0);
+        self.set_flag(StatusFlags::NEGATIVE, value & 0x80 != 0);
+    }
+
+    fn flag(&self, flag: StatusFlags) -> bool {
+        self.registers.status & flag.bits() != 0
+    }
+
+    fn set_flag(&mut self, flag: StatusFlags, enabled: bool) {
+        if enabled {
+            self.registers.status |= flag.bits();
+        } else {
+            self.registers.status &= !flag.bits();
+        }
+        self.registers.status |= StatusFlags::UNUSED.bits();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuRegisters {
+    pub a: u8,
+    pub x: u8,
+    pub y: u8,
+    pub sp: u8,
+    pub pc: u16,
+    pub status: u8,
+}
+
+impl Default for CpuRegisters {
+    fn default() -> Self {
+        Self {
+            a: 0,
+            x: 0,
+            y: 0,
+            sp: 0xFD,
+            pc: 0,
+            status: StatusFlags::UNUSED.bits(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuStep {
+    pub pc: u16,
+    pub opcode: u8,
+    pub registers_before: CpuRegisters,
+    pub registers_after: CpuRegisters,
+    pub cycles: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuError {
+    Halted,
+    UnsupportedOpcode { pc: u16, opcode: u8 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusFlags(u8);
+
+impl StatusFlags {
+    const CARRY: Self = Self(0x01);
+    const ZERO: Self = Self(0x02);
+    const INTERRUPT_DISABLE: Self = Self(0x04);
+    const DECIMAL: Self = Self(0x08);
+    const UNUSED: Self = Self(0x20);
+    const OVERFLOW: Self = Self(0x40);
+    const NEGATIVE: Self = Self(0x80);
+
+    const fn bits(self) -> u8 {
+        self.0
     }
 }
 
@@ -838,6 +1441,70 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn cpu_resets_from_reset_vector() {
+        let mut bus = Bus::default();
+        bus.ram_mut().write(0xFFFC, 0x34);
+        bus.ram_mut().write(0xFFFD, 0x12);
+        let mut cpu = Cpu::default();
+
+        cpu.reset(&mut bus);
+
+        assert_eq!(cpu.registers().pc, 0x1234);
+        assert_eq!(cpu.registers().sp, 0xFD);
+        assert_eq!(cpu.cycles(), 7);
+    }
+
+    #[test]
+    fn cpu_steps_through_basic_program_via_bus() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x42, // LDA #$42
+                    0x85, 0x10, // STA $10
+                    0xA2, 0x7F, // LDX #$7F
+                    0x86, 0x11, // STX $11
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        let first = cpu.step(&mut bus).unwrap();
+        assert_eq!(first.pc, 0x0200);
+        assert_eq!(first.opcode, 0xA9);
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.ram().read(0x0010), 0x42);
+        assert_eq!(bus.ram().read(0x0011), 0x7F);
+        assert_eq!(cpu.registers().pc, 0x0208);
+    }
+
+    #[test]
+    fn cpu_reports_unsupported_opcode_with_pc() {
+        let mut bus = Bus::default();
+        bus.ram_mut().write(0x0200, 0x02);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        assert_eq!(
+            cpu.step(&mut bus).unwrap_err(),
+            CpuError::UnsupportedOpcode {
+                pc: 0x0200,
+                opcode: 0x02,
+            }
+        );
+        assert!(cpu.halted());
     }
 
     fn car_bytes(cartridge_type: u32, bank0: &[u8], bank1: &[u8]) -> Vec<u8> {

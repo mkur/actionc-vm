@@ -25,6 +25,11 @@ surface.
      - PC/register inspection,
      - no heavy emulator dependency.
    - Implement a small 6502 core only if no suitable crate fits.
+   - Status: bootstrap core implemented in-tree. It resets from `$FFFC`,
+     steps only through the bus, exposes registers/PC/status, supports trace
+     output, and currently implements enough opcodes to run deeply into the
+     Atari OS reset path. It is intentionally incomplete and stops cleanly on
+     unsupported opcodes.
 
 3. Memory bus.
    - Replace raw memory access with a bus abstraction.
@@ -42,6 +47,11 @@ surface.
    - Step with tracing enabled.
    - Confirm whether execution reaches cartridge code.
    - Record the first missing hardware or OS assumption.
+   - Status: started. With `action.rom` plus `rev02.rom`, reset starts at
+     `$C2AA` and the bootstrap CPU runs through the OS reset path until it
+     reaches a `BRK`/zero byte near `$5003`, suggesting the next work is to
+     inspect required OS/hardware initialization state rather than just adding
+     opcodes.
 
 5. Trace infrastructure.
    - Add CLI flags:
