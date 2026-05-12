@@ -3,8 +3,8 @@ use std::env;
 use std::path::PathBuf;
 
 use action_compiler_vm::{
-    ACTION_OS_PRESET, AddressRange, BusAccess, BusEvent, CpuError, CpuRegisters, CpuStep,
-    ImageKind, VmConfig,
+    ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, AddressRange, BusAccess, BusEvent, CpuError,
+    CpuRegisters, CpuStep, ImageKind, VmConfig,
 };
 
 fn main() {
@@ -83,8 +83,8 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     for watch_range in &options.watch_ranges {
         vm.bus_mut().add_watch_range(*watch_range);
     }
-    if let Some(key_code) = options.key_code {
-        vm.bus_mut().queue_key_code(key_code);
+    for key_code in &options.key_codes {
+        vm.bus_mut().queue_key_code(*key_code);
     }
     vm.reset_cpu();
     println!(
@@ -165,7 +165,7 @@ struct CliOptions {
     history_len: usize,
     watchpoints: Vec<u16>,
     watch_ranges: Vec<AddressRange>,
-    key_code: Option<u8>,
+    key_codes: Vec<u8>,
 }
 
 impl Default for CliOptions {
@@ -179,7 +179,7 @@ impl Default for CliOptions {
             history_len: 64,
             watchpoints: Vec::new(),
             watch_ranges: Vec::new(),
-            key_code: None,
+            key_codes: Vec::new(),
         }
     }
 }
@@ -199,7 +199,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut history_len = 64;
     let mut watchpoints = Vec::new();
     let mut watch_ranges = Vec::new();
-    let mut key_code = None;
+    let mut key_codes = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
@@ -244,7 +244,10 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
             "--key-code" => {
                 index += 1;
                 let value = required_value(&args, index, "--key-code")?;
-                key_code = Some(parse_byte(value)?);
+                key_codes.push(parse_byte(value)?);
+            }
+            "--monitor-key" => {
+                key_codes.push(ACTION_MONITOR_KEY_CODE);
             }
             "--preset" => {
                 index += 1;
@@ -295,7 +298,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         history_len,
         watchpoints,
         watch_ranges,
-        key_code,
+        key_codes,
     })
 }
 
@@ -488,7 +491,8 @@ fn print_help() {
          --history <n>        Recent instruction count in stop reports, default 64\n  \
          --watch <addr>       Record bus reads/writes at addr\n  \
          --watch-range <a:b>  Record bus reads/writes inside the range\n  \
-         --key-code <byte>    Queue one Atari keyboard code for CH ($02FC)\n  \
+         --key-code <byte>    Queue one Atari keyboard code for CH ($02FC); repeatable\n  \
+         --monitor-key        Queue Action! Shift+Control+M ($E5)\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );
@@ -502,7 +506,27 @@ mod tests {
     fn parses_key_code_option() {
         let options = parse_options(vec!["--key-code".to_string(), "$21".to_string()]).unwrap();
 
-        assert_eq!(options.key_code, Some(0x21));
+        assert_eq!(options.key_codes, vec![0x21]);
+    }
+
+    #[test]
+    fn parses_repeated_key_code_options() {
+        let options = parse_options(vec![
+            "--key-code".to_string(),
+            "$21".to_string(),
+            "--key-code".to_string(),
+            "$E5".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(options.key_codes, vec![0x21, 0xE5]);
+    }
+
+    #[test]
+    fn parses_monitor_key_option() {
+        let options = parse_options(vec!["--monitor-key".to_string()]).unwrap();
+
+        assert_eq!(options.key_codes, vec![ACTION_MONITOR_KEY_CODE]);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
 
@@ -12,7 +13,9 @@ pub const PORTB: u16 = 0xD301;
 pub const PORTB_SELF_TEST_DISABLE: u8 = 0x80;
 pub const ANTIC_VCOUNT: u16 = 0xD40B;
 pub const RTCLOK_LOW: u16 = 0x0014;
+pub const KBCODE_PRIOR_KEY_CODE: u16 = 0x02F2;
 pub const CH_KEY_CODE: u16 = 0x02FC;
+pub const ACTION_MONITOR_KEY_CODE: u8 = 0xE5;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
 pub const OSS_TYPE_15_FIXED_BASE: u16 = 0xB000;
@@ -1115,7 +1118,7 @@ pub struct Bus {
     events: Vec<BusEvent>,
     last_data: u8,
     vcount: u8,
-    pending_key_code: Option<u8>,
+    pending_key_codes: VecDeque<u8>,
 }
 
 impl Default for Bus {
@@ -1129,7 +1132,7 @@ impl Default for Bus {
             events: Vec::new(),
             last_data: 0,
             vcount: 0,
-            pending_key_code: None,
+            pending_key_codes: VecDeque::new(),
         }
     }
 }
@@ -1177,7 +1180,7 @@ impl Bus {
     }
 
     pub fn queue_key_code(&mut self, key_code: u8) {
-        self.pending_key_code = Some(key_code);
+        self.pending_key_codes.push_back(key_code);
     }
 
     pub fn map_os_rom(&mut self, base: u16, bytes: Vec<u8>) -> Result<(), String> {
@@ -1283,8 +1286,11 @@ impl Bus {
 
     fn read_ram(&mut self, address: u16) -> u8 {
         if address == CH_KEY_CODE {
-            if let Some(key_code) = self.pending_key_code.take() {
-                return key_code;
+            if self.ram.read(CH_KEY_CODE) == 0xFF {
+                if let Some(key_code) = self.pending_key_codes.pop_front() {
+                    self.ram.write(CH_KEY_CODE, key_code);
+                    self.ram.write(KBCODE_PRIOR_KEY_CODE, key_code);
+                }
             }
         }
 
@@ -1887,13 +1893,29 @@ mod tests {
     }
 
     #[test]
-    fn bus_returns_queued_key_code_once_from_ch() {
+    fn bus_latches_queued_key_code_until_ch_is_cleared() {
         let mut bus = Bus::default();
         bus.write(CH_KEY_CODE, 0xFF);
         bus.queue_key_code(0x21);
 
         assert_eq!(bus.read(CH_KEY_CODE), 0x21);
+        assert_eq!(bus.read(CH_KEY_CODE), 0x21);
+        assert_eq!(bus.read(KBCODE_PRIOR_KEY_CODE), 0x21);
+        bus.write(CH_KEY_CODE, 0xFF);
         assert_eq!(bus.read(CH_KEY_CODE), 0xFF);
+    }
+
+    #[test]
+    fn bus_returns_queued_key_codes_in_order_after_ch_is_cleared() {
+        let mut bus = Bus::default();
+        bus.write(CH_KEY_CODE, 0xFF);
+        bus.queue_key_code(0x21);
+        bus.queue_key_code(ACTION_MONITOR_KEY_CODE);
+
+        assert_eq!(bus.read(CH_KEY_CODE), 0x21);
+        bus.write(CH_KEY_CODE, 0xFF);
+        assert_eq!(bus.read(CH_KEY_CODE), ACTION_MONITOR_KEY_CODE);
+        assert_eq!(bus.read(KBCODE_PRIOR_KEY_CODE), ACTION_MONITOR_KEY_CODE);
     }
 
     #[test]
