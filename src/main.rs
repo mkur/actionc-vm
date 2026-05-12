@@ -1,7 +1,11 @@
+use std::collections::VecDeque;
 use std::env;
 use std::path::PathBuf;
 
-use action_compiler_vm::{ACTION_OS_PRESET, CpuError, CpuStep, ImageKind, VmConfig};
+use action_compiler_vm::{
+    ACTION_OS_PRESET, AddressRange, BusAccess, BusEvent, CpuError, CpuRegisters, CpuStep,
+    ImageKind, VmConfig,
+};
 
 fn main() {
     if let Err(err) = run() {
@@ -62,11 +66,14 @@ fn inspect(config: VmConfig) -> Result<(), String> {
 }
 
 fn run_vm(options: CliOptions) -> Result<(), String> {
-    let config = options.config;
+    let config = options.config.clone();
     config.validate_for_execution()?;
     let mut vm = config.load()?;
-    for watchpoint in options.watchpoints {
-        vm.bus_mut().add_watchpoint(watchpoint);
+    for watchpoint in &options.watchpoints {
+        vm.bus_mut().add_watchpoint(*watchpoint);
+    }
+    for watch_range in &options.watch_ranges {
+        vm.bus_mut().add_watch_range(*watch_range);
     }
     vm.reset_cpu();
     println!(
@@ -75,17 +82,56 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         vm.cpu().registers().pc
     );
 
-    for _ in 0..options.max_steps {
+    let mut history = StepHistory::new(options.history_len);
+    for step_index in 0..options.max_steps {
         match vm.step_cpu() {
             Ok(step) => {
-                if options.trace_pc {
+                if options.should_trace(step.pc) {
                     print_step(&step);
+                }
+                let reached_trace_until = options.trace_until == Some(step.pc);
+                history.push(step);
+                if reached_trace_until {
+                    print_stop_report(
+                        "trace-until reached",
+                        Some(step.registers_after),
+                        Some(&history),
+                        vm.bus().events(),
+                        vm.bus().cartridge().map(|cart| cart.mapping_info()),
+                    );
+                    return Ok(());
                 }
             }
             Err(CpuError::UnsupportedOpcode { pc, opcode }) => {
+                print_stop_report(
+                    &format!("unsupported opcode ${opcode:02X} at ${pc:04X}"),
+                    Some(vm.cpu().registers()),
+                    Some(&history),
+                    vm.bus().events(),
+                    vm.bus().cartridge().map(|cart| cart.mapping_info()),
+                );
                 return Err(format!("unsupported opcode ${opcode:02X} at ${pc:04X}"));
             }
-            Err(CpuError::Halted) => return Err("CPU halted".to_string()),
+            Err(CpuError::Halted) => {
+                print_stop_report(
+                    "CPU halted",
+                    Some(vm.cpu().registers()),
+                    Some(&history),
+                    vm.bus().events(),
+                    vm.bus().cartridge().map(|cart| cart.mapping_info()),
+                );
+                return Err("CPU halted".to_string());
+            }
+        }
+
+        if step_index + 1 == options.max_steps {
+            print_stop_report(
+                "max steps reached",
+                Some(vm.cpu().registers()),
+                Some(&history),
+                vm.bus().events(),
+                vm.bus().cartridge().map(|cart| cart.mapping_info()),
+            );
         }
     }
 
@@ -103,7 +149,11 @@ struct CliOptions {
     config: VmConfig,
     max_steps: u64,
     trace_pc: bool,
+    trace_ranges: Vec<AddressRange>,
+    trace_until: Option<u16>,
+    history_len: usize,
     watchpoints: Vec<u16>,
+    watch_ranges: Vec<AddressRange>,
 }
 
 impl Default for CliOptions {
@@ -112,8 +162,18 @@ impl Default for CliOptions {
             config: VmConfig::default(),
             max_steps: 1_000,
             trace_pc: false,
+            trace_ranges: Vec::new(),
+            trace_until: None,
+            history_len: 64,
             watchpoints: Vec::new(),
+            watch_ranges: Vec::new(),
         }
+    }
+}
+
+impl CliOptions {
+    fn should_trace(&self, pc: u16) -> bool {
+        self.trace_pc || self.trace_ranges.iter().any(|range| range.contains(pc))
     }
 }
 
@@ -121,7 +181,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut config = VmConfig::default();
     let mut max_steps = 1_000;
     let mut trace_pc = false;
+    let mut trace_ranges = Vec::new();
+    let mut trace_until = None;
+    let mut history_len = 64;
     let mut watchpoints = Vec::new();
+    let mut watch_ranges = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
@@ -136,10 +200,32 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
             "--trace-pc" => {
                 trace_pc = true;
             }
+            "--trace-range" => {
+                index += 1;
+                let value = required_value(&args, index, "--trace-range")?;
+                trace_ranges.push(parse_range(value)?);
+            }
+            "--trace-until" => {
+                index += 1;
+                let value = required_value(&args, index, "--trace-until")?;
+                trace_until = Some(parse_address(value)?);
+            }
+            "--history" => {
+                index += 1;
+                let value = required_value(&args, index, "--history")?;
+                history_len = value
+                    .parse()
+                    .map_err(|_| format!("invalid history length `{value}`"))?;
+            }
             "--watch" => {
                 index += 1;
                 let address = required_value(&args, index, "--watch").and_then(parse_address)?;
                 watchpoints.push(address);
+            }
+            "--watch-range" => {
+                index += 1;
+                let value = required_value(&args, index, "--watch-range")?;
+                watch_ranges.push(parse_range(value)?);
             }
             "--preset" => {
                 index += 1;
@@ -185,7 +271,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         config,
         max_steps,
         trace_pc,
+        trace_ranges,
+        trace_until,
+        history_len,
         watchpoints,
+        watch_ranges,
     })
 }
 
@@ -238,9 +328,111 @@ fn parse_address(value: &str) -> Result<u16, String> {
     parsed.map_err(|_| format!("invalid address `{value}`"))
 }
 
+fn parse_range(value: &str) -> Result<AddressRange, String> {
+    let Some((start, end)) = value.split_once(':') else {
+        return Err(format!("range `{value}` must be start:end"));
+    };
+    let start = parse_address(start)?;
+    let end = parse_address(end)?;
+    if start > end {
+        return Err(format!("range `{value}` starts after it ends"));
+    }
+    Ok(AddressRange { start, end })
+}
+
+#[derive(Debug)]
+struct StepHistory {
+    limit: usize,
+    steps: VecDeque<CpuStep>,
+}
+
+impl StepHistory {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            steps: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, step: CpuStep) {
+        if self.limit == 0 {
+            return;
+        }
+        if self.steps.len() == self.limit {
+            self.steps.pop_front();
+        }
+        self.steps.push_back(step);
+    }
+
+    fn steps(&self) -> impl Iterator<Item = &CpuStep> {
+        self.steps.iter()
+    }
+}
+
 fn print_step(step: &CpuStep) {
     let regs = step.registers_before;
     println!(
+        "{:08} PC=${:04X} OP=${:02X} A=${:02X} X=${:02X} Y=${:02X} SP=${:02X} P=${:02X}",
+        step.cycles, step.pc, step.opcode, regs.a, regs.x, regs.y, regs.sp, regs.status
+    );
+}
+
+fn print_stop_report(
+    reason: &str,
+    registers: Option<CpuRegisters>,
+    history: Option<&StepHistory>,
+    events: &[BusEvent],
+    cartridge: Option<action_compiler_vm::CartridgeMappingInfo>,
+) {
+    eprintln!("stop: {reason}");
+    if let Some(regs) = registers {
+        eprintln!(
+            "regs: PC=${:04X} A=${:02X} X=${:02X} Y=${:02X} SP=${:02X} P=${:02X}",
+            regs.pc, regs.a, regs.x, regs.y, regs.sp, regs.status
+        );
+    }
+    if let Some(cartridge) = cartridge {
+        eprintln!(
+            "cart: window=${:04X}-${:04X} bank={}/{} bank_size={}",
+            cartridge.window_start,
+            cartridge.window_end,
+            cartridge.active_bank,
+            cartridge.bank_count,
+            cartridge.bank_size
+        );
+    }
+    if let Some(history) = history {
+        eprintln!("recent instructions:");
+        for step in history.steps() {
+            eprint!("  ");
+            print_step_stderr(step);
+        }
+    }
+    if !events.is_empty() {
+        eprintln!("bus events:");
+        for event in events
+            .iter()
+            .rev()
+            .take(64)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            let access = match event.access {
+                BusAccess::Read => "R",
+                BusAccess::Write => "W",
+            };
+            eprintln!(
+                "  {access} ${:04X}=${:02X} {:?}",
+                event.address, event.value, event.region
+            );
+        }
+    }
+}
+
+fn print_step_stderr(step: &CpuStep) {
+    let regs = step.registers_before;
+    eprintln!(
         "{:08} PC=${:04X} OP=${:02X} A=${:02X} X=${:02X} Y=${:02X} SP=${:02X} P=${:02X}",
         step.cycles, step.pc, step.opcode, regs.a, regs.x, regs.y, regs.sp, regs.status
     );
@@ -260,7 +452,11 @@ fn print_help() {
          --os-base <addr>     OS ROM base address, default $C000\n  \
          --max-cycles <n>     Run at most n CPU steps, default 1000\n  \
          --trace-pc           Print one line per executed instruction\n  \
-         --watch <addr>       Reserved for bus watchpoints\n  \
+         --trace-range <a:b>  Print instructions with PC inside the range\n  \
+         --trace-until <addr> Stop after executing an instruction at addr\n  \
+         --history <n>        Recent instruction count in stop reports, default 64\n  \
+         --watch <addr>       Record bus reads/writes at addr\n  \
+         --watch-range <a:b>  Record bus reads/writes inside the range\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );

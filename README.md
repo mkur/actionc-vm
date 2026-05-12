@@ -25,6 +25,8 @@ This repo currently contains a no-dependency Rust scaffold:
 - an `action-os` mapping preset for cartridge at `$A000` and OS ROM at `$C000`,
 - a bootstrap 6502 CPU core with reset, stepping, tracing, and a growing opcode
   subset,
+- execution recorder support: PC trace ranges, trace-until, watchpoints, and
+  recent-instruction stop reports,
 - a CLI that can load and inspect cartridge/ROM/source files,
 - tests around basic memory mapping.
 

@@ -60,6 +60,12 @@ surface.
      - `--watch $000E`,
      - `--max-cycles`.
    - Emit compact trace logs that help discover Action!'s compiler path.
+   - Status: initial recorder implemented. The runner supports PC trace
+     ranges, trace-until stops, watchpoints/watch ranges, recent-instruction
+     history, cartridge-bank reporting, and watched bus-event reports.
+     Current boot investigation shows the `$5003` stop is reached by an
+     explicit OS `JMP $5003` at `$C3C1`, after writing `$02F3/$02F4`; this
+     looks like a missing DOS/device boot target rather than a random CPU bug.
 
 6. Minimal Atari OS surface.
    - Initially run the real OS ROM.

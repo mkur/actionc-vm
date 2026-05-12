@@ -868,7 +868,7 @@ pub struct Bus {
     ram: Memory,
     os_rom: Option<RomRegion>,
     cartridge: Option<Cartridge>,
-    watchpoints: Vec<u16>,
+    watchpoints: Vec<AddressRange>,
     events: Vec<BusEvent>,
     last_data: u8,
 }
@@ -904,8 +904,15 @@ impl Bus {
     }
 
     pub fn add_watchpoint(&mut self, address: u16) {
-        if !self.watchpoints.contains(&address) {
-            self.watchpoints.push(address);
+        self.add_watch_range(AddressRange {
+            start: address,
+            end: address,
+        });
+    }
+
+    pub fn add_watch_range(&mut self, range: AddressRange) {
+        if !self.watchpoints.contains(&range) {
+            self.watchpoints.push(range);
         }
     }
 
@@ -986,7 +993,7 @@ impl Bus {
     }
 
     fn record_event(&mut self, access: BusAccess, address: u16, value: u8, region: BusRegion) {
-        if self.watchpoints.contains(&address) {
+        if self.watchpoints.iter().any(|range| range.contains(address)) {
             self.events.push(BusEvent {
                 access,
                 address,
