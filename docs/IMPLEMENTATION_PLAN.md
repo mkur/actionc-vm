@@ -31,6 +31,10 @@ surface.
    - Support RAM writes and ROM/cartridge read-only regions.
    - Support watchpoints, vector reads/writes, and trace hooks for OS-range
      calls.
+   - Status: initial draft implemented. The bus now has writable RAM,
+     read-only OS ROM, cartridge mapping, watchpoints, and `.CAR` parsing for
+     the Action! type `$0F` 16K banked cartridge. Exact OSS bank-switch control
+     semantics still need tracing/confirmation.
 
 4. Boot/entry experiment.
    - Load cartridge plus OS ROM.

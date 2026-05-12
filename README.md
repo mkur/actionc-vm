@@ -19,7 +19,8 @@ should stop and fall back to Atari800 automation.
 This repo currently contains a no-dependency Rust scaffold:
 
 - a 64K memory image,
-- image mapping helpers,
+- a bus with writable RAM, read-only OS ROM, cartridge mapping, and watchpoints,
+- `.CAR` container detection for cartridge images,
 - ROM metadata reporting with mapped range, checksum, and CRC32,
 - an `action-os` mapping preset for cartridge at `$A000` and OS ROM at `$C000`,
 - a CLI that can load and inspect cartridge/ROM/source files,

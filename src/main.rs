@@ -41,6 +41,22 @@ fn inspect(config: VmConfig) -> Result<(), String> {
             image.metadata.checksum16,
             image.metadata.crc32
         );
+        if let Some(header) = image.car_header {
+            println!(
+                "  CAR type=${:08X}, header checksum=${:08X}",
+                header.cartridge_type, header.checksum
+            );
+        }
+        if let Some(mapping) = image.cartridge_mapping {
+            println!(
+                "  cart window ${:04X}-${:04X}, bank_size={}, banks={}, active_bank={}",
+                mapping.window_start,
+                mapping.window_end,
+                mapping.bank_size,
+                mapping.bank_count,
+                mapping.active_bank
+            );
+        }
     }
     Ok(())
 }
