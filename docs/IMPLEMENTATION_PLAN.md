@@ -13,6 +13,9 @@ surface.
    - Add ROM metadata checks: size, mapped address range, checksum/hash display.
    - Add config presets for common mappings: Action! cartridge at `$A000`, OS
      ROM at `$C000`.
+   - Status: implemented. `run` requires `--cart` and `--os`, images report
+     mapped range, checksum16, and CRC32, and the `action-os` preset captures
+     the common `$A000`/`$C000` mapping.
 
 2. CPU core decision.
    - Evaluate using an existing Rust 6502 core first.

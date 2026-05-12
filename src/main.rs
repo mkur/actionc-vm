@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use action_compiler_vm::{ImageKind, VmConfig};
+use action_compiler_vm::{ACTION_OS_PRESET, ImageKind, VmConfig};
 
 fn main() {
     if let Err(err) = run() {
@@ -33,16 +33,20 @@ fn inspect(config: VmConfig) -> Result<(), String> {
     println!("loaded {} image(s)", vm.images().len());
     for image in vm.images() {
         println!(
-            "{:?}: {} byte(s) mapped at ${:04X}",
+            "{:?}: {} byte(s), ${:04X}-${:04X}, checksum16=${:04X}, crc32=${:08X}",
             image.kind,
-            image.bytes.len(),
-            image.base
+            image.metadata.size,
+            image.metadata.base,
+            image.metadata.end,
+            image.metadata.checksum16,
+            image.metadata.crc32
         );
     }
     Ok(())
 }
 
 fn run_vm(config: VmConfig) -> Result<(), String> {
+    config.validate_for_execution()?;
     let vm = config.load()?;
     println!(
         "compiler VM skeleton loaded {} image(s); CPU execution is not implemented yet",
@@ -57,6 +61,11 @@ fn parse_options(args: Vec<String>) -> Result<VmConfig, String> {
 
     while index < args.len() {
         match args[index].as_str() {
+            "--preset" => {
+                index += 1;
+                let value = required_value(&args, index, "--preset")?;
+                apply_preset(&mut config, value)?;
+            }
             "--cart" => {
                 index += 1;
                 let path = required_value(&args, index, "--cart")?;
@@ -71,6 +80,11 @@ fn parse_options(args: Vec<String>) -> Result<VmConfig, String> {
                 index += 1;
                 let path = required_value(&args, index, "--os")?;
                 config.os_rom = Some(PathBuf::from(path));
+            }
+            "--os-base" => {
+                index += 1;
+                let value = required_value(&args, index, "--os-base")?;
+                config.os_base = parse_address(value)?;
             }
             "--source" => {
                 index += 1;
@@ -88,6 +102,16 @@ fn parse_options(args: Vec<String>) -> Result<VmConfig, String> {
     }
 
     Ok(config)
+}
+
+fn apply_preset(config: &mut VmConfig, value: &str) -> Result<(), String> {
+    match value {
+        "action-os" => {
+            config.apply_preset(ACTION_OS_PRESET);
+            Ok(())
+        }
+        other => Err(format!("unknown preset `{other}`")),
+    }
 }
 
 fn required_value<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
@@ -136,9 +160,11 @@ fn print_help() {
          action-compiler-vm inspect [options]\n  \
          action-compiler-vm run [options]\n\n\
          Options:\n  \
+         --preset <name>      Mapping preset, currently action-os\n  \
          --cart <path>        Load an Action! cartridge image\n  \
          --cart-base <addr>   Cartridge base address, default $A000\n  \
          --os <path>          Load an Atari OS ROM image at $C000\n  \
+         --os-base <addr>     OS ROM base address, default $C000\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );

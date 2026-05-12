@@ -20,6 +20,8 @@ This repo currently contains a no-dependency Rust scaffold:
 
 - a 64K memory image,
 - image mapping helpers,
+- ROM metadata reporting with mapped range, checksum, and CRC32,
+- an `action-os` mapping preset for cartridge at `$A000` and OS ROM at `$C000`,
 - a CLI that can load and inspect cartridge/ROM/source files,
 - tests around basic memory mapping.
 
@@ -31,10 +33,11 @@ implemented yet.
 ```sh
 cargo test
 cargo run -- inspect --cart path/to/action.rom
-cargo run -- run --cart path/to/action.rom --source probe.act
+cargo run -- run --cart path/to/action.rom --os path/to/atari-os.rom --source probe.act
 ```
 
 `run` currently loads inputs and reports that execution is not implemented.
+For phase 1, `run` requires both the Action! cartridge ROM and an Atari OS ROM.
 
 ## Design Constraint
 
