@@ -16,6 +16,10 @@ pub const RTCLOK_LOW: u16 = 0x0014;
 pub const KBCODE_PRIOR_KEY_CODE: u16 = 0x02F2;
 pub const CH_KEY_CODE: u16 = 0x02FC;
 pub const ACTION_MONITOR_KEY_CODE: u8 = 0xE5;
+pub const XMTDON_TRANSMISSION_DONE_FLAG: u16 = 0x003A;
+pub const CONSOL: u16 = 0xD01F;
+pub const CONSOL_NO_KEYS: u8 = 0x07;
+pub const SEROUT_SERIAL_OUTPUT: u16 = 0xD20D;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
 pub const OSS_TYPE_15_FIXED_BASE: u16 = 0xB000;
@@ -522,6 +526,12 @@ impl Cpu {
                 self.adc(value);
                 self.cycles += 2;
             }
+            0x6D => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.adc(value);
+                self.cycles += 4;
+            }
             0x6A => {
                 let carry_in = if self.flag(StatusFlags::CARRY) {
                     0x80
@@ -683,6 +693,13 @@ impl Cpu {
                 self.registers.x = self.registers.a;
                 self.set_zn(self.registers.x);
                 self.cycles += 2;
+            }
+            0xAC => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.registers.y = value;
+                self.set_zn(value);
+                self.cycles += 4;
             }
             0xAD => {
                 let address = self.fetch_word(bus);
@@ -1193,8 +1210,10 @@ impl Bus {
     }
 
     pub fn read(&mut self, address: u16) -> u8 {
-        let (value, region) = if let Some(cartridge) = self.cartridge.as_ref() {
-            if let Some(value) = cartridge.read(address) {
+        let (value, region) = if let Some(cartridge) = self.cartridge.as_mut() {
+            if cartridge.control_access(address) {
+                (self.last_data, BusRegion::CartridgeControl)
+            } else if let Some(value) = cartridge.read(address) {
                 (value, BusRegion::Cartridge)
             } else if let Some(value) = self.read_io(address) {
                 (value, BusRegion::Io)
@@ -1258,6 +1277,10 @@ impl Bus {
             self.ram.write(address, value);
             BusRegion::Ram
         };
+
+        if address == SEROUT_SERIAL_OUTPUT {
+            self.ram.write(XMTDON_TRANSMISSION_DONE_FLAG, 0xFF);
+        }
 
         self.last_data = value;
         self.record_event(BusAccess::Write, address, value, region);
@@ -1351,6 +1374,7 @@ pub struct RomRegion {
 pub struct IoRegion {
     range: AddressRange,
     bytes: Vec<u8>,
+    console_switches: u8,
 }
 
 impl Default for IoRegion {
@@ -1358,6 +1382,7 @@ impl Default for IoRegion {
         Self {
             range: AddressRange::with_size(IO_BASE, IO_SIZE).expect("valid I/O range"),
             bytes: vec![0xFF; IO_SIZE],
+            console_switches: CONSOL_NO_KEYS,
         }
     }
 }
@@ -1371,12 +1396,18 @@ impl IoRegion {
         if !self.contains(address) {
             return None;
         }
+        if address == CONSOL {
+            return Some(self.console_switches);
+        }
         Some(self.bytes[(address - self.range.start) as usize])
     }
 
     pub fn write(&mut self, address: u16, value: u8) -> bool {
         if !self.contains(address) {
             return false;
+        }
+        if address == CONSOL {
+            return true;
         }
         self.bytes[(address - self.range.start) as usize] = value;
         true
@@ -1478,6 +1509,14 @@ impl Cartridge {
         }
     }
 
+    pub fn control_access(&mut self, address: u16) -> bool {
+        match &mut self.mapping {
+            CartridgeMapping::Linear(_) => false,
+            CartridgeMapping::Banked8k(_) => false,
+            CartridgeMapping::OssType15(cart) => cart.control_access(address),
+        }
+    }
+
     pub fn write(&mut self, address: u16, value: u8) -> bool {
         match &mut self.mapping {
             CartridgeMapping::Linear(_) => false,
@@ -1498,7 +1537,7 @@ enum CartridgeMapping {
 struct OssType15Cartridge {
     bank_window: AddressRange,
     fixed_window: AddressRange,
-    active_bank: usize,
+    active_bank: Option<usize>,
     payload: Vec<u8>,
 }
 
@@ -1514,7 +1553,7 @@ impl OssType15Cartridge {
         Ok(Self {
             bank_window: AddressRange::with_size(bank_window_start, OSS_TYPE_15_BANK_SIZE)?,
             fixed_window: AddressRange::with_size(OSS_TYPE_15_FIXED_BASE, OSS_TYPE_15_BANK_SIZE)?,
-            active_bank: 0,
+            active_bank: Some(0),
             payload,
         })
     }
@@ -1524,10 +1563,13 @@ impl OssType15Cartridge {
     }
 
     fn contains(&self, address: u16) -> bool {
-        self.bank_window.contains(address) || self.fixed_window.contains(address)
+        self.active_bank.is_some()
+            && (self.bank_window.contains(address) || self.fixed_window.contains(address))
     }
 
     fn read(&self, address: u16) -> Option<u8> {
+        let active_bank = self.active_bank?;
+
         if self.fixed_window.contains(address) {
             let offset = (address - self.fixed_window.start) as usize;
             return self.payload.get(offset).copied();
@@ -1536,20 +1578,30 @@ impl OssType15Cartridge {
         if self.bank_window.contains(address) {
             let window_offset = (address - self.bank_window.start) as usize;
             let bank_offset =
-                OSS_TYPE_15_BANK_SIZE + self.active_bank * OSS_TYPE_15_BANK_SIZE + window_offset;
+                OSS_TYPE_15_BANK_SIZE + active_bank * OSS_TYPE_15_BANK_SIZE + window_offset;
             return self.payload.get(bank_offset).copied();
         }
 
         None
     }
 
-    fn write_control(&mut self, address: u16, value: u8) -> bool {
+    fn control_access(&mut self, address: u16) -> bool {
         if !(0xD500..=0xD5FF).contains(&address) {
             return false;
         }
 
-        self.active_bank = (value as usize) % self.bank_count();
+        self.active_bank = match address & 0x0009 {
+            0x0000 => Some(0),
+            0x0001 => Some(2),
+            0x0008 => None,
+            0x0009 => Some(1),
+            _ => unreachable!("masked OSS type 15 control address has only four values"),
+        };
         true
+    }
+
+    fn write_control(&mut self, address: u16, _value: u8) -> bool {
+        self.control_access(address)
     }
 
     fn mapping_info(&self) -> CartridgeMappingInfo {
@@ -1558,7 +1610,7 @@ impl OssType15Cartridge {
             window_end: self.fixed_window.end,
             bank_size: OSS_TYPE_15_BANK_SIZE,
             bank_count: self.bank_count(),
-            active_bank: self.active_bank,
+            active_bank: self.active_bank.unwrap_or(self.bank_count()),
         }
     }
 }
@@ -1851,6 +1903,27 @@ mod tests {
     }
 
     #[test]
+    fn console_switch_reads_are_independent_from_speaker_writes() {
+        let mut bus = Bus::default();
+
+        assert_eq!(bus.read(CONSOL), CONSOL_NO_KEYS);
+        bus.write(CONSOL, 0x00);
+        assert_eq!(bus.read(CONSOL), CONSOL_NO_KEYS);
+        bus.write(CONSOL, 0x7F);
+        assert_eq!(bus.read(CONSOL), CONSOL_NO_KEYS);
+    }
+
+    #[test]
+    fn pokey_serial_output_completes_immediately_for_sio_boot() {
+        let mut bus = Bus::default();
+
+        bus.write(XMTDON_TRANSMISSION_DONE_FLAG, 0x00);
+        bus.write(SEROUT_SERIAL_OUTPUT, 0x31);
+
+        assert_eq!(bus.read(XMTDON_TRANSMISSION_DONE_FLAG), 0xFF);
+    }
+
+    #[test]
     fn portb_maps_self_test_rom_from_hidden_os_slice() {
         let mut bus = Bus::default();
         let mut os_rom = vec![0xAA; 0x4000];
@@ -1944,10 +2017,19 @@ mod tests {
         assert_eq!(bus.read(0xBFFF), 0x11);
         assert_eq!(bus.read(0xC000), 0xCC);
 
-        bus.write(0xD500, 0x01);
+        bus.write(0xD501, 0x00);
+        assert_eq!(bus.read(0xA000), 0x44);
+        assert_eq!(bus.read(0xBFFF), 0x11);
+        assert_eq!(bus.read(0xC000), 0xCC);
+
+        bus.read(0xD509);
         assert_eq!(bus.read(0xA000), 0x33);
         assert_eq!(bus.read(0xBFFF), 0x11);
         assert_eq!(bus.read(0xC000), 0xCC);
+
+        bus.write(0xD508, 0x00);
+        assert_eq!(bus.read(0xA000), 0x00);
+        assert_eq!(bus.read(0xBFFF), 0x00);
     }
 
     #[test]
@@ -2055,6 +2137,36 @@ mod tests {
     }
 
     #[test]
+    fn cpu_adc_absolute_updates_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0xFE, // LDA #$FE
+                    0x18, // CLC
+                    0x6D, 0x10, 0x03, // ADC $0310
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0310, 0x03);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x01);
+        assert!(registers.status & StatusFlags::CARRY.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+    }
+
+    #[test]
     fn cpu_ora_absolute_updates_accumulator_flags() {
         let mut bus = Bus::default();
         bus.ram_mut()
@@ -2077,6 +2189,31 @@ mod tests {
 
         let registers = cpu.registers();
         assert_eq!(registers.a, 0xC0);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_ldy_absolute_loads_y() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xAC, 0x20, 0x03, // LDY $0320
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0320, 0x80);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.y, 0x80);
         assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
         assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
     }
