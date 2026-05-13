@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+
+probe_dir="${ACTION_PROBES_DIR:-$repo_root/../actionc/experiments/original-compiler-probes}"
+output_dir="${ACTION_VM_OUTPUT_DIR:-$probe_dir/outputs/vm}"
+original_dir="${ACTION_ORIGINAL_OUTPUT_DIR:-$probe_dir/outputs/original}"
+cart_rom="${ACTION_VM_CART:-$repo_root/../roms/action.rom}"
+os_rom="${ACTION_VM_OS:-$repo_root/../roms/rev02.rom}"
+max_steps="${ACTION_VM_MAX_STEPS:-60000000}"
+
+probe_names="
+abi_calls
+abi_system_call
+argthr
+arith
+array_params
+array_refs
+arrays
+bools
+control_flow
+functions
+locarr
+locals
+nested_calls
+pointers
+records
+retflow
+returns
+sargs
+signedge
+stridx
+strinit
+strlit
+strloc
+strmut
+strpass
+"
+
+probe_source() {
+  case "$1" in
+    abi_calls) echo abi_calls.act ;;
+    abi_system_call) echo abi_system_call.act ;;
+    argthr) echo argthr.act ;;
+    arith) echo arith.act ;;
+    array_params) echo array_params.act ;;
+    array_refs) echo array_refs.act ;;
+    arrays) echo arrays.act ;;
+    bools) echo bools.act ;;
+    control_flow) echo control_flow.act ;;
+    functions) echo functions.act ;;
+    locarr) echo locarr.act ;;
+    locals) echo locals.act ;;
+    nested_calls) echo nested_calls.act ;;
+    pointers) echo pointers.act ;;
+    records) echo records.act ;;
+    retflow) echo retflow.act ;;
+    returns) echo returns.act ;;
+    sargs) echo sargs.act ;;
+    signedge) echo signedge.act ;;
+    stridx) echo stridx.act ;;
+    strinit) echo strinit.act ;;
+    strlit) echo strlit.act ;;
+    strloc) echo strloc.act ;;
+    strmut) echo strmut.act ;;
+    strpass) echo strpass.act ;;
+    *) return 1 ;;
+  esac
+}
+
+probe_output() {
+  case "$1" in
+    abi_calls) echo ABICALLS.COM ;;
+    abi_system_call) echo ABISYS.COM ;;
+    argthr) echo ARGTHR.COM ;;
+    arith) echo ARITH.COM ;;
+    array_params) echo ARRPAR.COM ;;
+    array_refs) echo ARRREF.COM ;;
+    arrays) echo ARRAYS.COM ;;
+    bools) echo BOOLS.COM ;;
+    control_flow) echo CONTROL.COM ;;
+    functions) echo FUNC.COM ;;
+    locarr) echo LOCARR.COM ;;
+    locals) echo LOCALS.COM ;;
+    nested_calls) echo NESTED.COM ;;
+    pointers) echo POINTERS.COM ;;
+    records) echo RECORDS.COM ;;
+    retflow) echo RETFLOW.COM ;;
+    returns) echo RETURNS.COM ;;
+    sargs) echo SARGS.COM ;;
+    signedge) echo SIGNEDGE.COM ;;
+    stridx) echo STRIDX.COM ;;
+    strinit) echo STRINIT.COM ;;
+    strlit) echo STRLIT.COM ;;
+    strloc) echo STRLOC.COM ;;
+    strmut) echo STRMUT.COM ;;
+    strpass) echo STRPASS.COM ;;
+    *) return 1 ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  scripts/run-probe <probe-name> [<probe-name> ...]
+  scripts/run-probe all
+  scripts/run-probe --list
+
+Environment:
+  ACTION_PROBES_DIR          Probe source directory
+  ACTION_VM_OUTPUT_DIR       Output directory for VM-generated .COM files
+  ACTION_ORIGINAL_OUTPUT_DIR Original .COM directory for cmp summaries
+  ACTION_VM_CART             Action! cartridge ROM path
+  ACTION_VM_OS               Atari OS ROM path
+  ACTION_VM_MAX_STEPS        Max VM steps per probe, default 60000000
+EOF
+}
+
+list_probes() {
+  printf '%s\n' "$probe_names" | sed '/^$/d' | sort
+}
+
+require_file() {
+  local path="$1"
+  local label="$2"
+  if [[ ! -f "$path" ]]; then
+    echo "missing $label: $path" >&2
+    exit 1
+  fi
+}
+
+run_probe() {
+  local probe="$1"
+  local source_name
+  local output_name
+
+  if ! source_name="$(probe_source "$probe")" || ! output_name="$(probe_output "$probe")"; then
+    echo "unknown probe: $probe" >&2
+    echo "known probes:" >&2
+    list_probes >&2
+    exit 1
+  fi
+
+  local source_path="$probe_dir/$source_name"
+  local output_path="$output_dir/$output_name"
+  local original_path="$original_dir/$output_name"
+  local h_source
+  local monitor_input
+  h_source="$(printf '%s' "$source_name" | tr '[:lower:]' '[:upper:]')"
+  printf -v monitor_input 'C "H:%s"\nW "H:%s"\n' "$h_source" "$output_name"
+
+  require_file "$source_path" "probe source"
+  mkdir -p "$output_dir"
+  rm -f "$output_path"
+
+  echo "==> $probe: $source_name -> $output_name"
+  (
+    cd "$repo_root"
+    cargo run --quiet -- run \
+      --cart "$cart_rom" \
+      --os "$os_rom" \
+      --hotpatch action-q-input \
+      --hotpatch action-headless-getkey \
+      --host-file "$h_source:$source_path" \
+      --host-output "$output_name:$output_path" \
+      --monitor-key-at-pc '$A2E0' \
+      --q-input-at-pc-after '$A2E0:$B2F5:'"$monitor_input" \
+      --max-steps "$max_steps" \
+      --history 20
+  )
+
+  if [[ ! -s "$output_path" ]]; then
+    echo "FAILED: $output_path was not written or is empty" >&2
+    exit 1
+  fi
+
+  local size
+  size="$(wc -c < "$output_path" | tr -d ' ')"
+  if [[ -f "$original_path" ]]; then
+    if cmp -s "$original_path" "$output_path"; then
+      echo "    wrote $size bytes; matches original"
+    else
+      echo "    wrote $size bytes; differs from original $original_path"
+    fi
+  else
+    echo "    wrote $size bytes; no original file for comparison"
+  fi
+}
+
+if [[ $# -eq 0 ]]; then
+  usage >&2
+  exit 2
+fi
+
+case "$1" in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  --list)
+    list_probes
+    exit 0
+    ;;
+  all)
+    shift
+    if [[ $# -ne 0 ]]; then
+      echo "'all' cannot be combined with explicit probe names" >&2
+      exit 2
+    fi
+    probes=()
+    while IFS= read -r probe; do
+      probes+=("$probe")
+    done < <(list_probes)
+    ;;
+  *)
+    probes=("$@")
+    ;;
+esac
+
+require_file "$cart_rom" "Action! cartridge ROM"
+require_file "$os_rom" "Atari OS ROM"
+
+for probe in "${probes[@]}"; do
+  run_probe "$probe"
+done

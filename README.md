@@ -39,10 +39,27 @@ implemented yet.
 cargo test
 cargo run -- inspect --cart path/to/action.rom
 cargo run -- run --cart path/to/action.rom --os path/to/atari-os.rom --max-cycles 1000 --trace-pc
+scripts/run-probe functions
+scripts/run-probe all
 ```
 
 `run` currently resets and steps the bootstrap CPU through the mapped bus.
 For phase 1, `run` requires both the Action! cartridge ROM and an Atari OS ROM.
+
+`scripts/run-probe` runs the original Action! compiler in the VM against probe
+sources from `../actionc/experiments/original-compiler-probes`. It feeds monitor
+commands equivalent to:
+
+```text
+C "H:FUNCTIONS.ACT"
+W "H:FUNC.COM"
+```
+
+By default it writes VM-generated load files to
+`../actionc/experiments/original-compiler-probes/outputs/vm` and compares them
+with matching files in `outputs/original` when present. Override paths with
+`ACTION_PROBES_DIR`, `ACTION_VM_OUTPUT_DIR`, `ACTION_ORIGINAL_OUTPUT_DIR`,
+`ACTION_VM_CART`, `ACTION_VM_OS`, or `ACTION_VM_MAX_STEPS`.
 
 ## Design Constraint
 
