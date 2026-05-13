@@ -76,31 +76,46 @@ The compiler later restores `top+1` from `vars.top1` before compiling editor
 text. That means source injection must preserve a coherent editor/window state
 before entering the monitor or must update `vars.top1` as part of the injection.
 
-## Injection Strategy
+## Implemented Injection Strategy
 
 For automation, prefer direct source injection over simulated typing, but inject
 the editor data structure, not a contiguous text blob.
 
-Minimum viable injection plan:
+The VM now exposes `Bus::inject_action_source`, and the CLI can trigger it with
+`--inject-source-at-pc <pc:path>`. A useful editor-idle trigger is currently
+`$A2E0`, after the Action! editor has initialized its heap and scratch buffer.
+
+The implemented flow:
 
 1. Wait until Action! has completed editor initialization and `buf` points at a
    valid scratch buffer.
-2. Clear or replace the current source line list.
-3. Build one line record per source line in free RAM, with correct prev/next
-   links and length-prefixed ATASCII text.
-4. Set `top`, `bot`, and `cur` to the injected list.
-5. Update the saved current-window record (`vars.w1`, especially current-line
-   fields) or invoke the editor's save/restore path after injection.
-6. Ensure monitor/compiler state sees the program, either by entering monitor
-   after `top` is valid or by setting `vars.top1` consistently.
+2. Free the current source line list through a small reproduction of Action!'s
+   free-list behavior.
+3. Allocate one live Action! heap block per host source line.
+4. Build each line record with correct prev/next links, allocation size, line
+   length, and ATASCII text bytes.
+5. Set `top`, `bot`, `cur`, `vars.w1` top/bottom/current fields, and
+   `vars.top1`.
+6. Copy the first source line into the editor scratch buffer and clear dirty
+   state.
 7. Use keyboard simulation only for high-level monitor commands such as
    Shift+Control+M, `C` + Return, and `E` + Return.
 
-Open questions for implementation:
+The companion `Bus::action_editor_lines` API and
+`--dump-editor-lines-at-pc <pc>` CLI option walk the live linked list and are
+intended for sanity checks while automation evolves.
 
-- The safest address range for injected line allocations should be discovered
-  from the live Action! heap after boot rather than hardcoded.
-- The allocator free list should either be updated to exclude injected records,
-  or injection should call/reproduce the allocator's allocation logic.
-- Window save state should be verified against a live trace before relying on
-  only `top`, `bot`, and `cur`.
+The compiler's completion signal is only a speaker beep. Both success and error
+paths beep; errors additionally print an `Error:` line with a numeric code. The
+VM therefore records speaker writes and can dump/decode the Atari text screen
+with `--dump-screen-at-pc <pc>` or `--dump-screen-on-stop`.
+
+Remaining questions:
+
+- The current injector replaces the editor text directly; it does not call the
+  original editor insertion routines.
+- Compile success should be treated as "compile command completed, a speaker
+  write occurred, and no visible `Error:` line was detected"; watching
+  code-size/output ranges can make that stronger later.
+- Window save state has been updated from observed fields, but should still be
+  checked against more live editor navigation traces.

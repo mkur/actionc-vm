@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 use action_compiler_vm::{
     ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ATARI_KEY_C, ATARI_KEY_E, ATARI_KEY_RETURN,
-    AddressRange, BusAccess, BusEvent, CpuError, CpuRegisters, CpuStep, ImageKind, VmConfig,
+    ActionEditorLine, ActionSourceInjectionReport, AddressRange, BusAccess, BusEvent, CpuError,
+    CpuRegisters, CpuStep, ImageKind, TextScreenSnapshot, VmConfig,
 };
 
 fn main() {
@@ -88,6 +90,9 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     }
     vm.reset_cpu();
     let mut deferred_key_codes = options.deferred_key_codes.clone();
+    let mut deferred_source_injections = options.deferred_source_injections.clone();
+    let mut editor_line_dump_pcs = options.editor_line_dump_pcs.clone();
+    let mut screen_dump_pcs = options.screen_dump_pcs.clone();
     println!(
         "compiler VM loaded {} image(s); reset PC=${:04X}",
         vm.images().len(),
@@ -97,6 +102,46 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     let mut history = StepHistory::new(options.history_len);
     for step_index in 0..options.max_steps {
         let pc = vm.cpu().registers().pc;
+        let mut source_index = 0;
+        while source_index < deferred_source_injections.len() {
+            if deferred_source_injections[source_index].pc == pc {
+                let deferred = deferred_source_injections.remove(source_index);
+                let source = fs::read(&deferred.path).map_err(|err| {
+                    format!(
+                        "failed to read source `{}` for injection: {err}",
+                        deferred.path.display()
+                    )
+                })?;
+                let report = vm.bus_mut().inject_action_source(&source)?;
+                print_source_injection_report(&deferred, &report);
+                print_editor_lines(vm.bus())?;
+            } else {
+                source_index += 1;
+            }
+        }
+
+        let mut dump_index = 0;
+        while dump_index < editor_line_dump_pcs.len() {
+            if editor_line_dump_pcs[dump_index] == pc {
+                let dump_pc = editor_line_dump_pcs.remove(dump_index);
+                eprintln!("Action! editor lines at PC=${dump_pc:04X}:");
+                print_editor_lines(vm.bus())?;
+            } else {
+                dump_index += 1;
+            }
+        }
+
+        let mut screen_dump_index = 0;
+        while screen_dump_index < screen_dump_pcs.len() {
+            if screen_dump_pcs[screen_dump_index] == pc {
+                let dump_pc = screen_dump_pcs.remove(screen_dump_index);
+                eprintln!("text screen at PC=${dump_pc:04X}:");
+                print_text_screen(&vm.bus().text_screen_snapshot(40, 24));
+            } else {
+                screen_dump_index += 1;
+            }
+        }
+
         let mut deferred_index = 0;
         while deferred_index < deferred_key_codes.len() {
             if deferred_key_codes[deferred_index].pc == pc {
@@ -125,6 +170,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                         vm.bus().events(),
                         vm.bus().cartridge().map(|cart| cart.mapping_info()),
                     );
+                    print_run_observations(vm.bus(), options.dump_screen_on_stop);
                     return Ok(());
                 }
             }
@@ -136,6 +182,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     vm.bus().events(),
                     vm.bus().cartridge().map(|cart| cart.mapping_info()),
                 );
+                print_run_observations(vm.bus(), options.dump_screen_on_stop);
                 return Err(format!("unsupported opcode ${opcode:02X} at ${pc:04X}"));
             }
             Err(CpuError::Halted) => {
@@ -146,6 +193,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     vm.bus().events(),
                     vm.bus().cartridge().map(|cart| cart.mapping_info()),
                 );
+                print_run_observations(vm.bus(), options.dump_screen_on_stop);
                 return Err("CPU halted".to_string());
             }
         }
@@ -158,6 +206,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 vm.bus().events(),
                 vm.bus().cartridge().map(|cart| cart.mapping_info()),
             );
+            print_run_observations(vm.bus(), options.dump_screen_on_stop);
         }
     }
 
@@ -182,12 +231,22 @@ struct CliOptions {
     watch_ranges: Vec<AddressRange>,
     key_codes: Vec<u8>,
     deferred_key_codes: Vec<DeferredKeyCode>,
+    deferred_source_injections: Vec<DeferredSourceInjection>,
+    editor_line_dump_pcs: Vec<u16>,
+    screen_dump_pcs: Vec<u16>,
+    dump_screen_on_stop: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeferredKeyCode {
     pc: u16,
     key_code: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredSourceInjection {
+    pc: u16,
+    path: PathBuf,
 }
 
 impl Default for CliOptions {
@@ -203,6 +262,10 @@ impl Default for CliOptions {
             watch_ranges: Vec::new(),
             key_codes: Vec::new(),
             deferred_key_codes: Vec::new(),
+            deferred_source_injections: Vec::new(),
+            editor_line_dump_pcs: Vec::new(),
+            screen_dump_pcs: Vec::new(),
+            dump_screen_on_stop: false,
         }
     }
 }
@@ -224,6 +287,10 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut watch_ranges = Vec::new();
     let mut key_codes = Vec::new();
     let mut deferred_key_codes = Vec::new();
+    let mut deferred_source_injections = Vec::new();
+    let mut editor_line_dump_pcs = Vec::new();
+    let mut screen_dump_pcs = Vec::new();
+    let mut dump_screen_on_stop = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -291,6 +358,24 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let value = required_value(&args, index, "--action-command-at-pc")?;
                 deferred_key_codes.extend(parse_action_command_at_pc(value)?);
             }
+            "--inject-source-at-pc" => {
+                index += 1;
+                let value = required_value(&args, index, "--inject-source-at-pc")?;
+                deferred_source_injections.push(parse_source_injection_at_pc(value)?);
+            }
+            "--dump-editor-lines-at-pc" => {
+                index += 1;
+                let value = required_value(&args, index, "--dump-editor-lines-at-pc")?;
+                editor_line_dump_pcs.push(parse_address(value)?);
+            }
+            "--dump-screen-at-pc" => {
+                index += 1;
+                let value = required_value(&args, index, "--dump-screen-at-pc")?;
+                screen_dump_pcs.push(parse_address(value)?);
+            }
+            "--dump-screen-on-stop" => {
+                dump_screen_on_stop = true;
+            }
             "--preset" => {
                 index += 1;
                 let value = required_value(&args, index, "--preset")?;
@@ -342,6 +427,10 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         watch_ranges,
         key_codes,
         deferred_key_codes,
+        deferred_source_injections,
+        editor_line_dump_pcs,
+        screen_dump_pcs,
+        dump_screen_on_stop,
     })
 }
 
@@ -443,6 +532,19 @@ fn parse_action_command_at_pc(value: &str) -> Result<Vec<DeferredKeyCode>, Strin
     ])
 }
 
+fn parse_source_injection_at_pc(value: &str) -> Result<DeferredSourceInjection, String> {
+    let Some((pc, path)) = value.split_once(':') else {
+        return Err(format!("source injection `{value}` must be pc:path"));
+    };
+    if path.is_empty() {
+        return Err("source injection path must not be empty".to_string());
+    }
+    Ok(DeferredSourceInjection {
+        pc: parse_address(pc)?,
+        path: PathBuf::from(path),
+    })
+}
+
 fn parse_range(value: &str) -> Result<AddressRange, String> {
     let Some((start, end)) = value.split_once(':') else {
         return Err(format!("range `{value}` must be start:end"));
@@ -490,6 +592,79 @@ fn print_step(step: &CpuStep) {
         "{:08} PC=${:04X} OP=${:02X} A=${:02X} X=${:02X} Y=${:02X} SP=${:02X} P=${:02X}",
         step.cycles, step.pc, step.opcode, regs.a, regs.x, regs.y, regs.sp, regs.status
     );
+}
+
+fn print_source_injection_report(
+    deferred: &DeferredSourceInjection,
+    report: &ActionSourceInjectionReport,
+) {
+    eprintln!(
+        "injected source `{}` at PC=${:04X}: {} line(s), first={}, last={}, allocated={} byte(s), free_head=${:04X}",
+        deferred.path.display(),
+        deferred.pc,
+        report.line_count,
+        format_optional_address(report.first_line),
+        format_optional_address(report.last_line),
+        report.allocated_bytes,
+        report.free_head
+    );
+}
+
+fn print_editor_lines(bus: &action_compiler_vm::Bus) -> Result<(), String> {
+    let lines = bus.action_editor_lines()?;
+    if lines.is_empty() {
+        eprintln!("  <empty>");
+        return Ok(());
+    }
+    for (index, line) in lines.iter().enumerate() {
+        print_editor_line(index, line);
+    }
+    Ok(())
+}
+
+fn print_editor_line(index: usize, line: &ActionEditorLine) {
+    eprintln!(
+        "  {:03} @ ${:04X}: prev=${:04X} next=${:04X} alloc={} len={} `{}`",
+        index + 1,
+        line.address,
+        line.previous,
+        line.next,
+        line.allocation_size,
+        line.length,
+        String::from_utf8_lossy(&line.text)
+    );
+}
+
+fn print_run_observations(bus: &action_compiler_vm::Bus, dump_screen: bool) {
+    if bus.speaker_write_count() != 0 {
+        let last = bus
+            .last_speaker_write()
+            .map(|value| format!("${value:02X}"))
+            .unwrap_or_else(|| "<none>".to_string());
+        eprintln!("speaker writes: {} last={last}", bus.speaker_write_count());
+    }
+    if let Some(error_line) = bus.visible_action_error() {
+        eprintln!("visible Action! error: `{error_line}`");
+    }
+    if dump_screen {
+        print_text_screen(&bus.text_screen_snapshot(40, 24));
+    }
+}
+
+fn print_text_screen(snapshot: &TextScreenSnapshot) {
+    eprintln!(
+        "screen base=${:04X}, {}x{}:",
+        snapshot.base, snapshot.columns, snapshot.rows
+    );
+    for line in &snapshot.lines {
+        eprintln!("  |{}|", line.trim_end());
+    }
+}
+
+fn format_optional_address(address: Option<u16>) -> String {
+    address
+        .map(|address| format!("${address:04X}"))
+        .unwrap_or_else(|| "<none>".to_string())
 }
 
 fn cart_word(cartridge: &action_compiler_vm::Cartridge, address: u16) -> u16 {
@@ -585,6 +760,14 @@ fn print_help() {
                               Queue Action! monitor key when execution reaches pc\n  \
          --action-command-at-pc <pc:cmd>\n  \
                               Queue monitor cmd plus Return; cmd is compile or editor\n  \
+         --inject-source-at-pc <pc:path>\n  \
+                              Inject host source as Action! editor lines at pc\n  \
+         --dump-editor-lines-at-pc <pc>\n  \
+                              Dump Action! editor line list when execution reaches pc\n  \
+         --dump-screen-at-pc <pc>\n  \
+                              Dump decoded 40x24 text screen when execution reaches pc\n  \
+         --dump-screen-on-stop\n  \
+                              Dump decoded 40x24 text screen in stop reports\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );
@@ -678,6 +861,42 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn parses_source_injection_at_pc() {
+        let options = parse_options(vec![
+            "--inject-source-at-pc".to_string(),
+            "$A2E0:samples/hello.act".to_string(),
+            "--dump-editor-lines-at-pc".to_string(),
+            "$A2E0".to_string(),
+            "--dump-screen-at-pc".to_string(),
+            "$A2F0".to_string(),
+            "--dump-screen-on-stop".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options.deferred_source_injections,
+            vec![DeferredSourceInjection {
+                pc: 0xA2E0,
+                path: PathBuf::from("samples/hello.act")
+            }]
+        );
+        assert_eq!(options.editor_line_dump_pcs, vec![0xA2E0]);
+        assert_eq!(options.screen_dump_pcs, vec![0xA2F0]);
+        assert!(options.dump_screen_on_stop);
+    }
+
+    #[test]
+    fn rejects_malformed_source_injection() {
+        let err = parse_options(vec![
+            "--inject-source-at-pc".to_string(),
+            "$A2E0".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(err.contains("must be pc:path"));
     }
 
     #[test]

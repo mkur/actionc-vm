@@ -17,10 +17,29 @@ pub const ANTIC_VCOUNT: u16 = 0xD40B;
 pub const RTCLOK_LOW: u16 = 0x0014;
 pub const KBCODE_PRIOR_KEY_CODE: u16 = 0x02F2;
 pub const CH_KEY_CODE: u16 = 0x02FC;
+pub const SAVMSC_SCREEN_MEMORY_POINTER: u16 = 0x0058;
+pub const SDLSTL_DISPLAY_LIST_POINTER: u16 = 0x0230;
 pub const ACTION_MONITOR_KEY_CODE: u8 = 0xE5;
 pub const ATARI_KEY_RETURN: u8 = 0x0C;
 pub const ATARI_KEY_C: u8 = 0x12;
 pub const ATARI_KEY_E: u8 = 0x2A;
+pub const ACTION_AFBASE: u16 = 0x0080;
+pub const ACTION_CHOFF: u16 = 0x008D;
+pub const ACTION_LNUM: u16 = 0x008E;
+pub const ACTION_DIRTY: u16 = 0x008F;
+pub const ACTION_TOP: u16 = 0x0090;
+pub const ACTION_BOT: u16 = 0x0092;
+pub const ACTION_CUR: u16 = 0x0094;
+pub const ACTION_BUF: u16 = 0x009B;
+pub const ACTION_DIRTYF: u16 = 0x00C3;
+pub const ACTION_VARS_W1: u16 = 0x0480;
+pub const ACTION_VARS_TOP1: u16 = 0x048F;
+pub const ACTION_LINEMAX: u16 = 0x04CF;
+pub const ACTION_WINDOW_TOP_OFFSET: u16 = 4;
+pub const ACTION_WINDOW_BOT_OFFSET: u16 = 6;
+pub const ACTION_WINDOW_CUR_OFFSET: u16 = 8;
+pub const ACTION_LINE_HEADER_SIZE: u16 = 6;
+pub const ACTION_LINE_ALLOC_OVERHEAD: u16 = 7;
 pub const RECVDN_RECEIVE_DONE_FLAG: u16 = 0x0039;
 pub const XMTDON_TRANSMISSION_DONE_FLAG: u16 = 0x003A;
 pub const TIMFLG_TIMEOUT_FLAG: u16 = 0x0317;
@@ -247,6 +266,33 @@ impl CompilerVm {
         self.images.push(image);
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionSourceInjectionReport {
+    pub line_count: usize,
+    pub first_line: Option<u16>,
+    pub last_line: Option<u16>,
+    pub allocated_bytes: u16,
+    pub free_head: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionEditorLine {
+    pub address: u16,
+    pub previous: u16,
+    pub next: u16,
+    pub allocation_size: u16,
+    pub length: u8,
+    pub text: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextScreenSnapshot {
+    pub base: u16,
+    pub columns: usize,
+    pub rows: usize,
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -494,6 +540,13 @@ impl Cpu {
                 let target = self.fetch_word(bus);
                 self.registers.pc = target;
                 self.cycles += 3;
+            }
+            0x4D => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.registers.a ^= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
             }
             0x4E => {
                 let address = self.fetch_word(bus);
@@ -827,6 +880,12 @@ impl Cpu {
                 self.compare(self.registers.y, value);
                 self.cycles += 2;
             }
+            0xC4 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.compare(self.registers.y, value);
+                self.cycles += 3;
+            }
             0xC5 => {
                 let address = self.fetch_byte(bus) as u16;
                 let value = bus.read(address);
@@ -854,6 +913,12 @@ impl Cpu {
                 self.registers.x = self.registers.x.wrapping_sub(1);
                 self.set_zn(self.registers.x);
                 self.cycles += 2;
+            }
+            0xCC => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.compare(self.registers.y, value);
+                self.cycles += 4;
             }
             0xCD => {
                 let address = self.fetch_word(bus);
@@ -1257,6 +1322,211 @@ impl Bus {
         self.pending_key_codes.push_back(key_code);
     }
 
+    pub fn inject_action_source(
+        &mut self,
+        source: &[u8],
+    ) -> Result<ActionSourceInjectionReport, String> {
+        let lines = split_action_source_lines(source);
+        let line_max = self.action_line_max();
+        for line in &lines {
+            if line.len() > line_max as usize {
+                return Err(format!(
+                    "source line is {} byte(s), exceeding Action! line limit {line_max}",
+                    line.len()
+                ));
+            }
+        }
+
+        let buf = self.ram.read_word(ACTION_BUF);
+        if buf == 0 {
+            return Err(
+                "Action! edit buffer pointer is zero; editor is not initialized".to_string(),
+            );
+        }
+
+        let old_top = self.ram.read_word(ACTION_TOP);
+        if old_top != 0 {
+            self.free_action_line_list(old_top)?;
+        }
+
+        let mut records = Vec::new();
+        let mut allocated_bytes = 0u16;
+        for &line in &lines {
+            let allocation_size = ACTION_LINE_ALLOC_OVERHEAD
+                .checked_add(line.len() as u16)
+                .ok_or_else(|| "source line allocation size overflowed".to_string())?;
+            let address = self.allocate_action_heap(allocation_size)?;
+            allocated_bytes = allocated_bytes
+                .checked_add(allocation_size)
+                .ok_or_else(|| "source allocation total overflowed".to_string())?;
+            records.push((address, allocation_size, line));
+        }
+
+        for index in 0..records.len() {
+            let (address, allocation_size, line) = records[index];
+            let previous = if index == 0 { 0 } else { records[index - 1].0 };
+            let next = if index + 1 == records.len() {
+                0
+            } else {
+                records[index + 1].0
+            };
+
+            self.ram.write_word(address, previous);
+            self.ram
+                .write_word(address.wrapping_add(2), allocation_size);
+            self.ram.write_word(address.wrapping_add(4), next);
+            self.ram.write(
+                address.wrapping_add(ACTION_LINE_HEADER_SIZE),
+                line.len() as u8,
+            );
+            if !line.is_empty() {
+                self.ram
+                    .map(address.wrapping_add(ACTION_LINE_HEADER_SIZE + 1), line)?;
+            }
+        }
+
+        let first_line = records.first().map(|record| record.0);
+        let last_line = records.last().map(|record| record.0);
+        let first = first_line.unwrap_or(0);
+        let last = last_line.unwrap_or(0);
+
+        self.ram.write_word(ACTION_TOP, first);
+        self.ram.write_word(ACTION_BOT, last);
+        self.ram.write_word(ACTION_CUR, first);
+        self.ram.write(ACTION_DIRTY, 0);
+        self.ram.write(ACTION_DIRTYF, 0);
+        self.ram.write(ACTION_CHOFF, 0);
+        self.ram.write(ACTION_LNUM, 0);
+        self.ram
+            .write_word(ACTION_VARS_W1.wrapping_add(ACTION_WINDOW_TOP_OFFSET), first);
+        self.ram
+            .write_word(ACTION_VARS_W1.wrapping_add(ACTION_WINDOW_BOT_OFFSET), last);
+        self.ram
+            .write_word(ACTION_VARS_W1.wrapping_add(ACTION_WINDOW_CUR_OFFSET), first);
+        self.ram.write(ACTION_VARS_W1.wrapping_add(3), 0);
+        self.ram.write(ACTION_VARS_TOP1, (first >> 8) as u8);
+
+        if let Some((_, _, first_text)) = records.first() {
+            self.write_action_scratch_line(first_text)?;
+        } else {
+            self.ram.write(buf, 0);
+        }
+
+        Ok(ActionSourceInjectionReport {
+            line_count: records.len(),
+            first_line,
+            last_line,
+            allocated_bytes,
+            free_head: self.ram.read_word(ACTION_AFBASE),
+        })
+    }
+
+    pub fn action_editor_lines(&self) -> Result<Vec<ActionEditorLine>, String> {
+        let mut lines = Vec::new();
+        let mut address = self.ram.read_word(ACTION_TOP);
+        let mut previous = 0;
+
+        for _ in 0..1024 {
+            if address == 0 {
+                return Ok(lines);
+            }
+
+            let line_previous = self.ram.read_word(address);
+            let allocation_size = self.ram.read_word(address.wrapping_add(2));
+            let next = self.ram.read_word(address.wrapping_add(4));
+            let length = self.ram.read(address.wrapping_add(ACTION_LINE_HEADER_SIZE));
+            if allocation_size < ACTION_LINE_ALLOC_OVERHEAD {
+                return Err(format!(
+                    "line at ${address:04X} has invalid allocation size {allocation_size}"
+                ));
+            }
+            if length as u16 > allocation_size - ACTION_LINE_ALLOC_OVERHEAD {
+                return Err(format!(
+                    "line at ${address:04X} length {length} exceeds allocation payload"
+                ));
+            }
+            if line_previous != previous {
+                return Err(format!(
+                    "line at ${address:04X} has prev ${line_previous:04X}, expected ${previous:04X}"
+                ));
+            }
+
+            let text_start = address.wrapping_add(ACTION_LINE_HEADER_SIZE + 1);
+            let mut text = Vec::with_capacity(length as usize);
+            for offset in 0..length as u16 {
+                text.push(self.ram.read(text_start.wrapping_add(offset)));
+            }
+
+            lines.push(ActionEditorLine {
+                address,
+                previous: line_previous,
+                next,
+                allocation_size,
+                length,
+                text,
+            });
+
+            previous = address;
+            address = next;
+        }
+
+        Err("Action! editor line list did not terminate within 1024 lines".to_string())
+    }
+
+    pub fn text_screen_snapshot(&self, columns: usize, rows: usize) -> TextScreenSnapshot {
+        let base = self.text_screen_base();
+        let mut lines = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let mut line = String::with_capacity(columns);
+            for column in 0..columns {
+                let offset = row
+                    .checked_mul(columns)
+                    .and_then(|offset| offset.checked_add(column))
+                    .unwrap_or(usize::MAX);
+                let value = if offset <= u16::MAX as usize {
+                    self.ram.read(base.wrapping_add(offset as u16))
+                } else {
+                    0
+                };
+                line.push(atari_screen_code_to_ascii(value));
+            }
+            lines.push(line);
+        }
+        TextScreenSnapshot {
+            base,
+            columns,
+            rows,
+            lines,
+        }
+    }
+
+    pub fn visible_action_error(&self) -> Option<String> {
+        let snapshot = self.text_screen_snapshot(40, 24);
+        if let Some(line) = snapshot
+            .lines
+            .iter()
+            .map(|line| line.trim_end().to_string())
+            .find(|line| line.to_ascii_lowercase().contains("error:"))
+        {
+            return Some(line);
+        }
+        self.decoded_ram_line_containing_action_error()
+    }
+
+    pub fn speaker_write_count(&self) -> u64 {
+        self.io.speaker_write_count()
+    }
+
+    pub fn last_speaker_write(&self) -> Option<u8> {
+        self.io.last_speaker_write()
+    }
+
+    pub fn text_screen_base(&self) -> u16 {
+        self.display_list_screen_base()
+            .or_else(|| ram_address(self.ram.read_word(SAVMSC_SCREEN_MEMORY_POINTER)))
+            .unwrap_or_else(|| self.ram.read_word(SAVMSC_SCREEN_MEMORY_POINTER))
+    }
+
     pub fn map_os_rom(&mut self, base: u16, bytes: Vec<u8>) -> Result<(), String> {
         self.os_rom = Some(RomRegion::new(base, bytes)?);
         Ok(())
@@ -1450,6 +1720,178 @@ impl Bus {
         let os_address = IO_BASE.wrapping_add(address - SELF_TEST_BASE);
         self.os_rom.as_ref()?.read(os_address)
     }
+
+    fn display_list_screen_base(&self) -> Option<u16> {
+        let display_list = ram_address(self.ram.read_word(SDLSTL_DISPLAY_LIST_POINTER))?;
+        for offset in 0..256u16 {
+            let instruction = self.ram.read(display_list.wrapping_add(offset));
+            let mode = instruction & 0x0F;
+            if instruction & 0x40 == 0 || mode < 2 {
+                continue;
+            }
+            let lo = self
+                .ram
+                .read(display_list.wrapping_add(offset.wrapping_add(1)));
+            let hi = self
+                .ram
+                .read(display_list.wrapping_add(offset.wrapping_add(2)));
+            let screen = u16::from_le_bytes([lo, hi]);
+            if let Some(screen) = ram_address(screen) {
+                return Some(screen);
+            }
+        }
+        None
+    }
+
+    fn decoded_ram_line_containing_action_error(&self) -> Option<String> {
+        let pattern = [0x25, 0x72, 0x72, 0x6F, 0x72, 0x1A];
+        for address in 0..=u16::MAX.wrapping_sub(pattern.len() as u16) {
+            if !pattern.iter().enumerate().all(|(offset, expected)| {
+                self.ram.read(address.wrapping_add(offset as u16)) & 0x7F == *expected
+            }) {
+                continue;
+            }
+            let mut line = String::with_capacity(40);
+            for offset in 0..40u16 {
+                line.push(atari_screen_code_to_ascii(
+                    self.ram.read(address.wrapping_add(offset)),
+                ));
+            }
+            return Some(format!("${address:04X}: {}", line.trim_end()));
+        }
+        None
+    }
+
+    fn action_line_max(&self) -> u8 {
+        let line_max = self.ram.read(ACTION_LINEMAX);
+        if line_max == 0 { 120 } else { line_max }
+    }
+
+    fn allocate_action_heap(&mut self, requested_size: u16) -> Result<u16, String> {
+        if requested_size < 4 {
+            return Err("Action! heap allocation request is too small".to_string());
+        }
+
+        let mut last = ACTION_AFBASE;
+        let mut current = self.ram.read_word(last);
+        while current != 0 {
+            let next = self.ram.read_word(current);
+            let size = self.ram.read_word(current.wrapping_add(2)) & 0x7FFF;
+            if size >= requested_size {
+                let remaining = size - requested_size;
+                if remaining >= 4 {
+                    let remainder = current.wrapping_add(requested_size);
+                    self.ram.write_word(last, remainder);
+                    self.ram.write_word(remainder, next);
+                    self.ram.write_word(remainder.wrapping_add(2), remaining);
+                    self.ram.write_word(current.wrapping_add(2), requested_size);
+                } else {
+                    self.ram.write_word(last, next);
+                    self.ram.write_word(current.wrapping_add(2), size);
+                }
+                return Ok(current);
+            }
+
+            last = current;
+            current = next;
+        }
+
+        Err(format!(
+            "Action! heap has no free block large enough for {requested_size} byte(s)"
+        ))
+    }
+
+    fn free_action_line_list(&mut self, top: u16) -> Result<(), String> {
+        let mut address = top;
+        for _ in 0..1024 {
+            if address == 0 {
+                return Ok(());
+            }
+            let next = self.ram.read_word(address.wrapping_add(4));
+            self.free_action_heap(address)?;
+            address = next;
+        }
+        Err("existing Action! editor line list did not terminate within 1024 lines".to_string())
+    }
+
+    fn free_action_heap(&mut self, address: u16) -> Result<(), String> {
+        let mut last = ACTION_AFBASE;
+        let mut current = self.ram.read_word(last);
+        while current != 0 && current < address {
+            last = current;
+            current = self.ram.read_word(current);
+        }
+
+        self.ram.write_word(address, current);
+        self.ram.write_word(last, address);
+        self.coalesce_action_free_blocks(address);
+        if last != ACTION_AFBASE {
+            self.coalesce_action_free_blocks(last);
+        }
+        Ok(())
+    }
+
+    fn coalesce_action_free_blocks(&mut self, start: u16) {
+        let mut block = start;
+        for _ in 0..2 {
+            let next = self.ram.read_word(block);
+            if next == 0 {
+                return;
+            }
+            let size = self.ram.read_word(block.wrapping_add(2)) & 0x7FFF;
+            if block.wrapping_add(size) != next {
+                block = next;
+                continue;
+            }
+            let next_size = self.ram.read_word(next.wrapping_add(2)) & 0x7FFF;
+            let after_next = self.ram.read_word(next);
+            self.ram.write_word(block, after_next);
+            self.ram
+                .write_word(block.wrapping_add(2), size.wrapping_add(next_size));
+        }
+    }
+
+    fn write_action_scratch_line(&mut self, line: &[u8]) -> Result<(), String> {
+        let buf = self.ram.read_word(ACTION_BUF);
+        if buf == 0 {
+            return Ok(());
+        }
+        self.ram.write(buf, line.len() as u8);
+        if line.is_empty() {
+            Ok(())
+        } else {
+            self.ram.map(buf.wrapping_add(1), line)
+        }
+    }
+}
+
+fn split_action_source_lines(source: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    for raw_line in source.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        lines.push(line);
+    }
+    if source.ends_with(b"\n") {
+        lines.pop();
+    }
+    lines
+}
+
+fn ram_address(address: u16) -> Option<u16> {
+    if address != 0 && address < OS_ROM_BASE {
+        Some(address)
+    } else {
+        None
+    }
+}
+
+fn atari_screen_code_to_ascii(value: u8) -> char {
+    let code = value & 0x7F;
+    match code {
+        0x00..=0x3F => (code + 0x20) as char,
+        0x60..=0x7A => code as char,
+        _ => '.',
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1487,6 +1929,8 @@ pub struct IoRegion {
     range: AddressRange,
     bytes: Vec<u8>,
     console_switches: u8,
+    speaker_write_count: u64,
+    last_speaker_write: Option<u8>,
 }
 
 impl Default for IoRegion {
@@ -1495,6 +1939,8 @@ impl Default for IoRegion {
             range: AddressRange::with_size(IO_BASE, IO_SIZE).expect("valid I/O range"),
             bytes: vec![0xFF; IO_SIZE],
             console_switches: CONSOL_NO_KEYS,
+            speaker_write_count: 0,
+            last_speaker_write: None,
         }
     }
 }
@@ -1519,6 +1965,8 @@ impl IoRegion {
             return false;
         }
         if address == CONSOL {
+            self.speaker_write_count += 1;
+            self.last_speaker_write = Some(value);
             return true;
         }
         self.bytes[(address - self.range.start) as usize] = value;
@@ -1527,6 +1975,14 @@ impl IoRegion {
 
     pub fn portb(&self) -> u8 {
         self.read(PORTB).expect("PORTB is inside I/O range")
+    }
+
+    pub fn speaker_write_count(&self) -> u64 {
+        self.speaker_write_count
+    }
+
+    pub fn last_speaker_write(&self) -> Option<u8> {
+        self.last_speaker_write
     }
 }
 
@@ -1825,8 +2281,20 @@ impl Memory {
         self.bytes[address as usize]
     }
 
+    pub fn read_word(&self, address: u16) -> u16 {
+        let lo = self.read(address);
+        let hi = self.read(address.wrapping_add(1));
+        u16::from_le_bytes([lo, hi])
+    }
+
     pub fn write(&mut self, address: u16, value: u8) {
         self.bytes[address as usize] = value;
+    }
+
+    pub fn write_word(&mut self, address: u16, value: u16) {
+        let [lo, hi] = value.to_le_bytes();
+        self.write(address, lo);
+        self.write(address.wrapping_add(1), hi);
     }
 
     pub fn map(&mut self, base: u16, bytes: &[u8]) -> Result<(), String> {
@@ -1897,6 +2365,17 @@ mod tests {
         let err = memory.map(0xFFFF, &[0x11, 0x22]).unwrap_err();
 
         assert!(err.contains("exceeds 64K"));
+    }
+
+    #[test]
+    fn memory_reads_and_writes_words_little_endian() {
+        let mut memory = Memory::default();
+
+        memory.write_word(0x2000, 0x1234);
+
+        assert_eq!(memory.read(0x2000), 0x34);
+        assert_eq!(memory.read(0x2001), 0x12);
+        assert_eq!(memory.read_word(0x2000), 0x1234);
     }
 
     #[test]
@@ -2023,6 +2502,8 @@ mod tests {
         assert_eq!(bus.read(CONSOL), CONSOL_NO_KEYS);
         bus.write(CONSOL, 0x7F);
         assert_eq!(bus.read(CONSOL), CONSOL_NO_KEYS);
+        assert_eq!(bus.speaker_write_count(), 2);
+        assert_eq!(bus.last_speaker_write(), Some(0x7F));
     }
 
     #[test]
@@ -2181,6 +2662,131 @@ mod tests {
                 && event.address == KBCODE_PRIOR_KEY_CODE
                 && event.value == ACTION_MONITOR_KEY_CODE
         }));
+    }
+
+    #[test]
+    fn bus_injects_action_source_as_editor_line_list() {
+        let mut bus = Bus::default();
+        bus.ram_mut().write_word(ACTION_AFBASE, 0x2000);
+        bus.ram_mut().write_word(0x2000, 0);
+        bus.ram_mut().write_word(0x2002, 0x1000);
+        bus.ram_mut().write_word(ACTION_BUF, 0x3000);
+        bus.ram_mut().write(ACTION_LINEMAX, 120);
+
+        let report = bus.inject_action_source(b"PROC Main()\nRETURN\n").unwrap();
+        let lines = bus.action_editor_lines().unwrap();
+
+        assert_eq!(report.line_count, 2);
+        assert_eq!(report.first_line, Some(0x2000));
+        assert_eq!(report.last_line, Some(0x2012));
+        assert_eq!(bus.ram().read_word(ACTION_TOP), 0x2000);
+        assert_eq!(bus.ram().read_word(ACTION_BOT), 0x2012);
+        assert_eq!(bus.ram().read_word(ACTION_CUR), 0x2000);
+        assert_eq!(
+            bus.ram()
+                .read_word(ACTION_VARS_W1.wrapping_add(ACTION_WINDOW_CUR_OFFSET)),
+            0x2000
+        );
+        assert_eq!(bus.ram().read(ACTION_VARS_TOP1), 0x20);
+        assert_eq!(bus.ram().read_word(ACTION_AFBASE), 0x201F);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].previous, 0);
+        assert_eq!(lines[0].next, 0x2012);
+        assert_eq!(lines[0].text, b"PROC Main()");
+        assert_eq!(lines[1].previous, 0x2000);
+        assert_eq!(lines[1].next, 0);
+        assert_eq!(lines[1].text, b"RETURN");
+        assert_eq!(bus.ram().read(0x3000), 11);
+        assert_eq!(bus.ram().read(0x3001), b'P');
+    }
+
+    #[test]
+    fn bus_rejects_source_lines_over_action_line_limit() {
+        let mut bus = Bus::default();
+        bus.ram_mut().write_word(ACTION_AFBASE, 0x2000);
+        bus.ram_mut().write_word(0x2000, 0);
+        bus.ram_mut().write_word(0x2002, 0x1000);
+        bus.ram_mut().write_word(ACTION_BUF, 0x3000);
+        bus.ram_mut().write(ACTION_LINEMAX, 3);
+
+        let err = bus.inject_action_source(b"TOO LONG").unwrap_err();
+
+        assert!(err.contains("exceeding Action! line limit 3"));
+    }
+
+    #[test]
+    fn bus_replaces_existing_action_source_lines() {
+        let mut bus = Bus::default();
+        bus.ram_mut().write_word(ACTION_AFBASE, 0x2000);
+        bus.ram_mut().write_word(0x2000, 0);
+        bus.ram_mut().write_word(0x2002, 0x1000);
+        bus.ram_mut().write_word(ACTION_BUF, 0x3000);
+        bus.ram_mut().write(ACTION_LINEMAX, 120);
+
+        bus.inject_action_source(b"FIRST\nSECOND\n").unwrap();
+        let report = bus.inject_action_source(b"NEW\n").unwrap();
+        let lines = bus.action_editor_lines().unwrap();
+
+        assert_eq!(report.line_count, 1);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].address, 0x2000);
+        assert_eq!(lines[0].text, b"NEW");
+        assert_eq!(bus.ram().read_word(ACTION_AFBASE), 0x200A);
+    }
+
+    #[test]
+    fn bus_decodes_text_screen_and_detects_visible_action_error() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .write_word(SAVMSC_SCREEN_MEMORY_POINTER, 0x4000);
+        bus.ram_mut()
+            .map(
+                0x4000,
+                &[0x25, 0x72, 0x72, 0x6F, 0x72, 0x1A, 0x00, 0x11, 0x17],
+            )
+            .unwrap();
+
+        let snapshot = bus.text_screen_snapshot(9, 1);
+
+        assert_eq!(snapshot.base, 0x4000);
+        assert_eq!(snapshot.lines, vec!["Error: 17"]);
+        assert_eq!(bus.visible_action_error(), Some("Error: 17".to_string()));
+    }
+
+    #[test]
+    fn bus_prefers_display_list_lms_for_text_screen_base() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .write_word(SAVMSC_SCREEN_MEMORY_POINTER, 0xFC40);
+        bus.ram_mut()
+            .write_word(SDLSTL_DISPLAY_LIST_POINTER, 0x3000);
+        bus.ram_mut()
+            .map(0x3000, &[0x70, 0x70, 0x42, 0x00, 0x40])
+            .unwrap();
+        bus.ram_mut().map(0x4000, &[0x28, 0x29]).unwrap();
+
+        let snapshot = bus.text_screen_snapshot(2, 1);
+
+        assert_eq!(snapshot.base, 0x4000);
+        assert_eq!(snapshot.lines, vec!["HI"]);
+    }
+
+    #[test]
+    fn bus_finds_visible_action_error_by_scanning_ram_when_screen_base_is_invalid() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .write_word(SAVMSC_SCREEN_MEMORY_POINTER, 0xFC40);
+        bus.ram_mut()
+            .map(
+                0x4800,
+                &[0x25, 0x72, 0x72, 0x6F, 0x72, 0x1A, 0x00, 0x11, 0x17],
+            )
+            .unwrap();
+
+        assert_eq!(
+            bus.visible_action_error(),
+            Some("$4800: Error: 17".to_string())
+        );
     }
 
     #[test]
@@ -2730,6 +3336,33 @@ mod tests {
     }
 
     #[test]
+    fn cpu_eor_absolute_updates_accumulator_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x0F, // LDA #$0F
+                    0x4D, 0x00, 0x30, // EOR $3000
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x3000, 0xF0);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0xFF);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert_eq!(registers.pc, 0x0205);
+    }
+
+    #[test]
     fn cpu_and_absolute_x_updates_accumulator_flags() {
         let mut bus = Bus::default();
         bus.ram_mut()
@@ -2902,6 +3535,38 @@ mod tests {
         assert!(registers.status & StatusFlags::ZERO.bits() != 0);
         assert!(registers.status & StatusFlags::CARRY.bits() != 0);
         assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_cpy_zero_page_and_absolute_set_compare_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA0, 0x40, // LDY #$40
+                    0xC4, 0x20, // CPY $20
+                    0xCC, 0x00, 0x30, // CPY $3000
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0020, 0x41);
+        bus.ram_mut().write(0x3000, 0x40);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        let after_zero_page = cpu.registers();
+        cpu.step(&mut bus).unwrap();
+        let after_absolute = cpu.registers();
+
+        assert_eq!(after_zero_page.status & StatusFlags::CARRY.bits(), 0);
+        assert!(after_zero_page.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert!(after_absolute.status & StatusFlags::CARRY.bits() != 0);
+        assert!(after_absolute.status & StatusFlags::ZERO.bits() != 0);
     }
 
     #[test]
