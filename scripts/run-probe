@@ -47,6 +47,7 @@ strlit
 strloc
 strmut
 strpass
+ywalk
 "
 
 probe_source() {
@@ -86,6 +87,7 @@ probe_source() {
     strloc) echo strloc.act ;;
     strmut) echo strmut.act ;;
     strpass) echo strpass.act ;;
+    ywalk) echo ywalk.act ;;
     *) return 1 ;;
   esac
 }
@@ -127,6 +129,7 @@ probe_output() {
     strloc) echo STRLOC.COM ;;
     strmut) echo STRMUT.COM ;;
     strpass) echo STRPASS.COM ;;
+    ywalk) echo YWALK.COM ;;
     *) return 1 ;;
   esac
 }
