@@ -22,6 +22,7 @@ array_refs
 arrays
 bools
 booleq
+boolthen
 boolword
 bool_edges
 control_flow
@@ -60,6 +61,7 @@ probe_source() {
     arrays) echo arrays.act ;;
     bools) echo bools.act ;;
     booleq) echo booleq.act ;;
+    boolthen) echo boolthen.act ;;
     boolword) echo boolword.act ;;
     bool_edges) echo bool_edges.act ;;
     control_flow) echo control_flow.act ;;
@@ -100,6 +102,7 @@ probe_output() {
     arrays) echo ARRAYS.COM ;;
     bools) echo BOOLS.COM ;;
     booleq) echo BOOLEQ.COM ;;
+    boolthen) echo BOOLTHEN.COM ;;
     boolword) echo BOOLWORD.COM ;;
     bool_edges) echo BOOLEDGE.COM ;;
     control_flow) echo CONTROL.COM ;;
