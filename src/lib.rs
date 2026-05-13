@@ -18,6 +18,9 @@ pub const RTCLOK_LOW: u16 = 0x0014;
 pub const KBCODE_PRIOR_KEY_CODE: u16 = 0x02F2;
 pub const CH_KEY_CODE: u16 = 0x02FC;
 pub const ACTION_MONITOR_KEY_CODE: u8 = 0xE5;
+pub const ATARI_KEY_RETURN: u8 = 0x0C;
+pub const ATARI_KEY_C: u8 = 0x12;
+pub const ATARI_KEY_E: u8 = 0x2A;
 pub const RECVDN_RECEIVE_DONE_FLAG: u16 = 0x0039;
 pub const XMTDON_TRANSMISSION_DONE_FLAG: u16 = 0x003A;
 pub const TIMFLG_TIMEOUT_FLAG: u16 = 0x0317;
@@ -1414,7 +1417,14 @@ impl Bus {
             if self.ram.read(CH_KEY_CODE) == 0xFF {
                 if let Some(key_code) = self.pending_key_codes.pop_front() {
                     self.ram.write(CH_KEY_CODE, key_code);
+                    self.record_event(BusAccess::Write, CH_KEY_CODE, key_code, BusRegion::Ram);
                     self.ram.write(KBCODE_PRIOR_KEY_CODE, key_code);
+                    self.record_event(
+                        BusAccess::Write,
+                        KBCODE_PRIOR_KEY_CODE,
+                        key_code,
+                        BusRegion::Ram,
+                    );
                 }
             }
         }
@@ -2149,6 +2159,28 @@ mod tests {
         bus.write(CH_KEY_CODE, 0xFF);
         assert_eq!(bus.read(CH_KEY_CODE), ACTION_MONITOR_KEY_CODE);
         assert_eq!(bus.read(KBCODE_PRIOR_KEY_CODE), ACTION_MONITOR_KEY_CODE);
+    }
+
+    #[test]
+    fn bus_records_synthetic_key_delivery_writes() {
+        let mut bus = Bus::default();
+        bus.add_watchpoint(CH_KEY_CODE);
+        bus.add_watchpoint(KBCODE_PRIOR_KEY_CODE);
+        bus.write(CH_KEY_CODE, 0xFF);
+        bus.queue_key_code(ACTION_MONITOR_KEY_CODE);
+
+        assert_eq!(bus.read(CH_KEY_CODE), ACTION_MONITOR_KEY_CODE);
+
+        assert!(bus.events().iter().any(|event| {
+            event.access == BusAccess::Write
+                && event.address == CH_KEY_CODE
+                && event.value == ACTION_MONITOR_KEY_CODE
+        }));
+        assert!(bus.events().iter().any(|event| {
+            event.access == BusAccess::Write
+                && event.address == KBCODE_PRIOR_KEY_CODE
+                && event.value == ACTION_MONITOR_KEY_CODE
+        }));
     }
 
     #[test]

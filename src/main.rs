@@ -3,8 +3,8 @@ use std::env;
 use std::path::PathBuf;
 
 use action_compiler_vm::{
-    ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, AddressRange, BusAccess, BusEvent, CpuError,
-    CpuRegisters, CpuStep, ImageKind, VmConfig,
+    ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ATARI_KEY_C, ATARI_KEY_E, ATARI_KEY_RETURN,
+    AddressRange, BusAccess, BusEvent, CpuError, CpuRegisters, CpuStep, ImageKind, VmConfig,
 };
 
 fn main() {
@@ -87,6 +87,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         vm.bus_mut().queue_key_code(*key_code);
     }
     vm.reset_cpu();
+    let mut deferred_key_codes = options.deferred_key_codes.clone();
     println!(
         "compiler VM loaded {} image(s); reset PC=${:04X}",
         vm.images().len(),
@@ -95,6 +96,20 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
 
     let mut history = StepHistory::new(options.history_len);
     for step_index in 0..options.max_steps {
+        let pc = vm.cpu().registers().pc;
+        let mut deferred_index = 0;
+        while deferred_index < deferred_key_codes.len() {
+            if deferred_key_codes[deferred_index].pc == pc {
+                let deferred = deferred_key_codes.remove(deferred_index);
+                vm.bus_mut().queue_key_code(deferred.key_code);
+                eprintln!(
+                    "queued key ${:02X} at PC=${:04X}",
+                    deferred.key_code, deferred.pc
+                );
+            } else {
+                deferred_index += 1;
+            }
+        }
         match vm.step_cpu() {
             Ok(step) => {
                 if options.should_trace(step.pc) {
@@ -166,6 +181,13 @@ struct CliOptions {
     watchpoints: Vec<u16>,
     watch_ranges: Vec<AddressRange>,
     key_codes: Vec<u8>,
+    deferred_key_codes: Vec<DeferredKeyCode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredKeyCode {
+    pc: u16,
+    key_code: u8,
 }
 
 impl Default for CliOptions {
@@ -180,6 +202,7 @@ impl Default for CliOptions {
             watchpoints: Vec::new(),
             watch_ranges: Vec::new(),
             key_codes: Vec::new(),
+            deferred_key_codes: Vec::new(),
         }
     }
 }
@@ -200,6 +223,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut watchpoints = Vec::new();
     let mut watch_ranges = Vec::new();
     let mut key_codes = Vec::new();
+    let mut deferred_key_codes = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
@@ -246,8 +270,26 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let value = required_value(&args, index, "--key-code")?;
                 key_codes.push(parse_byte(value)?);
             }
+            "--key-at-pc" => {
+                index += 1;
+                let value = required_value(&args, index, "--key-at-pc")?;
+                deferred_key_codes.push(parse_key_at_pc(value)?);
+            }
             "--monitor-key" => {
                 key_codes.push(ACTION_MONITOR_KEY_CODE);
+            }
+            "--monitor-key-at-pc" => {
+                index += 1;
+                let value = required_value(&args, index, "--monitor-key-at-pc")?;
+                deferred_key_codes.push(DeferredKeyCode {
+                    pc: parse_address(value)?,
+                    key_code: ACTION_MONITOR_KEY_CODE,
+                });
+            }
+            "--action-command-at-pc" => {
+                index += 1;
+                let value = required_value(&args, index, "--action-command-at-pc")?;
+                deferred_key_codes.extend(parse_action_command_at_pc(value)?);
             }
             "--preset" => {
                 index += 1;
@@ -299,6 +341,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         watchpoints,
         watch_ranges,
         key_codes,
+        deferred_key_codes,
     })
 }
 
@@ -352,8 +395,52 @@ fn parse_address(value: &str) -> Result<u16, String> {
 }
 
 fn parse_byte(value: &str) -> Result<u8, String> {
+    if let Some(key_code) = parse_named_key(value) {
+        return Ok(key_code);
+    }
     let parsed = parse_address(value)?;
     u8::try_from(parsed).map_err(|_| format!("byte value `{value}` is outside $00-$FF"))
+}
+
+fn parse_named_key(value: &str) -> Option<u8> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "return" | "ret" | "enter" => Some(ATARI_KEY_RETURN),
+        "c" => Some(ATARI_KEY_C),
+        "e" => Some(ATARI_KEY_E),
+        "monitor" => Some(ACTION_MONITOR_KEY_CODE),
+        _ => None,
+    }
+}
+
+fn parse_key_at_pc(value: &str) -> Result<DeferredKeyCode, String> {
+    let Some((pc, key_code)) = value.split_once(':') else {
+        return Err(format!("key trigger `{value}` must be pc:key"));
+    };
+    Ok(DeferredKeyCode {
+        pc: parse_address(pc)?,
+        key_code: parse_byte(key_code)?,
+    })
+}
+
+fn parse_action_command_at_pc(value: &str) -> Result<Vec<DeferredKeyCode>, String> {
+    let Some((pc, command)) = value.split_once(':') else {
+        return Err(format!(
+            "Action! command trigger `{value}` must be pc:command"
+        ));
+    };
+    let pc = parse_address(pc)?;
+    let key_code = match command.trim().to_ascii_lowercase().as_str() {
+        "compile" | "c" => ATARI_KEY_C,
+        "editor" | "edit" | "e" => ATARI_KEY_E,
+        other => return Err(format!("unknown Action! monitor command `{other}`")),
+    };
+    Ok(vec![
+        DeferredKeyCode { pc, key_code },
+        DeferredKeyCode {
+            pc,
+            key_code: ATARI_KEY_RETURN,
+        },
+    ])
 }
 
 fn parse_range(value: &str) -> Result<AddressRange, String> {
@@ -492,7 +579,12 @@ fn print_help() {
          --watch <addr>       Record bus reads/writes at addr\n  \
          --watch-range <a:b>  Record bus reads/writes inside the range\n  \
          --key-code <byte>    Queue one Atari keyboard code for CH ($02FC); repeatable\n  \
+         --key-at-pc <pc:k>   Queue key k when execution reaches pc\n  \
          --monitor-key        Queue Action! Shift+Control+M ($E5)\n  \
+         --monitor-key-at-pc <pc>\n  \
+                              Queue Action! monitor key when execution reaches pc\n  \
+         --action-command-at-pc <pc:cmd>\n  \
+                              Queue monitor cmd plus Return; cmd is compile or editor\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );
@@ -530,9 +622,89 @@ mod tests {
     }
 
     #[test]
+    fn parses_deferred_key_code_option() {
+        let options =
+            parse_options(vec!["--key-at-pc".to_string(), "$A2E0:$E5".to_string()]).unwrap();
+
+        assert_eq!(
+            options.deferred_key_codes,
+            vec![DeferredKeyCode {
+                pc: 0xA2E0,
+                key_code: 0xE5
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_named_key_codes() {
+        let options = parse_options(vec![
+            "--key-code".to_string(),
+            "C".to_string(),
+            "--key-code".to_string(),
+            "RETURN".to_string(),
+            "--key-at-pc".to_string(),
+            "$B28F:E".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(options.key_codes, vec![ATARI_KEY_C, ATARI_KEY_RETURN]);
+        assert_eq!(
+            options.deferred_key_codes,
+            vec![DeferredKeyCode {
+                pc: 0xB28F,
+                key_code: ATARI_KEY_E
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_action_command_at_pc() {
+        let options = parse_options(vec![
+            "--action-command-at-pc".to_string(),
+            "$B28F:compile".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options.deferred_key_codes,
+            vec![
+                DeferredKeyCode {
+                    pc: 0xB28F,
+                    key_code: ATARI_KEY_C
+                },
+                DeferredKeyCode {
+                    pc: 0xB28F,
+                    key_code: ATARI_KEY_RETURN
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_deferred_monitor_key_option() {
+        let options =
+            parse_options(vec!["--monitor-key-at-pc".to_string(), "$A2E0".to_string()]).unwrap();
+
+        assert_eq!(
+            options.deferred_key_codes,
+            vec![DeferredKeyCode {
+                pc: 0xA2E0,
+                key_code: ACTION_MONITOR_KEY_CODE
+            }]
+        );
+    }
+
+    #[test]
     fn rejects_out_of_range_key_code() {
         let err = parse_options(vec!["--key-code".to_string(), "$100".to_string()]).unwrap_err();
 
         assert!(err.contains("outside $00-$FF"));
+    }
+
+    #[test]
+    fn rejects_malformed_deferred_key_code() {
+        let err = parse_options(vec!["--key-at-pc".to_string(), "$A2E0".to_string()]).unwrap_err();
+
+        assert!(err.contains("must be pc:key"));
     }
 }
