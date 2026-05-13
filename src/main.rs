@@ -144,7 +144,12 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
 
         let mut deferred_index = 0;
         while deferred_index < deferred_key_codes.len() {
-            if deferred_key_codes[deferred_index].pc == pc {
+            if deferred_key_codes[deferred_index].after_pc == Some(pc) {
+                deferred_key_codes[deferred_index].after_pc = None;
+            }
+            if deferred_key_codes[deferred_index].after_pc.is_none()
+                && deferred_key_codes[deferred_index].pc == pc
+            {
                 let deferred = deferred_key_codes.remove(deferred_index);
                 vm.bus_mut().queue_key_code(deferred.key_code);
                 eprintln!(
@@ -241,6 +246,7 @@ struct CliOptions {
 struct DeferredKeyCode {
     pc: u16,
     key_code: u8,
+    after_pc: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +348,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let value = required_value(&args, index, "--key-at-pc")?;
                 deferred_key_codes.push(parse_key_at_pc(value)?);
             }
+            "--key-at-pc-after" => {
+                index += 1;
+                let value = required_value(&args, index, "--key-at-pc-after")?;
+                deferred_key_codes.push(parse_key_at_pc_after(value)?);
+            }
             "--monitor-key" => {
                 key_codes.push(ACTION_MONITOR_KEY_CODE);
             }
@@ -351,6 +362,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 deferred_key_codes.push(DeferredKeyCode {
                     pc: parse_address(value)?,
                     key_code: ACTION_MONITOR_KEY_CODE,
+                    after_pc: None,
                 });
             }
             "--action-command-at-pc" => {
@@ -508,6 +520,21 @@ fn parse_key_at_pc(value: &str) -> Result<DeferredKeyCode, String> {
     Ok(DeferredKeyCode {
         pc: parse_address(pc)?,
         key_code: parse_byte(key_code)?,
+        after_pc: None,
+    })
+}
+
+fn parse_key_at_pc_after(value: &str) -> Result<DeferredKeyCode, String> {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(format!(
+            "gated key trigger `{value}` must be after_pc:pc:key"
+        ));
+    }
+    Ok(DeferredKeyCode {
+        after_pc: Some(parse_address(parts[0])?),
+        pc: parse_address(parts[1])?,
+        key_code: parse_byte(parts[2])?,
     })
 }
 
@@ -524,10 +551,15 @@ fn parse_action_command_at_pc(value: &str) -> Result<Vec<DeferredKeyCode>, Strin
         other => return Err(format!("unknown Action! monitor command `{other}`")),
     };
     Ok(vec![
-        DeferredKeyCode { pc, key_code },
+        DeferredKeyCode {
+            pc,
+            key_code,
+            after_pc: None,
+        },
         DeferredKeyCode {
             pc,
             key_code: ATARI_KEY_RETURN,
+            after_pc: None,
         },
     ])
 }
@@ -755,6 +787,8 @@ fn print_help() {
          --watch-range <a:b>  Record bus reads/writes inside the range\n  \
          --key-code <byte>    Queue one Atari keyboard code for CH ($02FC); repeatable\n  \
          --key-at-pc <pc:k>   Queue key k when execution reaches pc\n  \
+         --key-at-pc-after <after:pc:k>\n  \
+                              Queue key k at pc, but only after after_pc was reached\n  \
          --monitor-key        Queue Action! Shift+Control+M ($E5)\n  \
          --monitor-key-at-pc <pc>\n  \
                               Queue Action! monitor key when execution reaches pc\n  \
@@ -813,7 +847,8 @@ mod tests {
             options.deferred_key_codes,
             vec![DeferredKeyCode {
                 pc: 0xA2E0,
-                key_code: 0xE5
+                key_code: 0xE5,
+                after_pc: None
             }]
         );
     }
@@ -835,7 +870,26 @@ mod tests {
             options.deferred_key_codes,
             vec![DeferredKeyCode {
                 pc: 0xB28F,
-                key_code: ATARI_KEY_E
+                key_code: ATARI_KEY_E,
+                after_pc: None
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_gated_deferred_key_code_option() {
+        let options = parse_options(vec![
+            "--key-at-pc-after".to_string(),
+            "$A2E0:$B2F5:C".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options.deferred_key_codes,
+            vec![DeferredKeyCode {
+                after_pc: Some(0xA2E0),
+                pc: 0xB2F5,
+                key_code: ATARI_KEY_C
             }]
         );
     }
@@ -853,11 +907,13 @@ mod tests {
             vec![
                 DeferredKeyCode {
                     pc: 0xB28F,
-                    key_code: ATARI_KEY_C
+                    key_code: ATARI_KEY_C,
+                    after_pc: None
                 },
                 DeferredKeyCode {
                     pc: 0xB28F,
-                    key_code: ATARI_KEY_RETURN
+                    key_code: ATARI_KEY_RETURN,
+                    after_pc: None
                 }
             ]
         );
@@ -908,7 +964,8 @@ mod tests {
             options.deferred_key_codes,
             vec![DeferredKeyCode {
                 pc: 0xA2E0,
-                key_code: ACTION_MONITOR_KEY_CODE
+                key_code: ACTION_MONITOR_KEY_CODE,
+                after_pc: None
             }]
         );
     }

@@ -46,6 +46,9 @@ pub const TIMFLG_TIMEOUT_FLAG: u16 = 0x0317;
 pub const CONSOL: u16 = 0xD01F;
 pub const CONSOL_NO_KEYS: u8 = 0x07;
 pub const SEROUT_SERIAL_OUTPUT: u16 = 0xD20D;
+pub const CIOV: u16 = 0xE456;
+pub const IOCB_COMMAND_BASE: u16 = 0x0342;
+pub const CIO_COMMAND_GETCHR: u8 = 0x07;
 pub const CARTCS_COLDSTART_VECTOR: u16 = 0xBFFA;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
@@ -349,6 +352,16 @@ impl Cpu {
 
         let pc = self.registers.pc;
         let registers_before = self.registers;
+        if pc == CIOV && self.try_emulate_ciov(bus) {
+            return Ok(CpuStep {
+                pc,
+                opcode: 0xFF,
+                registers_before,
+                registers_after: self.registers,
+                cycles: self.cycles,
+            });
+        }
+
         let opcode = self.fetch_byte(bus);
 
         match opcode {
@@ -642,6 +655,13 @@ impl Cpu {
                 bus.write(address, result);
                 self.set_zn(result);
                 self.cycles += 6;
+            }
+            0x71 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indirect_y(bus, zp);
+                let value = bus.read(address);
+                self.adc(value);
+                self.cycles += 5;
             }
             0x78 => {
                 self.set_flag(StatusFlags::INTERRUPT_DISABLE, true);
@@ -1059,6 +1079,28 @@ impl Cpu {
         self.registers.sp = self.registers.sp.wrapping_add(1);
         let address = 0x0100 | self.registers.sp as u16;
         bus.read(address)
+    }
+
+    fn try_emulate_ciov(&mut self, bus: &mut Bus) -> bool {
+        let command_address = IOCB_COMMAND_BASE.wrapping_add(self.registers.x as u16);
+        if self.registers.x != 0x70 || bus.ram().read(command_address) != CIO_COMMAND_GETCHR {
+            return false;
+        }
+
+        let raw_key = bus.ram().read(CH_KEY_CODE);
+        let Some(character) = atari_key_code_to_character(raw_key) else {
+            return false;
+        };
+
+        bus.write(CH_KEY_CODE, 0xFF);
+        self.registers.a = character;
+        self.registers.y = 0x01;
+        let lo = self.pop(bus);
+        let hi = self.pop(bus);
+        self.registers.pc = u16::from_le_bytes([lo, hi]).wrapping_add(1);
+        self.set_zn(self.registers.a);
+        self.cycles += 6;
+        true
     }
 
     fn branch(&mut self, bus: &mut Bus, condition: bool, base_cycles: u64, branch_cycles: u64) {
@@ -1891,6 +1933,15 @@ fn atari_screen_code_to_ascii(value: u8) -> char {
         0x00..=0x3F => (code + 0x20) as char,
         0x60..=0x7A => code as char,
         _ => '.',
+    }
+}
+
+fn atari_key_code_to_character(key_code: u8) -> Option<u8> {
+    match key_code {
+        ATARI_KEY_C => Some(b'C'),
+        ATARI_KEY_E => Some(b'E'),
+        ATARI_KEY_RETURN => Some(0x9B),
+        _ => None,
     }
 }
 
@@ -2935,6 +2986,37 @@ mod tests {
     }
 
     #[test]
+    fn cpu_adc_indirect_y_updates_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x40, // LDA #$40
+                    0xA0, 0x01, // LDY #$01
+                    0x71, 0x20, // ADC ($20),Y
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0020, 0x00);
+        bus.ram_mut().write(0x0021, 0x30);
+        bus.ram_mut().write(0x3001, 0x40);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x80);
+        assert!(registers.status & StatusFlags::OVERFLOW.bits() != 0);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+    }
+
+    #[test]
     fn cpu_adc_absolute_updates_flags() {
         let mut bus = Bus::default();
         bus.ram_mut()
@@ -3759,6 +3841,29 @@ mod tests {
         assert_eq!(registers.sp, 0xFD);
         assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
         assert!(registers.status & StatusFlags::CARRY.bits() != 0);
+    }
+
+    #[test]
+    fn cpu_emulates_keyboard_get_character_ciov_for_monitor_commands() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x70), CIO_COMMAND_GETCHR);
+        bus.ram_mut().write(CH_KEY_CODE, ATARI_KEY_C);
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        let mut cpu = Cpu::default();
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x70;
+        cpu.registers.sp = 0xFB;
+
+        let step = cpu.step(&mut bus).unwrap();
+
+        assert_eq!(step.pc, CIOV);
+        assert_eq!(step.opcode, 0xFF);
+        assert_eq!(cpu.registers().pc, 0x2000);
+        assert_eq!(cpu.registers().a, b'C');
+        assert_eq!(cpu.registers().y, 0x01);
+        assert_eq!(bus.ram().read(CH_KEY_CODE), 0xFF);
     }
 
     #[test]

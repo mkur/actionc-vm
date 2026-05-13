@@ -110,6 +110,38 @@ paths beep; errors additionally print an `Error:` line with a numeric code. The
 VM therefore records speaker writes and can dump/decode the Atari text screen
 with `--dump-screen-at-pc <pc>` or `--dump-screen-on-stop`.
 
+## Compiler Error Output
+
+The compiler error path is mixed. It is not purely OS `E:` output and not purely
+custom screen handling.
+
+Compiler diagnostics jump through `mainbnk.splerr` to `lib.lsplerr`
+(`src/lib/SPL.ERR.asm`). That routine first stores the editor error position
+from `spln` and `curln` into the current editor window state. It then calls
+`mainio.syserr`.
+
+`mainio.syserr` (`src/main/MAIN.IO.asm`) converts the numeric error code to a
+string and calls `dspstr`. `dspstr` uses `mainio.putstr`, whose comment is
+explicit: it bypasses the `E:` handler. `putstr` computes the display-memory
+address and writes screen-code bytes directly, so the status-line/inverted
+`Error: NN` display should be detected by inspecting screen memory or scanning
+RAM for the screen-code `Error:` pattern.
+
+After drawing the status-line error, `syserr` rings the bell through
+`screen.scrbell`. The screen helpers in `src/main/SCREEN.MAC.asm` do use CIOV on
+channel 0 for single-character screen/control output, so the bell is an OS
+`E:`/CIO operation.
+
+Finally, `lsplerr` also emits `Error: ` and the numeric buffer through
+`mainio.output`/`mainio.print` on channel 0. A future CIO-aware harness may be
+able to capture that text stream directly, but the current screen/RAM scan is
+still needed because the primary visible diagnostic is direct screen-memory
+output.
+
+The plain ROM build has `feature_error_texts = 0`
+(`src/ACTION-ROM-Plain-16k.asm`), so it displays numeric error codes rather than
+long textual explanations.
+
 Remaining questions:
 
 - The current injector replaces the editor text directly; it does not call the
