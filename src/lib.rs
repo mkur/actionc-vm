@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 
@@ -17,8 +17,16 @@ pub const ANTIC_VCOUNT: u16 = 0xD40B;
 pub const RTCLOK_LOW: u16 = 0x0014;
 pub const KBCODE_PRIOR_KEY_CODE: u16 = 0x02F2;
 pub const CH_KEY_CODE: u16 = 0x02FC;
+pub const RMARGIN: u16 = 0x0053;
+pub const ROWCRS: u16 = 0x0054;
+pub const COLCRS: u16 = 0x0055;
+pub const RAMTOP_MEMORY_TOP_PAGE: u16 = 0x006A;
 pub const SAVMSC_SCREEN_MEMORY_POINTER: u16 = 0x0058;
 pub const SDLSTL_DISPLAY_LIST_POINTER: u16 = 0x0230;
+pub const MEMTOP_OS_TOP_OF_FREE_MEMORY: u16 = 0x02E5;
+pub const DEFAULT_HEADLESS_RAMTOP_PAGE: u8 = 0xA0;
+pub const DEFAULT_HEADLESS_MEMTOP: u16 = 0x9C1F;
+pub const DEFAULT_HEADLESS_SCREEN: u16 = 0x9C40;
 pub const ACTION_MONITOR_KEY_CODE: u8 = 0xE5;
 pub const ATARI_KEY_RETURN: u8 = 0x0C;
 pub const ATARI_KEY_C: u8 = 0x12;
@@ -51,6 +59,8 @@ pub const IOCB_DEVICE_BASE: u16 = 0x0341;
 pub const IOCB_COMMAND_BASE: u16 = 0x0342;
 pub const IOCB_BUFFER_BASE: u16 = 0x0344;
 pub const IOCB_LENGTH_BASE: u16 = 0x0348;
+pub const IOCB_AUX1_BASE: u16 = 0x034A;
+pub const IOCB_AUX2_BASE: u16 = 0x034B;
 pub const CIO_COMMAND_OPEN: u8 = 0x03;
 pub const CIO_COMMAND_GETREC: u8 = 0x05;
 pub const CIO_COMMAND_GETCHR: u8 = 0x07;
@@ -87,6 +97,8 @@ pub struct VmConfig {
     pub source: Option<PathBuf>,
     pub extra_images: Vec<(ImageKind, PathBuf, u16)>,
     pub hotpatches: Vec<Hotpatch>,
+    pub host_files: Vec<(String, PathBuf)>,
+    pub trace_cio: bool,
 }
 
 impl Default for VmConfig {
@@ -99,6 +111,8 @@ impl Default for VmConfig {
             source: None,
             extra_images: Vec::new(),
             hotpatches: Vec::new(),
+            host_files: Vec::new(),
+            trace_cio: false,
         }
     }
 }
@@ -145,6 +159,13 @@ impl VmConfig {
             );
         }
 
+        for (name, path) in &self.host_files {
+            let bytes = fs::read(path)
+                .map_err(|err| format!("failed to read host file `{}`: {err}", path.display()))?;
+            vm.bus_mut().add_host_file(name, bytes);
+        }
+        vm.bus_mut().set_trace_cio(self.trace_cio);
+
         Ok(vm)
     }
 }
@@ -152,6 +173,7 @@ impl VmConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hotpatch {
     ActionQueuedInput,
+    ActionHeadlessGetkey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,6 +583,17 @@ impl Cpu {
             0x30 => {
                 self.branch(bus, self.flag(StatusFlags::NEGATIVE), 2, 3);
             }
+            0x36 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                let carry_in = u8::from(self.flag(StatusFlags::CARRY));
+                self.set_flag(StatusFlags::CARRY, value & 0x80 != 0);
+                let result = (value << 1) | carry_in;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 6;
+            }
             0x31 => {
                 let zp = self.fetch_byte(bus);
                 let address = self.indirect_y(bus, zp);
@@ -580,6 +613,13 @@ impl Cpu {
                 self.registers.a &= value;
                 self.set_zn(self.registers.a);
                 self.cycles += 4;
+            }
+            0x45 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.registers.a ^= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 3;
             }
             0x46 => {
                 let address = self.fetch_byte(bus) as u16;
@@ -720,6 +760,13 @@ impl Cpu {
                 let value = bus.read(address);
                 self.adc(value);
                 self.cycles += 5;
+            }
+            0x75 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                self.adc(value);
+                self.cycles += 4;
             }
             0x78 => {
                 self.set_flag(StatusFlags::INTERRUPT_DISABLE, true);
@@ -1004,6 +1051,13 @@ impl Cpu {
                 self.compare(self.registers.a, value);
                 self.cycles += 4;
             }
+            0xCE => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address).wrapping_sub(1);
+                bus.write(address, value);
+                self.set_zn(value);
+                self.cycles += 6;
+            }
             0xD0 => {
                 self.branch(bus, !self.flag(StatusFlags::ZERO), 2, 3);
             }
@@ -1021,6 +1075,21 @@ impl Cpu {
             0xD9 => {
                 let base = self.fetch_word(bus);
                 let address = base.wrapping_add(self.registers.y as u16);
+                let value = bus.read(address);
+                self.compare(self.registers.a, value);
+                self.cycles += 4;
+            }
+            0xDE => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address).wrapping_sub(1);
+                bus.write(address, value);
+                self.set_zn(value);
+                self.cycles += 7;
+            }
+            0xDD => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
                 let value = bus.read(address);
                 self.compare(self.registers.a, value);
                 self.cycles += 4;
@@ -1082,6 +1151,14 @@ impl Cpu {
                 self.set_flag(StatusFlags::DECIMAL, true);
                 self.cycles += 2;
             }
+            0xFE => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address).wrapping_add(1);
+                bus.write(address, value);
+                self.set_zn(value);
+                self.cycles += 7;
+            }
             opcode => {
                 self.halted = true;
                 return Err(CpuError::UnsupportedOpcode { pc, opcode });
@@ -1142,6 +1219,8 @@ impl Cpu {
     fn try_emulate_ciov(&mut self, bus: &mut Bus) -> bool {
         let command_address = IOCB_COMMAND_BASE.wrapping_add(self.registers.x as u16);
         let command = bus.ram().read(command_address);
+        let return_pc = self.peek_return_address(bus);
+        bus.trace_cio_call(self.registers.x, command, return_pc);
         match command {
             CIO_COMMAND_OPEN => {
                 if bus.try_open_harness_cio_device(self.registers.x) {
@@ -1151,11 +1230,29 @@ impl Cpu {
                 false
             }
             CIO_COMMAND_GETCHR | CIO_COMMAND_GETREC => {
-                if bus.cio_channel_device(self.registers.x) == Some(CioHarnessDevice::QueuedInput)
-                    && let Some(character) = bus.pop_scripted_cio_input_byte()
-                {
-                    self.return_from_ciov(bus, character, 0x01);
-                    return true;
+                match bus.cio_channel_device(self.registers.x) {
+                    Some(CioHarnessDevice::QueuedInput) => {
+                        if let Some(character) = bus.pop_scripted_cio_input_byte() {
+                            bus.trace_cio(format_args!(
+                                "  Q: read ${character:02X} `{}`",
+                                atari_debug_char(character)
+                            ));
+                            self.return_from_ciov(bus, character, 0x01);
+                            return true;
+                        }
+                    }
+                    Some(CioHarnessDevice::Host { .. }) => {
+                        let result = if command == CIO_COMMAND_GETREC {
+                            bus.read_host_record(self.registers.x)
+                        } else {
+                            bus.read_host_character(self.registers.x)
+                        };
+                        if let Some((accumulator, status)) = result {
+                            self.return_from_ciov(bus, accumulator, status);
+                            return true;
+                        }
+                    }
+                    None => {}
                 }
 
                 if self.registers.x != 0x70 {
@@ -1203,8 +1300,16 @@ impl Cpu {
         let lo = self.pop(bus);
         let hi = self.pop(bus);
         self.registers.pc = u16::from_le_bytes([lo, hi]).wrapping_add(1);
-        self.set_zn(self.registers.a);
+        self.set_zn(self.registers.y);
         self.cycles += 6;
+    }
+
+    fn peek_return_address(&self, bus: &Bus) -> u16 {
+        let lo_address = 0x0100 | self.registers.sp.wrapping_add(1) as u16;
+        let hi_address = 0x0100 | self.registers.sp.wrapping_add(2) as u16;
+        let lo = bus.ram().read(lo_address);
+        let hi = bus.ram().read(hi_address);
+        u16::from_le_bytes([lo, hi]).wrapping_add(1)
     }
 
     fn branch(&mut self, bus: &mut Bus, condition: bool, base_cycles: u64, branch_cycles: u64) {
@@ -1403,6 +1508,9 @@ pub struct Bus {
     scripted_cio_input: VecDeque<u8>,
     cio_channel0_output: Vec<u8>,
     cio_harness_devices: [Option<CioHarnessDevice>; 8],
+    host_files: Vec<HostFile>,
+    host_file_lookup: HashMap<String, usize>,
+    trace_cio: bool,
     sio_timeout_pending: bool,
     redirect_disk_boot_to_cart: bool,
 }
@@ -1422,6 +1530,9 @@ impl Default for Bus {
             scripted_cio_input: VecDeque::new(),
             cio_channel0_output: Vec::new(),
             cio_harness_devices: [None; 8],
+            host_files: Vec::new(),
+            host_file_lookup: HashMap::new(),
+            trace_cio: false,
             sio_timeout_pending: false,
             redirect_disk_boot_to_cart: false,
         }
@@ -1475,7 +1586,11 @@ impl Bus {
     }
 
     pub fn queue_key_code(&mut self, key_code: u8) {
-        self.pending_key_codes.push_back(key_code);
+        if self.ram.read(CH_KEY_CODE) == 0xFF {
+            self.deliver_key_code(key_code);
+        } else {
+            self.pending_key_codes.push_back(key_code);
+        }
     }
 
     pub fn queue_scripted_cio_input_byte(&mut self, byte: u8) {
@@ -1484,6 +1599,20 @@ impl Bus {
 
     pub fn queue_scripted_cio_input_bytes(&mut self, bytes: &[u8]) {
         self.scripted_cio_input.extend(bytes);
+    }
+
+    pub fn add_host_file(&mut self, name: impl AsRef<str>, bytes: Vec<u8>) {
+        let normalized = normalize_host_file_name(name.as_ref());
+        let index = self.host_files.len();
+        self.host_files.push(HostFile {
+            name: normalized.clone(),
+            bytes,
+        });
+        self.host_file_lookup.insert(normalized, index);
+    }
+
+    pub fn set_trace_cio(&mut self, trace_cio: bool) {
+        self.trace_cio = trace_cio;
     }
 
     pub fn cio_channel0_output(&self) -> &[u8] {
@@ -1818,10 +1947,20 @@ impl Bus {
             return;
         };
 
+        self.apply_headless_memory_defaults();
         let [lo, hi] = target.to_le_bytes();
         self.ram.write(BOOTQ_SUCCESSFUL_BOOT_FLAG, 0x01);
         self.ram.write(DOSVEC_START_VECTOR, lo);
         self.ram.write(DOSVEC_START_VECTOR.wrapping_add(1), hi);
+    }
+
+    fn apply_headless_memory_defaults(&mut self) {
+        self.ram
+            .write(RAMTOP_MEMORY_TOP_PAGE, DEFAULT_HEADLESS_RAMTOP_PAGE);
+        self.ram
+            .write_word(MEMTOP_OS_TOP_OF_FREE_MEMORY, DEFAULT_HEADLESS_MEMTOP);
+        self.ram
+            .write_word(SAVMSC_SCREEN_MEMORY_POINTER, DEFAULT_HEADLESS_SCREEN);
     }
 
     fn cartridge_word(&self, address: u16) -> Option<u16> {
@@ -1858,15 +1997,14 @@ impl Bus {
         if address == CH_KEY_CODE {
             if self.ram.read(CH_KEY_CODE) == 0xFF {
                 if let Some(key_code) = self.pending_key_codes.pop_front() {
-                    self.ram.write(CH_KEY_CODE, key_code);
-                    self.record_event(BusAccess::Write, CH_KEY_CODE, key_code, BusRegion::Ram);
-                    self.ram.write(KBCODE_PRIOR_KEY_CODE, key_code);
-                    self.record_event(
-                        BusAccess::Write,
-                        KBCODE_PRIOR_KEY_CODE,
-                        key_code,
-                        BusRegion::Ram,
-                    );
+                    self.deliver_key_code(key_code);
+                } else if self.has_queued_input_device()
+                    && let Some(key_code) = self
+                        .scripted_cio_input
+                        .front()
+                        .and_then(|byte| atari_character_to_key_code(*byte))
+                {
+                    self.deliver_key_code(key_code);
                 }
             }
         }
@@ -1878,6 +2016,18 @@ impl Bus {
         value
     }
 
+    fn deliver_key_code(&mut self, key_code: u8) {
+        self.ram.write(CH_KEY_CODE, key_code);
+        self.record_event(BusAccess::Write, CH_KEY_CODE, key_code, BusRegion::Ram);
+        self.ram.write(KBCODE_PRIOR_KEY_CODE, key_code);
+        self.record_event(
+            BusAccess::Write,
+            KBCODE_PRIOR_KEY_CODE,
+            key_code,
+            BusRegion::Ram,
+        );
+    }
+
     fn pop_scripted_cio_input_byte(&mut self) -> Option<u8> {
         self.scripted_cio_input.pop_front()
     }
@@ -1887,16 +2037,38 @@ impl Bus {
             return false;
         };
         let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(x as u16));
-        let device = match self.ram.read(buffer).to_ascii_uppercase() {
+        let length = self.ram.read_word(IOCB_LENGTH_BASE.wrapping_add(x as u16));
+        let (spec_buffer, spec_length) = self.cio_spec_buffer(buffer, length);
+        let raw0 = self.peek_mapped(buffer);
+        let raw1 = self.peek_mapped(buffer.wrapping_add(1));
+        let raw2 = self.peek_mapped(buffer.wrapping_add(2));
+        self.trace_cio(format_args!(
+            "  open spec raw=${:02X} ${:02X} ${:02X} start=${spec_buffer:04X} len={spec_length}",
+            raw0, raw1, raw2
+        ));
+        let device = match self.peek_mapped(spec_buffer).to_ascii_uppercase() {
             b'Q' => CioHarnessDevice::QueuedInput,
-            b'H' => CioHarnessDevice::Host,
+            b'H' => {
+                let spec = self.read_iocb_string(spec_buffer, spec_length);
+                let name = normalize_host_file_name(&spec);
+                let Some(file_index) = self.host_file_lookup.get(&name).copied() else {
+                    self.trace_cio(format_args!("  H: open miss spec=`{spec}` name=`{name}`"));
+                    return false;
+                };
+                self.trace_cio(format_args!("  H: open spec=`{spec}` name=`{name}`"));
+                CioHarnessDevice::Host {
+                    file_index,
+                    offset: 0,
+                }
+            }
             _ => return false,
         };
-        if self.ram.read(buffer.wrapping_add(1)) != b':' {
+        if self.peek_mapped(spec_buffer.wrapping_add(1)) != b':' {
             return false;
         }
 
         self.cio_harness_devices[channel] = Some(device);
+        self.trace_cio(format_args!("  harness open channel={channel} device={device:?}"));
         true
     }
 
@@ -1911,6 +2083,117 @@ impl Bus {
 
     fn cio_channel_device(&self, x: u8) -> Option<CioHarnessDevice> {
         cio_channel_index(x).and_then(|channel| self.cio_harness_devices[channel])
+    }
+
+    fn has_queued_input_device(&self) -> bool {
+        self.cio_harness_devices
+            .iter()
+            .any(|device| matches!(device, Some(CioHarnessDevice::QueuedInput)))
+    }
+
+    fn read_iocb_string(&mut self, buffer: u16, length: u16) -> String {
+        let max_len = if length == 0 { 64 } else { length.min(255) };
+        let mut bytes = Vec::new();
+        for offset in 0..max_len {
+            let byte = self.peek_mapped(buffer.wrapping_add(offset));
+            if byte == 0 || byte == 0x9B {
+                break;
+            }
+            bytes.push(byte & 0x7F);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn cio_spec_buffer(&mut self, buffer: u16, length: u16) -> (u16, u16) {
+        let first = self.peek_mapped(buffer);
+        if length > 0
+            && first == length as u8
+            && self.peek_mapped(buffer.wrapping_add(2)) == b':'
+        {
+            (buffer.wrapping_add(1), length)
+        } else {
+            (buffer, length)
+        }
+    }
+
+    fn peek_mapped(&mut self, address: u16) -> u8 {
+        self.read(address)
+    }
+
+    fn read_host_character(&mut self, x: u8) -> Option<(u8, u8)> {
+        let channel = cio_channel_index(x)?;
+        let Some(CioHarnessDevice::Host { file_index, offset }) = self.cio_harness_devices[channel]
+        else {
+            return None;
+        };
+        let file = self.host_files.get(file_index)?;
+        let mut next_offset = offset;
+        while next_offset < file.bytes.len() {
+            let byte = file.bytes[next_offset];
+            next_offset += 1;
+            if byte == b'\r' {
+                continue;
+            }
+            self.cio_harness_devices[channel] = Some(CioHarnessDevice::Host {
+                file_index,
+                offset: next_offset,
+            });
+            return Some((host_source_byte_to_atascii(byte), 0x01));
+        }
+        Some((0x88, 0x88))
+    }
+
+    fn read_host_record(&mut self, x: u8) -> Option<(u8, u8)> {
+        let channel = cio_channel_index(x)?;
+        let Some(CioHarnessDevice::Host { file_index, offset }) = self.cio_harness_devices[channel]
+        else {
+            return None;
+        };
+        let requested = self.ram.read_word(IOCB_LENGTH_BASE.wrapping_add(x as u16));
+        let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(x as u16));
+        let file = self.host_files.get(file_index)?;
+        if requested == 0 || offset >= file.bytes.len() {
+            self.ram
+                .write_word(IOCB_LENGTH_BASE.wrapping_add(x as u16), 0);
+            return Some((0x88, 0x88));
+        }
+
+        let mut next_offset = offset;
+        let mut written = 0u16;
+        let mut wrote_eol = false;
+        while written < requested && next_offset < file.bytes.len() {
+            let byte = file.bytes[next_offset];
+            next_offset += 1;
+            if byte == b'\r' {
+                continue;
+            }
+            let output = host_source_byte_to_atascii(byte);
+            self.ram.write(buffer.wrapping_add(written), output);
+            written = written.wrapping_add(1);
+            if output == 0x9B {
+                wrote_eol = true;
+                break;
+            }
+        }
+
+        if written == 0 {
+            self.ram
+                .write_word(IOCB_LENGTH_BASE.wrapping_add(x as u16), 0);
+            return Some((0x88, 0x88));
+        }
+
+        if !wrote_eol && written < requested {
+            self.ram.write(buffer.wrapping_add(written), 0x9B);
+            written = written.wrapping_add(1);
+        }
+
+        self.ram
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(x as u16), written);
+        self.cio_harness_devices[channel] = Some(CioHarnessDevice::Host {
+            file_index,
+            offset: next_offset,
+        });
+        Some((0, 0x01))
     }
 
     fn cio_output_bytes_for_iocb(&self, x: u8, accumulator: u8) -> Vec<u8> {
@@ -1929,7 +2212,43 @@ impl Bus {
     }
 
     fn capture_cio_channel0_output(&mut self, bytes: &[u8]) {
+        self.ensure_text_cursor_defaults();
         self.cio_channel0_output.extend(bytes);
+        for byte in bytes {
+            if *byte == 0x9B {
+                self.ram.write(COLCRS, 0);
+                self.ram.write(ROWCRS, self.ram.read(ROWCRS).wrapping_add(1));
+            } else {
+                self.ram.write(COLCRS, self.ram.read(COLCRS).wrapping_add(1));
+            }
+        }
+    }
+
+    fn ensure_text_cursor_defaults(&mut self) {
+        if self.ram.read(RMARGIN) == 0 {
+            self.ram.write(RMARGIN, 39);
+        }
+    }
+
+    fn trace_cio_call(&self, x: u8, command: u8, return_pc: u16) {
+        if !self.trace_cio {
+            return;
+        }
+        let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(x as u16));
+        let length = self.ram.read_word(IOCB_LENGTH_BASE.wrapping_add(x as u16));
+        let aux1 = self.ram.read(IOCB_AUX1_BASE.wrapping_add(x as u16));
+        let aux2 = self.ram.read(IOCB_AUX2_BASE.wrapping_add(x as u16));
+        eprintln!(
+            "CIO x=${x:02X} ch={} cmd=${command:02X} ret=${return_pc:04X} aux=${aux1:02X}/${aux2:02X} buf=${buffer:04X} len={length} dev={:?}",
+            cio_channel_index(x).map_or(0xFF, |channel| channel as u8),
+            self.cio_channel_device(x)
+        );
+    }
+
+    fn trace_cio(&self, args: std::fmt::Arguments<'_>) {
+        if self.trace_cio {
+            eprintln!("{args}");
+        }
     }
 
     fn read_self_test(&self, address: u16) -> Option<u8> {
@@ -2111,10 +2430,40 @@ fn ram_address(address: u16) -> Option<u16> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostFile {
+    name: String,
+    bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CioHarnessDevice {
     QueuedInput,
-    Host,
+    Host { file_index: usize, offset: usize },
+}
+
+fn normalize_host_file_name(name: &str) -> String {
+    let trimmed = name.trim();
+    let without_device = trimmed
+        .strip_prefix("H:")
+        .or_else(|| trimmed.strip_prefix("h:"))
+        .unwrap_or(trimmed);
+    without_device.trim().to_ascii_uppercase()
+}
+
+fn host_source_byte_to_atascii(byte: u8) -> u8 {
+    match byte {
+        b'\n' => 0x9B,
+        _ => byte,
+    }
+}
+
+fn atari_debug_char(byte: u8) -> char {
+    match byte {
+        0x9B => '\u{23CE}',
+        0x20..=0x7E => byte as char,
+        _ => '.',
+    }
 }
 
 fn cio_channel_index(x: u8) -> Option<usize> {
@@ -2136,10 +2485,20 @@ fn atari_screen_code_to_ascii(value: u8) -> char {
 
 fn atari_key_code_to_character(key_code: u8) -> Option<u8> {
     match key_code {
+        ACTION_MONITOR_KEY_CODE => Some(ACTION_MONITOR_KEY_CODE),
         ATARI_KEY_C => Some(b'C'),
         ATARI_KEY_E => Some(b'E'),
         ATARI_KEY_RETURN => Some(0x9B),
         _ => None,
+    }
+}
+
+fn atari_character_to_key_code(character: u8) -> Option<u8> {
+    match character {
+        b'C' | b'c' => Some(ATARI_KEY_C),
+        b'E' | b'e' => Some(ATARI_KEY_E),
+        0x9B => Some(ATARI_KEY_RETURN),
+        _ => Some(ATARI_KEY_C),
     }
 }
 
@@ -2350,6 +2709,7 @@ impl Cartridge {
     pub fn apply_hotpatch(&mut self, hotpatch: Hotpatch) -> Result<HotpatchReport, String> {
         match hotpatch {
             Hotpatch::ActionQueuedInput => self.patch_action_keyboard_device_to_queue(),
+            Hotpatch::ActionHeadlessGetkey => self.patch_action_headless_getkey(),
         }
     }
 
@@ -2382,6 +2742,47 @@ impl Cartridge {
             payload_offset: device_offset,
             old_value,
             new_value: b'Q',
+        })
+    }
+
+    fn patch_action_headless_getkey(&mut self) -> Result<HotpatchReport, String> {
+        const PATTERN: &[u8] = &[
+            0x18, 0xA5, 0x14, 0x69, 0x0E, 0xAA, 0xAD, 0xFC, 0x02, 0x49, 0xFF, 0xD0,
+        ];
+        const REPLACEMENT: &[u8] = &[
+            0xA2, 0x70, // LDX #$70
+            0xA9, 0x07, // LDA #GETCHR
+            0x85, 0x11, // STA BRKKEY
+            0x20, 0x40, 0xB3, // JSR GTKBD
+            0x8D, 0xA2, 0x04, // STA CURCH
+            0x60, // RTS
+        ];
+
+        let payload = match &mut self.mapping {
+            CartridgeMapping::Linear(region) => &mut region.bytes,
+            CartridgeMapping::Banked8k(cart) => &mut cart.payload,
+            CartridgeMapping::OssType15(cart) => &mut cart.payload,
+        };
+        let matches = payload
+            .windows(PATTERN.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == PATTERN).then_some(offset))
+            .collect::<Vec<_>>();
+
+        let [payload_offset] = matches.as_slice() else {
+            return Err(format!(
+                "action-headless-getkey hotpatch expected one Action! GETKEY pattern, found {}",
+                matches.len()
+            ));
+        };
+        let old_value = payload[*payload_offset];
+        let replacement_len = REPLACEMENT.len();
+        payload[*payload_offset..*payload_offset + replacement_len].copy_from_slice(REPLACEMENT);
+        Ok(HotpatchReport {
+            patch: Hotpatch::ActionHeadlessGetkey,
+            payload_offset: *payload_offset,
+            old_value,
+            new_value: REPLACEMENT[0],
         })
     }
 
@@ -2804,6 +3205,35 @@ mod tests {
     }
 
     #[test]
+    fn action_headless_getkey_hotpatch_rewrites_blinking_wait_loop() {
+        let mut payload = vec![0xFF; 0x4000];
+        payload[0x12F0..0x12FC].copy_from_slice(&[
+            0x18, 0xA5, 0x14, 0x69, 0x0E, 0xAA, 0xAD, 0xFC, 0x02, 0x49, 0xFF, 0xD0,
+        ]);
+        let mut cartridge = Cartridge::from_payload(0xA000, None, payload).unwrap();
+
+        let report = cartridge
+            .apply_hotpatch(Hotpatch::ActionHeadlessGetkey)
+            .unwrap();
+
+        assert_eq!(
+            report,
+            HotpatchReport {
+                patch: Hotpatch::ActionHeadlessGetkey,
+                payload_offset: 0x12F0,
+                old_value: 0x18,
+                new_value: 0xA2,
+            }
+        );
+        assert_eq!(
+            &cartridge.payload()[0x12F0..0x12FD],
+            &[
+                0xA2, 0x70, 0xA9, 0x07, 0x85, 0x11, 0x20, 0x40, 0xB3, 0x8D, 0xA2, 0x04, 0x60,
+            ]
+        );
+    }
+
+    #[test]
     fn bus_reads_os_rom_and_ignores_os_rom_writes() {
         let mut bus = Bus::default();
         bus.map_os_rom(0xC000, vec![0xAA, 0xBB]).unwrap();
@@ -2871,6 +3301,15 @@ mod tests {
         assert_eq!(bus.read(BOOTQ_SUCCESSFUL_BOOT_FLAG), 0x01);
         assert_eq!(bus.read(DOSVEC_START_VECTOR), 0x34);
         assert_eq!(bus.read(DOSVEC_START_VECTOR.wrapping_add(1)), 0x12);
+        assert_eq!(bus.read(RAMTOP_MEMORY_TOP_PAGE), DEFAULT_HEADLESS_RAMTOP_PAGE);
+        assert_eq!(
+            bus.ram().read_word(MEMTOP_OS_TOP_OF_FREE_MEMORY),
+            DEFAULT_HEADLESS_MEMTOP
+        );
+        assert_eq!(
+            bus.ram().read_word(SAVMSC_SCREEN_MEMORY_POINTER),
+            DEFAULT_HEADLESS_SCREEN
+        );
 
         bus.write(DOSVEC_START_VECTOR, 0x23);
         bus.write(DOSVEC_START_VECTOR.wrapping_add(1), 0xF2);
@@ -3298,6 +3737,38 @@ mod tests {
     }
 
     #[test]
+    fn cpu_adc_zero_page_x_updates_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x7F, // LDA #$7F
+                    0xA2, 0x02, // LDX #$02
+                    0x18, // CLC
+                    0x75, 0x40, // ADC $40,X
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0042, 0x01);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x80);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert!(registers.status & StatusFlags::OVERFLOW.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::CARRY.bits(), 0);
+    }
+
+    #[test]
     fn cpu_adc_absolute_updates_flags() {
         let mut bus = Bus::default();
         bus.ram_mut()
@@ -3446,6 +3917,8 @@ mod tests {
                     0xA9, 0x40, // LDA #$40
                     0x2A, // ROL A
                     0x2E, 0x20, 0x03, // ROL $0320
+                    0xA2, 0x02, // LDX #$02
+                    0x36, 0x40, // ROL $40,X
                     0x66, 0x40, // ROR $40
                     0x18, // CLC
                     0x6E, 0x21, 0x03, // ROR $0321
@@ -3454,6 +3927,7 @@ mod tests {
             )
             .unwrap();
         bus.ram_mut().write(0x0040, 0x01);
+        bus.ram_mut().write(0x0042, 0x40);
         bus.ram_mut().write(0x0320, 0x80);
         bus.ram_mut().write(0x0321, 0x02);
         bus.ram_mut().write(0x0322, 0x01);
@@ -3462,14 +3936,15 @@ mod tests {
         let mut cpu = Cpu::default();
         cpu.reset(&mut bus);
 
-        for _ in 0..8 {
+        for _ in 0..10 {
             cpu.step(&mut bus).unwrap();
         }
 
         let registers = cpu.registers();
         assert_eq!(registers.a, 0x81);
         assert_eq!(bus.ram().read(0x0320), 0x00);
-        assert_eq!(bus.ram().read(0x0040), 0x80);
+        assert_eq!(bus.ram().read(0x0042), 0x81);
+        assert_eq!(bus.ram().read(0x0040), 0x00);
         assert_eq!(bus.ram().read(0x0321), 0x01);
         assert_eq!(bus.ram().read(0x0322), 0x00);
         assert!(registers.status & StatusFlags::CARRY.bits() != 0);
@@ -3551,6 +4026,85 @@ mod tests {
 
         let registers = cpu.registers();
         assert_eq!(bus.ram().read(0x0320), 0x00);
+        assert!(registers.status & StatusFlags::ZERO.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_inc_absolute_x_increments_indexed_memory() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA2, 0x04, // LDX #$04
+                    0xFE, 0x20, 0x03, // INC $0320,X
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0324, 0x7F);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(bus.ram().read(0x0324), 0x80);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+    }
+
+    #[test]
+    fn cpu_dec_absolute_decrements_memory() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xCE, 0x20, 0x03, // DEC $0320
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0320, 0x00);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(bus.ram().read(0x0320), 0xFF);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_dec_absolute_x_decrements_indexed_memory() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA2, 0x02, // LDX #$02
+                    0xDE, 0x20, 0x03, // DEC $0320,X
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0322, 0x01);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(bus.ram().read(0x0322), 0x00);
         assert!(registers.status & StatusFlags::ZERO.bits() != 0);
         assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
     }
@@ -3689,6 +4243,33 @@ mod tests {
         cpu.reset(&mut bus);
 
         cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x70);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_eor_zero_page_updates_accumulator_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0xF0, // LDA #$F0
+                    0x45, 0x40, // EOR $40
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0040, 0x80);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
         cpu.step(&mut bus).unwrap();
         cpu.step(&mut bus).unwrap();
 
@@ -3898,6 +4479,35 @@ mod tests {
         assert!(registers.status & StatusFlags::ZERO.bits() != 0);
         assert!(registers.status & StatusFlags::CARRY.bits() != 0);
         assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_cmp_absolute_x_sets_compare_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x20, // LDA #$20
+                    0xA2, 0x03, // LDX #$03
+                    0xDD, 0x10, 0x03, // CMP $0310,X
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0313, 0x21);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.status & StatusFlags::CARRY.bits(), 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
     }
 
     #[test]
@@ -4167,6 +4777,17 @@ mod tests {
         assert_eq!(cpu.registers().pc, 0x2000);
         assert_eq!(cpu.registers().a, b'Q');
         assert_eq!(bus.ram().read(CH_KEY_CODE), ATARI_KEY_C);
+    }
+
+    #[test]
+    fn bus_signals_key_down_when_queued_cio_input_is_pending() {
+        let mut bus = Bus::default();
+        bus.ram_mut().write(CH_KEY_CODE, 0xFF);
+        bus.cio_harness_devices[7] = Some(CioHarnessDevice::QueuedInput);
+        bus.queue_scripted_cio_input_byte(b'C');
+
+        assert_eq!(bus.read(CH_KEY_CODE), ATARI_KEY_C);
+        assert_eq!(bus.scripted_cio_input.front(), Some(&b'C'));
     }
 
     #[test]

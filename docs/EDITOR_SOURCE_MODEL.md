@@ -132,6 +132,11 @@ loaded Action! payload for the editor keyboard device string context
 The ROM file on disk is not modified. Use it with `--hotpatch action-q-input`
 and feed monitor/editor command text with `--q-input`, for example `C\n`.
 
+The `action-headless-getkey` hotpatch removes Action!'s editor cursor-blink
+polling loop from `GETKEY`. It replaces the start of `GETKEY` with a direct
+channel-7 CIO `GETCHR`, stores the returned byte in `CURCH`, and returns. This
+is intended for headless automation where no visible cursor blink is needed.
+
 The harness also captures `E:` channel 0 `PUTCHR`/`PUTREC` output. That matters
 because Action! writes some diagnostics through CIO channel 0, while the visible
 status-line error text is still written directly to screen memory.

@@ -93,6 +93,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     }
     vm.reset_cpu();
     let mut deferred_key_codes = options.deferred_key_codes.clone();
+    let mut deferred_scripted_cio_inputs = options.deferred_scripted_cio_inputs.clone();
     let mut deferred_source_injections = options.deferred_source_injections.clone();
     let mut editor_line_dump_pcs = options.editor_line_dump_pcs.clone();
     let mut screen_dump_pcs = options.screen_dump_pcs.clone();
@@ -146,6 +147,26 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         }
 
         let mut deferred_index = 0;
+        while deferred_index < deferred_scripted_cio_inputs.len() {
+            if deferred_scripted_cio_inputs[deferred_index].after_pc == Some(pc) {
+                deferred_scripted_cio_inputs[deferred_index].after_pc = None;
+            }
+            if deferred_scripted_cio_inputs[deferred_index].after_pc.is_none()
+                && deferred_scripted_cio_inputs[deferred_index].pc == pc
+            {
+                let deferred = deferred_scripted_cio_inputs.remove(deferred_index);
+                vm.bus_mut().queue_scripted_cio_input_bytes(&deferred.bytes);
+                eprintln!(
+                    "queued {} scripted CIO byte(s) at PC=${:04X}",
+                    deferred.bytes.len(),
+                    deferred.pc
+                );
+            } else {
+                deferred_index += 1;
+            }
+        }
+
+        let mut deferred_index = 0;
         while deferred_index < deferred_key_codes.len() {
             if deferred_key_codes[deferred_index].after_pc == Some(pc) {
                 deferred_key_codes[deferred_index].after_pc = None;
@@ -178,7 +199,11 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                         vm.bus().events(),
                         vm.bus().cartridge().map(|cart| cart.mapping_info()),
                     );
-                    print_run_observations(vm.bus(), options.dump_screen_on_stop);
+                    print_run_observations(
+                        vm.bus(),
+                        options.dump_screen_on_stop,
+                        &options.memory_dump_ranges,
+                    );
                     return Ok(());
                 }
             }
@@ -190,7 +215,11 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     vm.bus().events(),
                     vm.bus().cartridge().map(|cart| cart.mapping_info()),
                 );
-                print_run_observations(vm.bus(), options.dump_screen_on_stop);
+                print_run_observations(
+                    vm.bus(),
+                    options.dump_screen_on_stop,
+                    &options.memory_dump_ranges,
+                );
                 return Err(format!("unsupported opcode ${opcode:02X} at ${pc:04X}"));
             }
             Err(CpuError::Halted) => {
@@ -201,7 +230,11 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     vm.bus().events(),
                     vm.bus().cartridge().map(|cart| cart.mapping_info()),
                 );
-                print_run_observations(vm.bus(), options.dump_screen_on_stop);
+                print_run_observations(
+                    vm.bus(),
+                    options.dump_screen_on_stop,
+                    &options.memory_dump_ranges,
+                );
                 return Err("CPU halted".to_string());
             }
         }
@@ -214,7 +247,11 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 vm.bus().events(),
                 vm.bus().cartridge().map(|cart| cart.mapping_info()),
             );
-            print_run_observations(vm.bus(), options.dump_screen_on_stop);
+            print_run_observations(
+                vm.bus(),
+                options.dump_screen_on_stop,
+                &options.memory_dump_ranges,
+            );
         }
     }
 
@@ -239,10 +276,12 @@ struct CliOptions {
     watch_ranges: Vec<AddressRange>,
     key_codes: Vec<u8>,
     scripted_cio_inputs: Vec<Vec<u8>>,
+    deferred_scripted_cio_inputs: Vec<DeferredScriptedCioInput>,
     deferred_key_codes: Vec<DeferredKeyCode>,
     deferred_source_injections: Vec<DeferredSourceInjection>,
     editor_line_dump_pcs: Vec<u16>,
     screen_dump_pcs: Vec<u16>,
+    memory_dump_ranges: Vec<AddressRange>,
     dump_screen_on_stop: bool,
 }
 
@@ -250,6 +289,13 @@ struct CliOptions {
 struct DeferredKeyCode {
     pc: u16,
     key_code: u8,
+    after_pc: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredScriptedCioInput {
+    pc: u16,
+    bytes: Vec<u8>,
     after_pc: Option<u16>,
 }
 
@@ -272,10 +318,12 @@ impl Default for CliOptions {
             watch_ranges: Vec::new(),
             key_codes: Vec::new(),
             scripted_cio_inputs: Vec::new(),
+            deferred_scripted_cio_inputs: Vec::new(),
             deferred_key_codes: Vec::new(),
             deferred_source_injections: Vec::new(),
             editor_line_dump_pcs: Vec::new(),
             screen_dump_pcs: Vec::new(),
+            memory_dump_ranges: Vec::new(),
             dump_screen_on_stop: false,
         }
     }
@@ -298,10 +346,12 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut watch_ranges = Vec::new();
     let mut key_codes = Vec::new();
     let mut scripted_cio_inputs = Vec::new();
+    let mut deferred_scripted_cio_inputs = Vec::new();
     let mut deferred_key_codes = Vec::new();
     let mut deferred_source_injections = Vec::new();
     let mut editor_line_dump_pcs = Vec::new();
     let mut screen_dump_pcs = Vec::new();
+    let mut memory_dump_ranges = Vec::new();
     let mut dump_screen_on_stop = false;
     let mut index = 0;
 
@@ -354,6 +404,19 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let value = required_value(&args, index, "--q-input")?;
                 scripted_cio_inputs.push(parse_scripted_cio_input(value));
             }
+            "--q-input-at-pc" => {
+                index += 1;
+                let value = required_value(&args, index, "--q-input-at-pc")?;
+                deferred_scripted_cio_inputs.push(parse_scripted_cio_input_at_pc(value)?);
+            }
+            "--q-input-at-pc-after" => {
+                index += 1;
+                let value = required_value(&args, index, "--q-input-at-pc-after")?;
+                deferred_scripted_cio_inputs.push(parse_scripted_cio_input_at_pc_after(value)?);
+            }
+            "--trace-cio" => {
+                config.trace_cio = true;
+            }
             "--key-at-pc" => {
                 index += 1;
                 let value = required_value(&args, index, "--key-at-pc")?;
@@ -399,6 +462,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
             "--dump-screen-on-stop" => {
                 dump_screen_on_stop = true;
             }
+            "--dump-range-on-stop" => {
+                index += 1;
+                let value = required_value(&args, index, "--dump-range-on-stop")?;
+                memory_dump_ranges.push(parse_range(value)?);
+            }
             "--preset" => {
                 index += 1;
                 let value = required_value(&args, index, "--preset")?;
@@ -429,6 +497,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let path = required_value(&args, index, "--source")?;
                 config.source = Some(PathBuf::from(path));
             }
+            "--host-file" => {
+                index += 1;
+                let value = required_value(&args, index, "--host-file")?;
+                config.host_files.push(parse_host_file_map(value)?);
+            }
             "--map" => {
                 index += 1;
                 let value = required_value(&args, index, "--map")?;
@@ -455,10 +528,12 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         watch_ranges,
         key_codes,
         scripted_cio_inputs,
+        deferred_scripted_cio_inputs,
         deferred_key_codes,
         deferred_source_injections,
         editor_line_dump_pcs,
         screen_dump_pcs,
+        memory_dump_ranges,
         dump_screen_on_stop,
     })
 }
@@ -476,6 +551,7 @@ fn apply_preset(config: &mut VmConfig, value: &str) -> Result<(), String> {
 fn parse_hotpatch(value: &str) -> Result<Hotpatch, String> {
     match value {
         "action-q-input" => Ok(Hotpatch::ActionQueuedInput),
+        "action-headless-getkey" => Ok(Hotpatch::ActionHeadlessGetkey),
         other => Err(format!("unknown hotpatch `{other}`")),
     }
 }
@@ -557,6 +633,44 @@ fn parse_scripted_cio_input(value: &str) -> Vec<u8> {
         }
     }
     bytes
+}
+
+fn parse_scripted_cio_input_at_pc(value: &str) -> Result<DeferredScriptedCioInput, String> {
+    let Some((pc, text)) = value.split_once(':') else {
+        return Err(format!("scripted CIO trigger `{value}` must be pc:text"));
+    };
+    Ok(DeferredScriptedCioInput {
+        pc: parse_address(pc)?,
+        bytes: parse_scripted_cio_input(text),
+        after_pc: None,
+    })
+}
+
+fn parse_scripted_cio_input_at_pc_after(value: &str) -> Result<DeferredScriptedCioInput, String> {
+    let parts = value.splitn(3, ':').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(format!(
+            "gated scripted CIO trigger `{value}` must be after_pc:pc:text"
+        ));
+    }
+    Ok(DeferredScriptedCioInput {
+        after_pc: Some(parse_address(parts[0])?),
+        pc: parse_address(parts[1])?,
+        bytes: parse_scripted_cio_input(parts[2]),
+    })
+}
+
+fn parse_host_file_map(value: &str) -> Result<(String, PathBuf), String> {
+    let Some((name, path)) = value.split_once(':') else {
+        return Err(format!("host file `{value}` must be name:path"));
+    };
+    if name.trim().is_empty() {
+        return Err("host file name must not be empty".to_string());
+    }
+    if path.is_empty() {
+        return Err("host file path must not be empty".to_string());
+    }
+    Ok((name.to_string(), PathBuf::from(path)))
 }
 
 fn ascii_to_atascii(ch: char) -> u8 {
@@ -723,7 +837,11 @@ fn print_editor_line(index: usize, line: &ActionEditorLine) {
     );
 }
 
-fn print_run_observations(bus: &action_compiler_vm::Bus, dump_screen: bool) {
+fn print_run_observations(
+    bus: &action_compiler_vm::Bus,
+    dump_screen: bool,
+    memory_dump_ranges: &[AddressRange],
+) {
     if bus.speaker_write_count() != 0 {
         let last = bus
             .last_speaker_write()
@@ -742,6 +860,42 @@ fn print_run_observations(bus: &action_compiler_vm::Bus, dump_screen: bool) {
     }
     if dump_screen {
         print_text_screen(&bus.text_screen_snapshot(40, 24));
+    }
+    print_memory_dumps(bus, memory_dump_ranges);
+}
+
+fn print_memory_dumps(bus: &action_compiler_vm::Bus, ranges: &[AddressRange]) {
+    for range in ranges {
+        eprintln!("memory ${:04X}-${:04X}:", range.start, range.end);
+        let mut line_start = range.start;
+        while line_start <= range.end {
+            let line_end = line_start.saturating_add(15).min(range.end);
+            let mut hex = String::new();
+            let mut text = String::new();
+            let mut address = line_start;
+            while address <= line_end {
+                let value = bus.ram().read(address);
+                hex.push_str(&format!(" {value:02X}"));
+                text.push(memory_dump_char(value));
+                if address == u16::MAX {
+                    break;
+                }
+                address += 1;
+            }
+            eprintln!("  ${line_start:04X}:{hex:<48} |{text}|");
+            if line_end == u16::MAX {
+                break;
+            }
+            line_start = line_end + 1;
+        }
+    }
+}
+
+fn memory_dump_char(value: u8) -> char {
+    match value {
+        0x20..=0x7e => value as char,
+        0x9b => '~',
+        _ => '.',
     }
 }
 
@@ -849,6 +1003,11 @@ fn print_help() {
          --watch-range <a:b>  Record bus reads/writes inside the range\n  \
          --key-code <byte>    Queue one Atari keyboard code for CH ($02FC); repeatable\n  \
          --q-input <text>     Queue text for synthetic Q: CIO input; \\n becomes ATASCII EOL\n  \
+         --q-input-at-pc <pc:text>\n  \
+                              Queue Q: input when execution reaches pc\n  \
+         --q-input-at-pc-after <after:pc:text>\n  \
+                              Queue Q: input at pc, but only after after_pc was reached\n  \
+         --trace-cio          Print harness CIO calls while running\n  \
          --key-at-pc <pc:k>   Queue key k when execution reaches pc\n  \
          --key-at-pc-after <after:pc:k>\n  \
                               Queue key k at pc, but only after after_pc was reached\n  \
@@ -865,8 +1024,11 @@ fn print_help() {
                               Dump decoded 40x24 text screen when execution reaches pc\n  \
          --dump-screen-on-stop\n  \
                               Dump decoded 40x24 text screen in stop reports\n  \
+         --dump-range-on-stop <a:b>\n  \
+                              Dump RAM bytes in range when execution stops\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
-         --hotpatch <name>    Apply an in-memory hotpatch, e.g. action-q-input\n  \
+         --host-file <n:path> Register a host file visible as H:n\n  \
+         --hotpatch <name>    Apply an in-memory hotpatch, e.g. action-q-input or action-headless-getkey\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );
 }
@@ -891,10 +1053,18 @@ mod tests {
 
     #[test]
     fn parses_hotpatch_option() {
-        let options =
-            parse_options(vec!["--hotpatch".to_string(), "action-q-input".to_string()]).unwrap();
+        let options = parse_options(vec![
+            "--hotpatch".to_string(),
+            "action-q-input".to_string(),
+            "--hotpatch".to_string(),
+            "action-headless-getkey".to_string(),
+        ])
+        .unwrap();
 
-        assert_eq!(options.config.hotpatches, vec![Hotpatch::ActionQueuedInput]);
+        assert_eq!(
+            options.config.hotpatches,
+            vec![Hotpatch::ActionQueuedInput, Hotpatch::ActionHeadlessGetkey]
+        );
     }
 
     #[test]
