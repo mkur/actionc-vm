@@ -204,6 +204,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                         options.dump_screen_on_stop,
                         &options.memory_dump_ranges,
                     );
+                    write_host_outputs(&options.config, vm.bus())?;
                     return Ok(());
                 }
             }
@@ -220,6 +221,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     options.dump_screen_on_stop,
                     &options.memory_dump_ranges,
                 );
+                write_host_outputs(&options.config, vm.bus())?;
                 return Err(format!("unsupported opcode ${opcode:02X} at ${pc:04X}"));
             }
             Err(CpuError::Halted) => {
@@ -235,6 +237,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     options.dump_screen_on_stop,
                     &options.memory_dump_ranges,
                 );
+                write_host_outputs(&options.config, vm.bus())?;
                 return Err("CPU halted".to_string());
             }
         }
@@ -252,6 +255,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 options.dump_screen_on_stop,
                 &options.memory_dump_ranges,
             );
+            write_host_outputs(&options.config, vm.bus())?;
         }
     }
 
@@ -261,6 +265,22 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         vm.cpu().cycles(),
         vm.cpu().registers().pc
     );
+    Ok(())
+}
+
+fn write_host_outputs(config: &VmConfig, bus: &action_compiler_vm::Bus) -> Result<(), String> {
+    for (name, path) in &config.host_outputs {
+        let bytes = bus
+            .host_file_bytes(name)
+            .ok_or_else(|| format!("host output `{name}` was not registered"))?;
+        fs::write(path, bytes)
+            .map_err(|err| format!("failed to write host output `{}`: {err}", path.display()))?;
+        eprintln!(
+            "wrote host output `{name}`: {} byte(s) to {}",
+            bytes.len(),
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -501,6 +521,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 index += 1;
                 let value = required_value(&args, index, "--host-file")?;
                 config.host_files.push(parse_host_file_map(value)?);
+            }
+            "--host-output" => {
+                index += 1;
+                let value = required_value(&args, index, "--host-output")?;
+                config.host_outputs.push(parse_host_file_map(value)?);
             }
             "--map" => {
                 index += 1;
@@ -1028,6 +1053,8 @@ fn print_help() {
                               Dump RAM bytes in range when execution stops\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
          --host-file <n:path> Register a host file visible as H:n\n  \
+         --host-output <n:path>\n  \
+                              Register writable host file H:n and save it to path on stop\n  \
          --hotpatch <name>    Apply an in-memory hotpatch, e.g. action-q-input or action-headless-getkey\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );
@@ -1049,6 +1076,20 @@ mod tests {
         let options = parse_options(vec!["--q-input".to_string(), "C\\n".to_string()]).unwrap();
 
         assert_eq!(options.scripted_cio_inputs, vec![vec![b'C', 0x9B]]);
+    }
+
+    #[test]
+    fn parses_host_output_option() {
+        let options = parse_options(vec![
+            "--host-output".to_string(),
+            "FUNCTIONS.COM:/tmp/functions.com".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options.config.host_outputs,
+            vec![("FUNCTIONS.COM".to_string(), PathBuf::from("/tmp/functions.com"))]
+        );
     }
 
     #[test]

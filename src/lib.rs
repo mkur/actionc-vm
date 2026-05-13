@@ -98,6 +98,7 @@ pub struct VmConfig {
     pub extra_images: Vec<(ImageKind, PathBuf, u16)>,
     pub hotpatches: Vec<Hotpatch>,
     pub host_files: Vec<(String, PathBuf)>,
+    pub host_outputs: Vec<(String, PathBuf)>,
     pub trace_cio: bool,
 }
 
@@ -112,6 +113,7 @@ impl Default for VmConfig {
             extra_images: Vec::new(),
             hotpatches: Vec::new(),
             host_files: Vec::new(),
+            host_outputs: Vec::new(),
             trace_cio: false,
         }
     }
@@ -163,6 +165,9 @@ impl VmConfig {
             let bytes = fs::read(path)
                 .map_err(|err| format!("failed to read host file `{}`: {err}", path.display()))?;
             vm.bus_mut().add_host_file(name, bytes);
+        }
+        for (name, _) in &self.host_outputs {
+            vm.bus_mut().add_host_output(name);
         }
         vm.bus_mut().set_trace_cio(self.trace_cio);
 
@@ -1282,6 +1287,13 @@ impl Cpu {
                 false
             }
             CIO_COMMAND_PUTCHR | CIO_COMMAND_PUTREC => {
+                if bus
+                    .write_host_bytes_for_iocb(self.registers.x, self.registers.a)
+                    .is_some()
+                {
+                    self.return_from_ciov(bus, self.registers.a, 0x01);
+                    return true;
+                }
                 if self.registers.x != 0x00 {
                     return false;
                 }
@@ -1607,8 +1619,26 @@ impl Bus {
         self.host_files.push(HostFile {
             name: normalized.clone(),
             bytes,
+            writable: false,
         });
         self.host_file_lookup.insert(normalized, index);
+    }
+
+    pub fn add_host_output(&mut self, name: impl AsRef<str>) {
+        let normalized = normalize_host_file_name(name.as_ref());
+        let index = self.host_files.len();
+        self.host_files.push(HostFile {
+            name: normalized.clone(),
+            bytes: Vec::new(),
+            writable: true,
+        });
+        self.host_file_lookup.insert(normalized, index);
+    }
+
+    pub fn host_file_bytes(&self, name: impl AsRef<str>) -> Option<&[u8]> {
+        let normalized = normalize_host_file_name(name.as_ref());
+        let index = self.host_file_lookup.get(&normalized)?;
+        Some(&self.host_files[*index].bytes)
     }
 
     pub fn set_trace_cio(&mut self, trace_cio: bool) {
@@ -2056,6 +2086,9 @@ impl Bus {
                     return false;
                 };
                 self.trace_cio(format_args!("  H: open spec=`{spec}` name=`{name}`"));
+                if self.host_files[file_index].writable && self.open_mode_is_write(x) {
+                    self.host_files[file_index].bytes.clear();
+                }
                 CioHarnessDevice::Host {
                     file_index,
                     offset: 0,
@@ -2083,6 +2116,10 @@ impl Bus {
 
     fn cio_channel_device(&self, x: u8) -> Option<CioHarnessDevice> {
         cio_channel_index(x).and_then(|channel| self.cio_harness_devices[channel])
+    }
+
+    fn open_mode_is_write(&self, x: u8) -> bool {
+        self.ram.read(IOCB_AUX1_BASE.wrapping_add(x as u16)) & 0x08 != 0
     }
 
     fn has_queued_input_device(&self) -> bool {
@@ -2127,6 +2164,9 @@ impl Bus {
             return None;
         };
         let file = self.host_files.get(file_index)?;
+        if file.writable {
+            return None;
+        }
         let mut next_offset = offset;
         while next_offset < file.bytes.len() {
             let byte = file.bytes[next_offset];
@@ -2152,6 +2192,9 @@ impl Bus {
         let requested = self.ram.read_word(IOCB_LENGTH_BASE.wrapping_add(x as u16));
         let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(x as u16));
         let file = self.host_files.get(file_index)?;
+        if file.writable {
+            return None;
+        }
         if requested == 0 || offset >= file.bytes.len() {
             self.ram
                 .write_word(IOCB_LENGTH_BASE.wrapping_add(x as u16), 0);
@@ -2194,6 +2237,30 @@ impl Bus {
             offset: next_offset,
         });
         Some((0, 0x01))
+    }
+
+    fn write_host_bytes_for_iocb(&mut self, x: u8, accumulator: u8) -> Option<()> {
+        let channel = cio_channel_index(x)?;
+        let Some(CioHarnessDevice::Host { file_index, offset }) = self.cio_harness_devices[channel]
+        else {
+            return None;
+        };
+        if !self.host_files.get(file_index)?.writable {
+            return None;
+        }
+
+        let bytes = self.cio_output_bytes_for_iocb(x, accumulator);
+        self.host_files[file_index].bytes.extend_from_slice(&bytes);
+        self.cio_harness_devices[channel] = Some(CioHarnessDevice::Host {
+            file_index,
+            offset: offset.saturating_add(bytes.len()),
+        });
+        self.trace_cio(format_args!(
+            "  H: wrote {} byte(s) to `{}`",
+            bytes.len(),
+            self.host_files[file_index].name
+        ));
+        Some(())
     }
 
     fn cio_output_bytes_for_iocb(&self, x: u8, accumulator: u8) -> Vec<u8> {
@@ -2434,6 +2501,7 @@ fn ram_address(address: u16) -> Option<u16> {
 struct HostFile {
     name: String,
     bytes: Vec<u8>,
+    writable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2498,7 +2566,7 @@ fn atari_character_to_key_code(character: u8) -> Option<u8> {
         b'C' | b'c' => Some(ATARI_KEY_C),
         b'E' | b'e' => Some(ATARI_KEY_E),
         0x9B => Some(ATARI_KEY_RETURN),
-        _ => Some(ATARI_KEY_C),
+        _ => Some((character & 0x3F) | 0x40),
     }
 }
 
@@ -4822,6 +4890,46 @@ mod tests {
         cpu.step(&mut bus).unwrap();
 
         assert_eq!(bus.cio_channel_device(0x20), None);
+    }
+
+    #[test]
+    fn cpu_writes_harness_host_output() {
+        let mut bus = Bus::default();
+        bus.add_host_output("OUT.COM");
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x10), CIO_COMMAND_OPEN);
+        bus.ram_mut()
+            .write(IOCB_AUX1_BASE.wrapping_add(0x10), 0x08);
+        bus.ram_mut()
+            .write_word(IOCB_BUFFER_BASE.wrapping_add(0x10), 0x3000);
+        bus.ram_mut()
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(0x10), 9);
+        bus.ram_mut().map(0x3000, b"H:OUT.COM").unwrap();
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        let mut cpu = Cpu::default();
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x10;
+        cpu.registers.sp = 0xFB;
+
+        cpu.step(&mut bus).unwrap();
+
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x10), CIO_COMMAND_PUTCHR);
+        bus.ram_mut()
+            .write_word(IOCB_BUFFER_BASE.wrapping_add(0x10), 0x3100);
+        bus.ram_mut()
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(0x10), 4);
+        bus.ram_mut().map(0x3100, &[0xFF, 0xFF, 0x00, 0x30]).unwrap();
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x10;
+        cpu.registers.sp = 0xFB;
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.host_file_bytes("OUT.COM"), Some(&[0xFF, 0xFF, 0x00, 0x30][..]));
     }
 
     #[test]
