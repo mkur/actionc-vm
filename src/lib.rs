@@ -450,6 +450,14 @@ impl Cpu {
         let opcode = self.fetch_byte(bus);
 
         match opcode {
+            0x01 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indexed_indirect(bus, zp);
+                let value = bus.read(address);
+                self.registers.a |= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 6;
+            }
             0x05 => {
                 let address = self.fetch_byte(bus) as u16;
                 let value = bus.read(address);
@@ -505,9 +513,33 @@ impl Cpu {
             0x10 => {
                 self.branch(bus, !self.flag(StatusFlags::NEGATIVE), 2, 3);
             }
+            0x11 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indirect_y(bus, zp);
+                let value = bus.read(address);
+                self.registers.a |= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 5;
+            }
+            0x15 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                self.registers.a |= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
+            }
             0x18 => {
                 self.set_flag(StatusFlags::CARRY, false);
                 self.cycles += 2;
+            }
+            0x19 => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.y as u16);
+                let value = bus.read(address);
+                self.registers.a |= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
             }
             0x1D => {
                 let base = self.fetch_word(bus);
@@ -1104,6 +1136,13 @@ impl Cpu {
                 self.compare(self.registers.x, value);
                 self.cycles += 2;
             }
+            0xE1 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indexed_indirect(bus, zp);
+                let value = bus.read(address);
+                self.sbc(value);
+                self.cycles += 6;
+            }
             0xE4 => {
                 let address = self.fetch_byte(bus) as u16;
                 let value = bus.read(address);
@@ -1152,9 +1191,37 @@ impl Cpu {
             0xF0 => {
                 self.branch(bus, self.flag(StatusFlags::ZERO), 2, 3);
             }
+            0xF1 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indirect_y(bus, zp);
+                let value = bus.read(address);
+                self.sbc(value);
+                self.cycles += 5;
+            }
+            0xF5 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                self.sbc(value);
+                self.cycles += 4;
+            }
             0xF8 => {
                 self.set_flag(StatusFlags::DECIMAL, true);
                 self.cycles += 2;
+            }
+            0xF9 => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.y as u16);
+                let value = bus.read(address);
+                self.sbc(value);
+                self.cycles += 4;
+            }
+            0xFD => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address);
+                self.sbc(value);
+                self.cycles += 4;
             }
             0xFE => {
                 let base = self.fetch_word(bus);
@@ -1207,6 +1274,11 @@ impl Cpu {
     fn indirect_y(&mut self, bus: &mut Bus, zp: u8) -> u16 {
         let base = self.read_word(bus, zp as u16);
         base.wrapping_add(self.registers.y as u16)
+    }
+
+    fn indexed_indirect(&mut self, bus: &mut Bus, zp: u8) -> u16 {
+        let pointer = zp.wrapping_add(self.registers.x);
+        self.read_word(bus, pointer as u16)
     }
 
     fn push(&mut self, bus: &mut Bus, value: u8) {
@@ -3948,6 +4020,36 @@ mod tests {
     }
 
     #[test]
+    fn cpu_ora_indirect_y_updates_accumulator_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x40, // LDA #$40
+                    0xA0, 0x02, // LDY #$02
+                    0x11, 0x40, // ORA ($40),Y
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write_word(0x0040, 0x0320);
+        bus.ram_mut().write(0x0322, 0x80);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0xC0);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
     fn cpu_rol_zero_page_rotates_through_carry() {
         let mut bus = Bus::default();
         bus.ram_mut()
@@ -4490,6 +4592,39 @@ mod tests {
         assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
         assert_eq!(registers.status & StatusFlags::CARRY.bits(), 0);
         assert_eq!(registers.status & StatusFlags::OVERFLOW.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_sbc_indirect_y_updates_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x10, // LDA #$10
+                    0x38, // SEC
+                    0xA0, 0x02, // LDY #$02
+                    0xF1, 0x40, // SBC ($40),Y
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write_word(0x0040, 0x0320);
+        bus.ram_mut().write(0x0322, 0x03);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x0D);
+        assert!(registers.status & StatusFlags::CARRY.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
     }
 
     #[test]

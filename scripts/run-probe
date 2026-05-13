@@ -16,16 +16,23 @@ abi_calls
 abi_system_call
 argthr
 arith
+array_assign
 array_params
 array_refs
 arrays
 bools
+bool_edges
 control_flow
+external_call
 functions
+index_scaling
 locarr
 locals
 nested_calls
+optional_args
 pointers
+record_args
+record_ptr_order
 records
 retflow
 returns
@@ -45,16 +52,23 @@ probe_source() {
     abi_system_call) echo abi_system_call.act ;;
     argthr) echo argthr.act ;;
     arith) echo arith.act ;;
+    array_assign) echo array_assign.act ;;
     array_params) echo array_params.act ;;
     array_refs) echo array_refs.act ;;
     arrays) echo arrays.act ;;
     bools) echo bools.act ;;
+    bool_edges) echo bool_edges.act ;;
     control_flow) echo control_flow.act ;;
+    external_call) echo external_call.act ;;
     functions) echo functions.act ;;
+    index_scaling) echo index_scaling.act ;;
     locarr) echo locarr.act ;;
     locals) echo locals.act ;;
     nested_calls) echo nested_calls.act ;;
+    optional_args) echo optional_args.act ;;
     pointers) echo pointers.act ;;
+    record_args) echo record_args.act ;;
+    record_ptr_order) echo record_ptr_order.act ;;
     records) echo records.act ;;
     retflow) echo retflow.act ;;
     returns) echo returns.act ;;
@@ -76,16 +90,23 @@ probe_output() {
     abi_system_call) echo ABISYS.COM ;;
     argthr) echo ARGTHR.COM ;;
     arith) echo ARITH.COM ;;
+    array_assign) echo ARRASN.COM ;;
     array_params) echo ARRPAR.COM ;;
     array_refs) echo ARRREF.COM ;;
     arrays) echo ARRAYS.COM ;;
     bools) echo BOOLS.COM ;;
+    bool_edges) echo BOOLEDGE.COM ;;
     control_flow) echo CONTROL.COM ;;
+    external_call) echo EXTCALL.COM ;;
     functions) echo FUNC.COM ;;
+    index_scaling) echo IDXSCALE.COM ;;
     locarr) echo LOCARR.COM ;;
     locals) echo LOCALS.COM ;;
     nested_calls) echo NESTED.COM ;;
+    optional_args) echo OPTARGS.COM ;;
     pointers) echo POINTERS.COM ;;
+    record_args) echo RECARGS.COM ;;
+    record_ptr_order) echo RECPTRO.COM ;;
     records) echo RECORDS.COM ;;
     retflow) echo RETFLOW.COM ;;
     returns) echo RETURNS.COM ;;
@@ -97,6 +118,13 @@ probe_output() {
     strloc) echo STRLOC.COM ;;
     strmut) echo STRMUT.COM ;;
     strpass) echo STRPASS.COM ;;
+    *) return 1 ;;
+  esac
+}
+
+probe_expected_compile_failure() {
+  case "$1" in
+    record_ptr_order) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -172,6 +200,11 @@ run_probe() {
   )
 
   if [[ ! -s "$output_path" ]]; then
+    if probe_expected_compile_failure "$probe"; then
+      rm -f "$output_path"
+      echo "    expected original compiler failure; no output file written"
+      return 0
+    fi
     echo "FAILED: $output_path was not written or is empty" >&2
     exit 1
   fi
