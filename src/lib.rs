@@ -47,8 +47,17 @@ pub const CONSOL: u16 = 0xD01F;
 pub const CONSOL_NO_KEYS: u8 = 0x07;
 pub const SEROUT_SERIAL_OUTPUT: u16 = 0xD20D;
 pub const CIOV: u16 = 0xE456;
+pub const IOCB_DEVICE_BASE: u16 = 0x0341;
 pub const IOCB_COMMAND_BASE: u16 = 0x0342;
+pub const IOCB_BUFFER_BASE: u16 = 0x0344;
+pub const IOCB_LENGTH_BASE: u16 = 0x0348;
+pub const CIO_COMMAND_OPEN: u8 = 0x03;
+pub const CIO_COMMAND_GETREC: u8 = 0x05;
 pub const CIO_COMMAND_GETCHR: u8 = 0x07;
+pub const CIO_COMMAND_PUTREC: u8 = 0x09;
+pub const CIO_COMMAND_PUTCHR: u8 = 0x0B;
+pub const CIO_COMMAND_CLOSE: u8 = 0x0C;
+pub const CIO_COMMAND_STATUS: u8 = 0x0D;
 pub const CARTCS_COLDSTART_VECTOR: u16 = 0xBFFA;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
@@ -1083,24 +1092,70 @@ impl Cpu {
 
     fn try_emulate_ciov(&mut self, bus: &mut Bus) -> bool {
         let command_address = IOCB_COMMAND_BASE.wrapping_add(self.registers.x as u16);
-        if self.registers.x != 0x70 || bus.ram().read(command_address) != CIO_COMMAND_GETCHR {
-            return false;
+        let command = bus.ram().read(command_address);
+        match command {
+            CIO_COMMAND_OPEN => {
+                if bus.try_open_harness_cio_device(self.registers.x) {
+                    self.return_from_ciov(bus, self.registers.a, 0x01);
+                    return true;
+                }
+                false
+            }
+            CIO_COMMAND_GETCHR | CIO_COMMAND_GETREC => {
+                if bus.cio_channel_device(self.registers.x) == Some(CioHarnessDevice::QueuedInput)
+                    && let Some(character) = bus.pop_scripted_cio_input_byte()
+                {
+                    self.return_from_ciov(bus, character, 0x01);
+                    return true;
+                }
+
+                if self.registers.x != 0x70 {
+                    return false;
+                }
+                let raw_key = bus.ram().read(CH_KEY_CODE);
+                let Some(character) = atari_key_code_to_character(raw_key) else {
+                    return false;
+                };
+
+                bus.write(CH_KEY_CODE, 0xFF);
+                self.return_from_ciov(bus, character, 0x01);
+                true
+            }
+            CIO_COMMAND_CLOSE => {
+                if bus.close_harness_cio_device(self.registers.x) {
+                    self.return_from_ciov(bus, self.registers.a, 0x01);
+                    return true;
+                }
+                false
+            }
+            CIO_COMMAND_STATUS => {
+                if bus.cio_channel_device(self.registers.x).is_some() {
+                    self.return_from_ciov(bus, self.registers.a, 0x01);
+                    return true;
+                }
+                false
+            }
+            CIO_COMMAND_PUTCHR | CIO_COMMAND_PUTREC => {
+                if self.registers.x != 0x00 {
+                    return false;
+                }
+                let bytes = bus.cio_output_bytes_for_iocb(self.registers.x, self.registers.a);
+                bus.capture_cio_channel0_output(&bytes);
+                self.return_from_ciov(bus, self.registers.a, 0x01);
+                true
+            }
+            _ => false,
         }
+    }
 
-        let raw_key = bus.ram().read(CH_KEY_CODE);
-        let Some(character) = atari_key_code_to_character(raw_key) else {
-            return false;
-        };
-
-        bus.write(CH_KEY_CODE, 0xFF);
-        self.registers.a = character;
-        self.registers.y = 0x01;
+    fn return_from_ciov(&mut self, bus: &mut Bus, a: u8, y: u8) {
+        self.registers.a = a;
+        self.registers.y = y;
         let lo = self.pop(bus);
         let hi = self.pop(bus);
         self.registers.pc = u16::from_le_bytes([lo, hi]).wrapping_add(1);
         self.set_zn(self.registers.a);
         self.cycles += 6;
-        true
     }
 
     fn branch(&mut self, bus: &mut Bus, condition: bool, base_cycles: u64, branch_cycles: u64) {
@@ -1296,6 +1351,9 @@ pub struct Bus {
     last_data: u8,
     vcount: u8,
     pending_key_codes: VecDeque<u8>,
+    scripted_cio_input: VecDeque<u8>,
+    cio_channel0_output: Vec<u8>,
+    cio_harness_devices: [Option<CioHarnessDevice>; 8],
     sio_timeout_pending: bool,
     redirect_disk_boot_to_cart: bool,
 }
@@ -1312,6 +1370,9 @@ impl Default for Bus {
             last_data: 0,
             vcount: 0,
             pending_key_codes: VecDeque::new(),
+            scripted_cio_input: VecDeque::new(),
+            cio_channel0_output: Vec::new(),
+            cio_harness_devices: [None; 8],
             sio_timeout_pending: false,
             redirect_disk_boot_to_cart: false,
         }
@@ -1362,6 +1423,22 @@ impl Bus {
 
     pub fn queue_key_code(&mut self, key_code: u8) {
         self.pending_key_codes.push_back(key_code);
+    }
+
+    pub fn queue_scripted_cio_input_byte(&mut self, byte: u8) {
+        self.scripted_cio_input.push_back(byte);
+    }
+
+    pub fn queue_scripted_cio_input_bytes(&mut self, bytes: &[u8]) {
+        self.scripted_cio_input.extend(bytes);
+    }
+
+    pub fn cio_channel0_output(&self) -> &[u8] {
+        &self.cio_channel0_output
+    }
+
+    pub fn decoded_cio_channel0_output(&self) -> String {
+        decode_atascii_output(&self.cio_channel0_output)
     }
 
     pub fn inject_action_source(
@@ -1748,6 +1825,60 @@ impl Bus {
         value
     }
 
+    fn pop_scripted_cio_input_byte(&mut self) -> Option<u8> {
+        self.scripted_cio_input.pop_front()
+    }
+
+    fn try_open_harness_cio_device(&mut self, x: u8) -> bool {
+        let Some(channel) = cio_channel_index(x) else {
+            return false;
+        };
+        let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(x as u16));
+        let device = match self.ram.read(buffer).to_ascii_uppercase() {
+            b'Q' => CioHarnessDevice::QueuedInput,
+            b'H' => CioHarnessDevice::Host,
+            _ => return false,
+        };
+        if self.ram.read(buffer.wrapping_add(1)) != b':' {
+            return false;
+        }
+
+        self.cio_harness_devices[channel] = Some(device);
+        true
+    }
+
+    fn close_harness_cio_device(&mut self, x: u8) -> bool {
+        let Some(channel) = cio_channel_index(x) else {
+            return false;
+        };
+        let was_open = self.cio_harness_devices[channel].is_some();
+        self.cio_harness_devices[channel] = None;
+        was_open
+    }
+
+    fn cio_channel_device(&self, x: u8) -> Option<CioHarnessDevice> {
+        cio_channel_index(x).and_then(|channel| self.cio_harness_devices[channel])
+    }
+
+    fn cio_output_bytes_for_iocb(&self, x: u8, accumulator: u8) -> Vec<u8> {
+        let base = x as u16;
+        let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(base));
+        let length = self.ram.read_word(IOCB_LENGTH_BASE.wrapping_add(base));
+        if buffer == 0 || length == 0 {
+            return vec![accumulator];
+        }
+
+        let mut bytes = Vec::with_capacity(length as usize);
+        for offset in 0..length {
+            bytes.push(self.ram.read(buffer.wrapping_add(offset)));
+        }
+        bytes
+    }
+
+    fn capture_cio_channel0_output(&mut self, bytes: &[u8]) {
+        self.cio_channel0_output.extend(bytes);
+    }
+
     fn read_self_test(&self, address: u16) -> Option<u8> {
         if !AddressRange::with_size(SELF_TEST_BASE, SELF_TEST_SIZE)
             .expect("valid self-test range")
@@ -1927,6 +2058,20 @@ fn ram_address(address: u16) -> Option<u16> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CioHarnessDevice {
+    QueuedInput,
+    Host,
+}
+
+fn cio_channel_index(x: u8) -> Option<usize> {
+    if x & 0x0F == 0 && x <= 0x70 {
+        Some((x >> 4) as usize)
+    } else {
+        None
+    }
+}
+
 fn atari_screen_code_to_ascii(value: u8) -> char {
     let code = value & 0x7F;
     match code {
@@ -1943,6 +2088,19 @@ fn atari_key_code_to_character(key_code: u8) -> Option<u8> {
         ATARI_KEY_RETURN => Some(0x9B),
         _ => None,
     }
+}
+
+fn decode_atascii_output(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    for byte in bytes {
+        match *byte {
+            0x9B => output.push('\n'),
+            0x1B => {}
+            0x20..=0x7E => output.push(*byte as char),
+            _ => output.push('.'),
+        }
+    }
+    output
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3864,6 +4022,83 @@ mod tests {
         assert_eq!(cpu.registers().a, b'C');
         assert_eq!(cpu.registers().y, 0x01);
         assert_eq!(bus.ram().read(CH_KEY_CODE), 0xFF);
+    }
+
+    #[test]
+    fn cpu_emulates_scripted_cio_input_before_keyboard_latch() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x70), CIO_COMMAND_GETCHR);
+        bus.ram_mut().write(CH_KEY_CODE, ATARI_KEY_C);
+        bus.cio_harness_devices[7] = Some(CioHarnessDevice::QueuedInput);
+        bus.queue_scripted_cio_input_byte(b'Q');
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        let mut cpu = Cpu::default();
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x70;
+        cpu.registers.sp = 0xFB;
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers().pc, 0x2000);
+        assert_eq!(cpu.registers().a, b'Q');
+        assert_eq!(bus.ram().read(CH_KEY_CODE), ATARI_KEY_C);
+    }
+
+    #[test]
+    fn cpu_opens_and_closes_harness_cio_devices() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x20), CIO_COMMAND_OPEN);
+        bus.ram_mut()
+            .write_word(IOCB_BUFFER_BASE.wrapping_add(0x20), 0x3000);
+        bus.ram_mut().map(0x3000, b"Q:").unwrap();
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        let mut cpu = Cpu::default();
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x20;
+        cpu.registers.sp = 0xFB;
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(
+            bus.cio_channel_device(0x20),
+            Some(CioHarnessDevice::QueuedInput)
+        );
+
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x20), CIO_COMMAND_CLOSE);
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        cpu.registers.pc = CIOV;
+        cpu.registers.sp = 0xFB;
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.cio_channel_device(0x20), None);
+    }
+
+    #[test]
+    fn cpu_captures_channel_zero_cio_output() {
+        let mut bus = Bus::default();
+        bus.ram_mut().write(IOCB_COMMAND_BASE, CIO_COMMAND_PUTREC);
+        bus.ram_mut().write_word(IOCB_BUFFER_BASE, 0x3000);
+        bus.ram_mut().write_word(IOCB_LENGTH_BASE, 3);
+        bus.ram_mut().map(0x3000, b"OK\x9B").unwrap();
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        let mut cpu = Cpu::default();
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x00;
+        cpu.registers.sp = 0xFB;
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers().pc, 0x2000);
+        assert_eq!(bus.cio_channel0_output(), b"OK\x9B");
+        assert_eq!(bus.decoded_cio_channel0_output(), "OK\n");
     }
 
     #[test]

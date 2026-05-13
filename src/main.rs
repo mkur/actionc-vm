@@ -88,6 +88,9 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     for key_code in &options.key_codes {
         vm.bus_mut().queue_key_code(*key_code);
     }
+    for bytes in &options.scripted_cio_inputs {
+        vm.bus_mut().queue_scripted_cio_input_bytes(bytes);
+    }
     vm.reset_cpu();
     let mut deferred_key_codes = options.deferred_key_codes.clone();
     let mut deferred_source_injections = options.deferred_source_injections.clone();
@@ -235,6 +238,7 @@ struct CliOptions {
     watchpoints: Vec<u16>,
     watch_ranges: Vec<AddressRange>,
     key_codes: Vec<u8>,
+    scripted_cio_inputs: Vec<Vec<u8>>,
     deferred_key_codes: Vec<DeferredKeyCode>,
     deferred_source_injections: Vec<DeferredSourceInjection>,
     editor_line_dump_pcs: Vec<u16>,
@@ -267,6 +271,7 @@ impl Default for CliOptions {
             watchpoints: Vec::new(),
             watch_ranges: Vec::new(),
             key_codes: Vec::new(),
+            scripted_cio_inputs: Vec::new(),
             deferred_key_codes: Vec::new(),
             deferred_source_injections: Vec::new(),
             editor_line_dump_pcs: Vec::new(),
@@ -292,6 +297,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut watchpoints = Vec::new();
     let mut watch_ranges = Vec::new();
     let mut key_codes = Vec::new();
+    let mut scripted_cio_inputs = Vec::new();
     let mut deferred_key_codes = Vec::new();
     let mut deferred_source_injections = Vec::new();
     let mut editor_line_dump_pcs = Vec::new();
@@ -342,6 +348,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 index += 1;
                 let value = required_value(&args, index, "--key-code")?;
                 key_codes.push(parse_byte(value)?);
+            }
+            "--q-input" => {
+                index += 1;
+                let value = required_value(&args, index, "--q-input")?;
+                scripted_cio_inputs.push(parse_scripted_cio_input(value));
             }
             "--key-at-pc" => {
                 index += 1;
@@ -438,6 +449,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         watchpoints,
         watch_ranges,
         key_codes,
+        scripted_cio_inputs,
         deferred_key_codes,
         deferred_source_injections,
         editor_line_dump_pcs,
@@ -510,6 +522,38 @@ fn parse_named_key(value: &str) -> Option<u8> {
         "e" => Some(ATARI_KEY_E),
         "monitor" => Some(ACTION_MONITOR_KEY_CODE),
         _ => None,
+    }
+}
+
+fn parse_scripted_cio_input(value: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            bytes.push(ascii_to_atascii(ch));
+            continue;
+        }
+
+        match chars.next() {
+            Some('n') | Some('r') => bytes.push(0x9B),
+            Some('\\') => bytes.push(b'\\'),
+            Some(other) => {
+                bytes.push(b'\\');
+                bytes.push(ascii_to_atascii(other));
+            }
+            None => bytes.push(b'\\'),
+        }
+    }
+    bytes
+}
+
+fn ascii_to_atascii(ch: char) -> u8 {
+    if ch == '\n' || ch == '\r' {
+        0x9B
+    } else if ch.is_ascii() {
+        ch as u8
+    } else {
+        b'?'
     }
 }
 
@@ -675,6 +719,12 @@ fn print_run_observations(bus: &action_compiler_vm::Bus, dump_screen: bool) {
             .unwrap_or_else(|| "<none>".to_string());
         eprintln!("speaker writes: {} last={last}", bus.speaker_write_count());
     }
+    if !bus.cio_channel0_output().is_empty() {
+        eprintln!("CIO E: channel 0 output:");
+        for line in bus.decoded_cio_channel0_output().lines() {
+            eprintln!("  {line}");
+        }
+    }
     if let Some(error_line) = bus.visible_action_error() {
         eprintln!("visible Action! error: `{error_line}`");
     }
@@ -786,6 +836,7 @@ fn print_help() {
          --watch <addr>       Record bus reads/writes at addr\n  \
          --watch-range <a:b>  Record bus reads/writes inside the range\n  \
          --key-code <byte>    Queue one Atari keyboard code for CH ($02FC); repeatable\n  \
+         --q-input <text>     Queue text for synthetic Q: CIO input; \\n becomes ATASCII EOL\n  \
          --key-at-pc <pc:k>   Queue key k when execution reaches pc\n  \
          --key-at-pc-after <after:pc:k>\n  \
                               Queue key k at pc, but only after after_pc was reached\n  \
@@ -816,6 +867,13 @@ mod tests {
         let options = parse_options(vec!["--key-code".to_string(), "$21".to_string()]).unwrap();
 
         assert_eq!(options.key_codes, vec![0x21]);
+    }
+
+    #[test]
+    fn parses_scripted_cio_input_option() {
+        let options = parse_options(vec!["--q-input".to_string(), "C\\n".to_string()]).unwrap();
+
+        assert_eq!(options.scripted_cio_inputs, vec![vec![b'C', 0x9B]]);
     }
 
     #[test]

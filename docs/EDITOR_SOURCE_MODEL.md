@@ -110,6 +110,26 @@ paths beep; errors additionally print an `Error:` line with a numeric code. The
 VM therefore records speaker writes and can dump/decode the Atari text screen
 with `--dump-screen-at-pc <pc>` or `--dump-screen-on-stop`.
 
+## CIO Harness Devices
+
+The VM reserves two synthetic CIO-device roles for compiler automation:
+
+- `Q:` is queued/scripted input. It feeds deterministic command bytes such as
+  `C` followed by ATASCII EOL without depending on exact keyboard timing.
+- `H:` is reserved for host-backed file-like I/O, such as a future source-file
+  device.
+
+The current implementation hooks at the OS `CIOV` boundary rather than patching
+the cartridge. `OPEN "Q:"` and `OPEN "H:"` succeed through a small VM-side CIO
+device table. An open `Q:` channel returns queued bytes for `GETCHR`/`GETREC`;
+otherwise the older keyboard-latch fallback is still available. This keeps
+monitor/editor command input deterministic while still allowing boot/editor
+hotkeys to use the existing keyboard simulation.
+
+The harness also captures `E:` channel 0 `PUTCHR`/`PUTREC` output. That matters
+because Action! writes some diagnostics through CIO channel 0, while the visible
+status-line error text is still written directly to screen memory.
+
 ## Compiler Error Output
 
 The compiler error path is mixed. It is not purely OS `E:` output and not purely
