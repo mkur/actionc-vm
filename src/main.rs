@@ -151,7 +151,9 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
             if deferred_scripted_cio_inputs[deferred_index].after_pc == Some(pc) {
                 deferred_scripted_cio_inputs[deferred_index].after_pc = None;
             }
-            if deferred_scripted_cio_inputs[deferred_index].after_pc.is_none()
+            if deferred_scripted_cio_inputs[deferred_index]
+                .after_pc
+                .is_none()
                 && deferred_scripted_cio_inputs[deferred_index].pc == pc
             {
                 let deferred = deferred_scripted_cio_inputs.remove(deferred_index);
@@ -204,7 +206,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                         options.dump_screen_on_stop,
                         &options.memory_dump_ranges,
                     );
-                    write_host_outputs(&options.config, vm.bus())?;
+                    write_stop_outputs(&options, vm.bus())?;
                     return Ok(());
                 }
             }
@@ -221,7 +223,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     options.dump_screen_on_stop,
                     &options.memory_dump_ranges,
                 );
-                write_host_outputs(&options.config, vm.bus())?;
+                write_stop_outputs(&options, vm.bus())?;
                 return Err(format!("unsupported opcode ${opcode:02X} at ${pc:04X}"));
             }
             Err(CpuError::Halted) => {
@@ -237,7 +239,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     options.dump_screen_on_stop,
                     &options.memory_dump_ranges,
                 );
-                write_host_outputs(&options.config, vm.bus())?;
+                write_stop_outputs(&options, vm.bus())?;
                 return Err("CPU halted".to_string());
             }
         }
@@ -255,7 +257,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 options.dump_screen_on_stop,
                 &options.memory_dump_ranges,
             );
-            write_host_outputs(&options.config, vm.bus())?;
+            write_stop_outputs(&options, vm.bus())?;
         }
     }
 
@@ -265,6 +267,14 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         vm.cpu().cycles(),
         vm.cpu().registers().pc
     );
+    Ok(())
+}
+
+fn write_stop_outputs(options: &CliOptions, bus: &action_compiler_vm::Bus) -> Result<(), String> {
+    write_host_outputs(&options.config, bus)?;
+    if let Some(path) = &options.raw_memory_dump_path {
+        write_raw_memory_dump(path, bus)?;
+    }
     Ok(())
 }
 
@@ -281,6 +291,25 @@ fn write_host_outputs(config: &VmConfig, bus: &action_compiler_vm::Bus) -> Resul
             path.display()
         );
     }
+    Ok(())
+}
+
+fn write_raw_memory_dump(path: &PathBuf, bus: &action_compiler_vm::Bus) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(0x10000);
+    for address in 0..=u16::MAX {
+        bytes.push(bus.ram().read(address));
+    }
+    fs::write(path, &bytes).map_err(|err| {
+        format!(
+            "failed to write raw memory dump `{}`: {err}",
+            path.display()
+        )
+    })?;
+    eprintln!(
+        "wrote raw memory dump: {} byte(s) to {}",
+        bytes.len(),
+        path.display()
+    );
     Ok(())
 }
 
@@ -302,6 +331,7 @@ struct CliOptions {
     editor_line_dump_pcs: Vec<u16>,
     screen_dump_pcs: Vec<u16>,
     memory_dump_ranges: Vec<AddressRange>,
+    raw_memory_dump_path: Option<PathBuf>,
     dump_screen_on_stop: bool,
 }
 
@@ -344,6 +374,7 @@ impl Default for CliOptions {
             editor_line_dump_pcs: Vec::new(),
             screen_dump_pcs: Vec::new(),
             memory_dump_ranges: Vec::new(),
+            raw_memory_dump_path: None,
             dump_screen_on_stop: false,
         }
     }
@@ -372,6 +403,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut editor_line_dump_pcs = Vec::new();
     let mut screen_dump_pcs = Vec::new();
     let mut memory_dump_ranges = Vec::new();
+    let mut raw_memory_dump_path = None;
     let mut dump_screen_on_stop = false;
     let mut index = 0;
 
@@ -487,6 +519,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let value = required_value(&args, index, "--dump-range-on-stop")?;
                 memory_dump_ranges.push(parse_range(value)?);
             }
+            "--dump-memory-on-stop" => {
+                index += 1;
+                let value = required_value(&args, index, "--dump-memory-on-stop")?;
+                raw_memory_dump_path = Some(PathBuf::from(value));
+            }
             "--preset" => {
                 index += 1;
                 let value = required_value(&args, index, "--preset")?;
@@ -559,6 +596,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         editor_line_dump_pcs,
         screen_dump_pcs,
         memory_dump_ranges,
+        raw_memory_dump_path,
         dump_screen_on_stop,
     })
 }
@@ -1051,6 +1089,8 @@ fn print_help() {
                               Dump decoded 40x24 text screen in stop reports\n  \
          --dump-range-on-stop <a:b>\n  \
                               Dump RAM bytes in range when execution stops\n  \
+         --dump-memory-on-stop <path>\n  \
+                              Write raw 64K RAM image when execution stops\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
          --host-file <n:path> Register a host file visible as H:n\n  \
          --host-output <n:path>\n  \
@@ -1088,7 +1128,10 @@ mod tests {
 
         assert_eq!(
             options.config.host_outputs,
-            vec![("FUNCTIONS.COM".to_string(), PathBuf::from("/tmp/functions.com"))]
+            vec![(
+                "FUNCTIONS.COM".to_string(),
+                PathBuf::from("/tmp/functions.com")
+            )]
         );
     }
 
@@ -1219,6 +1262,8 @@ mod tests {
             "--dump-screen-at-pc".to_string(),
             "$A2F0".to_string(),
             "--dump-screen-on-stop".to_string(),
+            "--dump-memory-on-stop".to_string(),
+            "memory.bin".to_string(),
         ])
         .unwrap();
 
@@ -1231,6 +1276,10 @@ mod tests {
         );
         assert_eq!(options.editor_line_dump_pcs, vec![0xA2E0]);
         assert_eq!(options.screen_dump_pcs, vec![0xA2F0]);
+        assert_eq!(
+            options.raw_memory_dump_path,
+            Some(PathBuf::from("memory.bin"))
+        );
         assert!(options.dump_screen_on_stop);
     }
 

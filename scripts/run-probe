@@ -28,6 +28,7 @@ bool_edges
 control_flow
 external_call
 functions
+graphics_calls
 index_scaling
 locarr
 locals
@@ -68,6 +69,7 @@ probe_source() {
     control_flow) echo control_flow.act ;;
     external_call) echo external_call.act ;;
     functions) echo functions.act ;;
+    graphics_calls) echo graphics_calls.act ;;
     index_scaling) echo index_scaling.act ;;
     locarr) echo locarr.act ;;
     locals) echo locals.act ;;
@@ -110,6 +112,7 @@ probe_output() {
     control_flow) echo CONTROL.COM ;;
     external_call) echo EXTCALL.COM ;;
     functions) echo FUNC.COM ;;
+    graphics_calls) echo GRCALL.COM ;;
     index_scaling) echo IDXSCALE.COM ;;
     locarr) echo LOCARR.COM ;;
     locals) echo LOCALS.COM ;;
