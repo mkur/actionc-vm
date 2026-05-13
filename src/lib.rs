@@ -9,6 +9,8 @@ pub const IO_BASE: u16 = 0xD000;
 pub const IO_SIZE: usize = 0x0800;
 pub const SELF_TEST_BASE: u16 = 0x5000;
 pub const SELF_TEST_SIZE: usize = 0x0800;
+pub const BOOTQ_SUCCESSFUL_BOOT_FLAG: u16 = 0x0009;
+pub const DOSVEC_START_VECTOR: u16 = 0x000A;
 pub const PORTB: u16 = 0xD301;
 pub const PORTB_SELF_TEST_DISABLE: u8 = 0x80;
 pub const ANTIC_VCOUNT: u16 = 0xD40B;
@@ -16,10 +18,13 @@ pub const RTCLOK_LOW: u16 = 0x0014;
 pub const KBCODE_PRIOR_KEY_CODE: u16 = 0x02F2;
 pub const CH_KEY_CODE: u16 = 0x02FC;
 pub const ACTION_MONITOR_KEY_CODE: u8 = 0xE5;
+pub const RECVDN_RECEIVE_DONE_FLAG: u16 = 0x0039;
 pub const XMTDON_TRANSMISSION_DONE_FLAG: u16 = 0x003A;
+pub const TIMFLG_TIMEOUT_FLAG: u16 = 0x0317;
 pub const CONSOL: u16 = 0xD01F;
 pub const CONSOL_NO_KEYS: u8 = 0x07;
 pub const SEROUT_SERIAL_OUTPUT: u16 = 0xD20D;
+pub const CARTCS_COLDSTART_VECTOR: u16 = 0xBFFA;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
 pub const OSS_TYPE_15_FIXED_BASE: u16 = 0xB000;
@@ -216,6 +221,12 @@ impl CompilerVm {
     }
 
     pub fn step_cpu(&mut self) -> Result<CpuStep, CpuError> {
+        if let Some(target) = self
+            .bus
+            .take_disk_boot_cartridge_redirect(self.cpu.registers.pc)
+        {
+            self.cpu.set_pc(target);
+        }
         self.cpu.step(&mut self.bus)
     }
 
@@ -263,6 +274,10 @@ impl Cpu {
 
     pub fn halted(&self) -> bool {
         self.halted
+    }
+
+    fn set_pc(&mut self, pc: u16) {
+        self.registers.pc = pc;
     }
 
     pub fn reset(&mut self, bus: &mut Bus) {
@@ -486,6 +501,14 @@ impl Cpu {
                 self.set_zn(result);
                 self.cycles += 6;
             }
+            0x51 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indirect_y(bus, zp);
+                let value = bus.read(address);
+                self.registers.a ^= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 5;
+            }
             0x58 => {
                 self.set_flag(StatusFlags::INTERRUPT_DISABLE, false);
                 self.cycles += 2;
@@ -575,6 +598,21 @@ impl Cpu {
                 self.adc(value);
                 self.cycles += 4;
             }
+            0x7E => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address);
+                let carry_in = if self.flag(StatusFlags::CARRY) {
+                    0x80
+                } else {
+                    0x00
+                };
+                self.set_flag(StatusFlags::CARRY, value & 0x01 != 0);
+                let result = (value >> 1) | carry_in;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 7;
+            }
             0x84 => {
                 let address = self.fetch_byte(bus) as u16;
                 bus.write(address, self.registers.y);
@@ -623,6 +661,12 @@ impl Cpu {
                 let address = self.indirect_y(bus, zp);
                 bus.write(address, self.registers.a);
                 self.cycles += 6;
+            }
+            0x95 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                bus.write(address, self.registers.a);
+                self.cycles += 4;
             }
             0x98 => {
                 self.registers.a = self.registers.y;
@@ -844,6 +888,12 @@ impl Cpu {
                 let address = self.fetch_byte(bus) as u16;
                 let value = bus.read(address);
                 self.compare(self.registers.x, value);
+                self.cycles += 3;
+            }
+            0xE5 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.sbc(value);
                 self.cycles += 3;
             }
             0xE6 => {
@@ -1136,6 +1186,8 @@ pub struct Bus {
     last_data: u8,
     vcount: u8,
     pending_key_codes: VecDeque<u8>,
+    sio_timeout_pending: bool,
+    redirect_disk_boot_to_cart: bool,
 }
 
 impl Default for Bus {
@@ -1150,6 +1202,8 @@ impl Default for Bus {
             last_data: 0,
             vcount: 0,
             pending_key_codes: VecDeque::new(),
+            sio_timeout_pending: false,
+            redirect_disk_boot_to_cart: false,
         }
     }
 }
@@ -1210,7 +1264,7 @@ impl Bus {
     }
 
     pub fn read(&mut self, address: u16) -> u8 {
-        let (value, region) = if let Some(cartridge) = self.cartridge.as_mut() {
+        let (mut value, region) = if let Some(cartridge) = self.cartridge.as_mut() {
             if cartridge.control_access(address) {
                 (self.last_data, BusRegion::CartridgeControl)
             } else if let Some(value) = cartridge.read(address) {
@@ -1241,6 +1295,14 @@ impl Bus {
         } else {
             (self.read_ram(address), BusRegion::Ram)
         };
+
+        if address == TIMFLG_TIMEOUT_FLAG && self.sio_timeout_pending {
+            value = 0x00;
+            self.sio_timeout_pending = false;
+            self.ram.write(TIMFLG_TIMEOUT_FLAG, value);
+            self.redirect_disk_boot_to_cart = true;
+            self.point_dosvec_to_cartridge_coldstart();
+        }
 
         self.last_data = value;
         self.record_event(BusAccess::Read, address, value, region);
@@ -1280,6 +1342,15 @@ impl Bus {
 
         if address == SEROUT_SERIAL_OUTPUT {
             self.ram.write(XMTDON_TRANSMISSION_DONE_FLAG, 0xFF);
+            self.ram.write(RECVDN_RECEIVE_DONE_FLAG, 0x00);
+            self.sio_timeout_pending = true;
+        }
+        if self.redirect_disk_boot_to_cart
+            && (address == BOOTQ_SUCCESSFUL_BOOT_FLAG
+                || address == DOSVEC_START_VECTOR
+                || address == DOSVEC_START_VECTOR.wrapping_add(1))
+        {
+            self.point_dosvec_to_cartridge_coldstart();
         }
 
         self.last_data = value;
@@ -1295,6 +1366,37 @@ impl Bus {
                 region,
             });
         }
+    }
+
+    fn point_dosvec_to_cartridge_coldstart(&mut self) {
+        let Some(target) = self.cartridge_word(CARTCS_COLDSTART_VECTOR) else {
+            return;
+        };
+
+        let [lo, hi] = target.to_le_bytes();
+        self.ram.write(BOOTQ_SUCCESSFUL_BOOT_FLAG, 0x01);
+        self.ram.write(DOSVEC_START_VECTOR, lo);
+        self.ram.write(DOSVEC_START_VECTOR.wrapping_add(1), hi);
+    }
+
+    fn cartridge_word(&self, address: u16) -> Option<u16> {
+        let cartridge = self.cartridge.as_ref()?;
+        let lo = cartridge.read(address)?;
+        let hi = cartridge.read(address.wrapping_add(1))?;
+        Some(u16::from_le_bytes([lo, hi]))
+    }
+
+    fn take_disk_boot_cartridge_redirect(&mut self, pc: u16) -> Option<u16> {
+        if !self.redirect_disk_boot_to_cart {
+            return None;
+        }
+        if !(SELF_TEST_BASE..=SELF_TEST_BASE + SELF_TEST_SIZE as u16 - 1).contains(&pc) {
+            return None;
+        }
+
+        let target = self.cartridge_word(CARTCS_COLDSTART_VECTOR)?;
+        self.redirect_disk_boot_to_cart = false;
+        Some(target)
     }
 
     fn read_io(&mut self, address: u16) -> Option<u8> {
@@ -1914,13 +2016,71 @@ mod tests {
     }
 
     #[test]
-    fn pokey_serial_output_completes_immediately_for_sio_boot() {
+    fn pokey_serial_output_times_out_disk_boot_to_cartridge_coldstart() {
+        let image = LoadedImage::prepare(
+            ImageKind::Cartridge,
+            PathBuf::from("action.car"),
+            0xA000,
+            car_bytes(
+                0x0F,
+                &[
+                    &[0x11; 0x0FFA],
+                    &[0x34, 0x12],
+                    &[0x11; 0x04],
+                    &[0x22; 0x1000],
+                    &[0x33; 0x1000],
+                    &[0x44; 0x1000],
+                ],
+            ),
+        )
+        .unwrap();
         let mut bus = Bus::default();
+        bus.install_cartridge(Cartridge::from_loaded_image(&image).unwrap());
 
         bus.write(XMTDON_TRANSMISSION_DONE_FLAG, 0x00);
+        bus.write(RECVDN_RECEIVE_DONE_FLAG, 0xFF);
+        bus.write(TIMFLG_TIMEOUT_FLAG, 0x01);
         bus.write(SEROUT_SERIAL_OUTPUT, 0x31);
 
         assert_eq!(bus.read(XMTDON_TRANSMISSION_DONE_FLAG), 0xFF);
+        assert_eq!(bus.read(RECVDN_RECEIVE_DONE_FLAG), 0x00);
+        assert_eq!(bus.read(TIMFLG_TIMEOUT_FLAG), 0x00);
+        assert_eq!(bus.read(BOOTQ_SUCCESSFUL_BOOT_FLAG), 0x01);
+        assert_eq!(bus.read(DOSVEC_START_VECTOR), 0x34);
+        assert_eq!(bus.read(DOSVEC_START_VECTOR.wrapping_add(1)), 0x12);
+
+        bus.write(DOSVEC_START_VECTOR, 0x23);
+        bus.write(DOSVEC_START_VECTOR.wrapping_add(1), 0xF2);
+        assert_eq!(bus.read(DOSVEC_START_VECTOR), 0x34);
+        assert_eq!(bus.read(DOSVEC_START_VECTOR.wrapping_add(1)), 0x12);
+    }
+
+    #[test]
+    fn vm_redirects_self_test_fallback_to_cartridge_coldstart() {
+        let mut fixed = vec![0xEA; 0x1000];
+        fixed[0x0FFA] = 0xE7;
+        fixed[0x0FFB] = 0xB7;
+        let image = LoadedImage::prepare(
+            ImageKind::Cartridge,
+            PathBuf::from("action.car"),
+            0xA000,
+            car_bytes(
+                0x0F,
+                &[&fixed, &[0x22; 0x1000], &[0x33; 0x1000], &[0x44; 0x1000]],
+            ),
+        )
+        .unwrap();
+        let mut vm = CompilerVm::default();
+        vm.bus
+            .install_cartridge(Cartridge::from_loaded_image(&image).unwrap());
+        vm.bus.redirect_disk_boot_to_cart = true;
+        vm.cpu.registers.pc = SELF_TEST_BASE;
+
+        let step = vm.step_cpu().unwrap();
+
+        assert_eq!(step.pc, 0xB7E7);
+        assert_eq!(step.opcode, 0xEA);
+        assert_eq!(vm.cpu.registers().pc, 0xB7E8);
     }
 
     #[test]
@@ -2316,6 +2476,35 @@ mod tests {
     }
 
     #[test]
+    fn cpu_ror_absolute_x_rotates_through_carry() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0x38, // SEC
+                    0xA2, 0x02, // LDX #$02
+                    0x7E, 0x20, 0x03, // ROR $0320,X
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0322, 0x02);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(bus.ram().read(0x0322), 0x81);
+        assert_eq!(registers.status & StatusFlags::CARRY.bits(), 0);
+        assert!(registers.status & StatusFlags::NEGATIVE.bits() != 0);
+    }
+
+    #[test]
     fn cpu_asl_zero_page_shifts_memory_left() {
         let mut bus = Bus::default();
         bus.ram_mut()
@@ -2478,6 +2667,37 @@ mod tests {
     }
 
     #[test]
+    fn cpu_eor_indirect_y_updates_accumulator_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0xF0, // LDA #$F0
+                    0xA0, 0x01, // LDY #$01
+                    0x51, 0x40, // EOR ($40),Y
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0040, 0x20);
+        bus.ram_mut().write(0x0041, 0x03);
+        bus.ram_mut().write(0x0321, 0x80);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x70);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+    }
+
+    #[test]
     fn cpu_and_absolute_x_updates_accumulator_flags() {
         let mut bus = Bus::default();
         bus.ram_mut()
@@ -2533,6 +2753,36 @@ mod tests {
         assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
         assert!(registers.status & StatusFlags::OVERFLOW.bits() != 0);
         assert!(registers.status & StatusFlags::CARRY.bits() != 0);
+    }
+
+    #[test]
+    fn cpu_sbc_zero_page_updates_flags() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x10, // LDA #$10
+                    0x38, // SEC
+                    0xE5, 0x40, // SBC $40
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x0040, 0x01);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        let registers = cpu.registers();
+        assert_eq!(registers.a, 0x0F);
+        assert!(registers.status & StatusFlags::CARRY.bits() != 0);
+        assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
+        assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
     }
 
     #[test]
@@ -2674,6 +2924,31 @@ mod tests {
         assert_eq!(registers.a, 0x44);
         assert_eq!(registers.status & StatusFlags::ZERO.bits(), 0);
         assert_eq!(registers.status & StatusFlags::NEGATIVE.bits(), 0);
+    }
+
+    #[test]
+    fn cpu_sta_zero_page_x_stores_wrapped_value() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x42, // LDA #$42
+                    0xA2, 0x02, // LDX #$02
+                    0x95, 0xFE, // STA $FE,X
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.ram().read(0x0000), 0x42);
     }
 
     #[test]
