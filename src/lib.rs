@@ -86,6 +86,7 @@ pub struct VmConfig {
     pub os_base: u16,
     pub source: Option<PathBuf>,
     pub extra_images: Vec<(ImageKind, PathBuf, u16)>,
+    pub hotpatches: Vec<Hotpatch>,
 }
 
 impl Default for VmConfig {
@@ -97,6 +98,7 @@ impl Default for VmConfig {
             os_base: ACTION_OS_PRESET.os_base,
             source: None,
             extra_images: Vec::new(),
+            hotpatches: Vec::new(),
         }
     }
 }
@@ -132,6 +134,10 @@ impl VmConfig {
             vm.load_image(*kind, path.clone(), *base)?;
         }
 
+        for hotpatch in &self.hotpatches {
+            vm.apply_hotpatch(*hotpatch)?;
+        }
+
         if let Some(path) = &self.source {
             vm.source = Some(
                 fs::read(path)
@@ -141,6 +147,19 @@ impl VmConfig {
 
         Ok(vm)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hotpatch {
+    ActionQueuedInput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotpatchReport {
+    pub patch: Hotpatch,
+    pub payload_offset: usize,
+    pub old_value: u8,
+    pub new_value: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +281,36 @@ impl CompilerVm {
             self.cpu.set_pc(target);
         }
         self.cpu.step(&mut self.bus)
+    }
+
+    pub fn apply_hotpatch(&mut self, hotpatch: Hotpatch) -> Result<HotpatchReport, String> {
+        let (report, payload, mapping) = {
+            let Some(cartridge) = self.bus.cartridge_mut() else {
+                return Err("hotpatch requires a loaded cartridge".to_string());
+            };
+            let report = cartridge.apply_hotpatch(hotpatch)?;
+            (
+                report,
+                cartridge.payload().to_vec(),
+                cartridge.mapping_info(),
+            )
+        };
+        for image in self
+            .images
+            .iter_mut()
+            .filter(|image| image.kind == ImageKind::Cartridge)
+        {
+            image.bytes = payload.clone();
+            image.metadata = ImageMetadata {
+                size: payload.len(),
+                base: mapping.window_start,
+                end: mapping.window_end,
+                checksum16: checksum16(&payload),
+                crc32: crc32(&payload),
+            };
+            image.cartridge_mapping = Some(mapping);
+        }
+        Ok(report)
     }
 
     fn load_image(&mut self, kind: ImageKind, path: PathBuf, base: u16) -> Result<(), String> {
@@ -1392,6 +1441,10 @@ impl Bus {
         self.cartridge.as_ref()
     }
 
+    pub fn cartridge_mut(&mut self) -> Option<&mut Cartridge> {
+        self.cartridge.as_mut()
+    }
+
     pub fn os_rom(&self) -> Option<&RomRegion> {
         self.os_rom.as_ref()
     }
@@ -2286,6 +2339,52 @@ impl Cartridge {
         }
     }
 
+    pub fn payload(&self) -> &[u8] {
+        match &self.mapping {
+            CartridgeMapping::Linear(region) => &region.bytes,
+            CartridgeMapping::Banked8k(cart) => &cart.payload,
+            CartridgeMapping::OssType15(cart) => &cart.payload,
+        }
+    }
+
+    pub fn apply_hotpatch(&mut self, hotpatch: Hotpatch) -> Result<HotpatchReport, String> {
+        match hotpatch {
+            Hotpatch::ActionQueuedInput => self.patch_action_keyboard_device_to_queue(),
+        }
+    }
+
+    fn patch_action_keyboard_device_to_queue(&mut self) -> Result<HotpatchReport, String> {
+        const PATTERN: &[u8] = &[0x02, b'K', b':', 0xAD, 0xFC, 0x02, 0x49, 0xFF, 0x60];
+        const DEVICE_OFFSET: usize = 1;
+
+        let payload = match &mut self.mapping {
+            CartridgeMapping::Linear(region) => &mut region.bytes,
+            CartridgeMapping::Banked8k(cart) => &mut cart.payload,
+            CartridgeMapping::OssType15(cart) => &mut cart.payload,
+        };
+        let matches = payload
+            .windows(PATTERN.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == PATTERN).then_some(offset))
+            .collect::<Vec<_>>();
+
+        let [payload_offset] = matches.as_slice() else {
+            return Err(format!(
+                "action-q-input hotpatch expected one Action! `K:` keyboard device pattern, found {}",
+                matches.len()
+            ));
+        };
+        let device_offset = payload_offset + DEVICE_OFFSET;
+        let old_value = payload[device_offset];
+        payload[device_offset] = b'Q';
+        Ok(HotpatchReport {
+            patch: Hotpatch::ActionQueuedInput,
+            payload_offset: device_offset,
+            old_value,
+            new_value: b'Q',
+        })
+    }
+
     pub fn control_access(&mut self, address: u16) -> bool {
         match &mut self.mapping {
             CartridgeMapping::Linear(_) => false,
@@ -2678,6 +2777,30 @@ mod tests {
                 active_bank: 0,
             })
         );
+    }
+
+    #[test]
+    fn action_q_input_hotpatch_rewrites_keyboard_device_string() {
+        let mut payload = vec![0xFF; 0x4000];
+        payload[0x3840..0x3849]
+            .copy_from_slice(&[0x02, b'K', b':', 0xAD, 0xFC, 0x02, 0x49, 0xFF, 0x60]);
+        let mut cartridge = Cartridge::from_payload(0xA000, None, payload).unwrap();
+
+        let report = cartridge
+            .apply_hotpatch(Hotpatch::ActionQueuedInput)
+            .unwrap();
+
+        assert_eq!(
+            report,
+            HotpatchReport {
+                patch: Hotpatch::ActionQueuedInput,
+                payload_offset: 0x3841,
+                old_value: b'K',
+                new_value: b'Q',
+            }
+        );
+        assert_eq!(cartridge.payload()[0x3841], b'Q');
+        assert_eq!(cartridge.payload()[0x3842], b':');
     }
 
     #[test]

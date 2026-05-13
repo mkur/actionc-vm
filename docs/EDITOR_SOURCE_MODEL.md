@@ -126,6 +126,12 @@ otherwise the older keyboard-latch fallback is still available. This keeps
 monitor/editor command input deterministic while still allowing boot/editor
 hotkeys to use the existing keyboard simulation.
 
+The `action-q-input` hotpatch is an in-memory cartridge patch. It scans the
+loaded Action! payload for the editor keyboard device string context
+`02 "K:" AD FC 02 49 FF 60` and rewrites only the device byte from `K` to `Q`.
+The ROM file on disk is not modified. Use it with `--hotpatch action-q-input`
+and feed monitor/editor command text with `--q-input`, for example `C\n`.
+
 The harness also captures `E:` channel 0 `PUTCHR`/`PUTREC` output. That matters
 because Action! writes some diagnostics through CIO channel 0, while the visible
 status-line error text is still written directly to screen memory.

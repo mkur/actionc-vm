@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use action_compiler_vm::{
     ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ATARI_KEY_C, ATARI_KEY_E, ATARI_KEY_RETURN,
     ActionEditorLine, ActionSourceInjectionReport, AddressRange, BusAccess, BusEvent, CpuError,
-    CpuRegisters, CpuStep, ImageKind, TextScreenSnapshot, VmConfig,
+    CpuRegisters, CpuStep, Hotpatch, ImageKind, TextScreenSnapshot, VmConfig,
 };
 
 fn main() {
@@ -434,6 +434,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let value = required_value(&args, index, "--map")?;
                 config.extra_images.push(parse_image_map(value)?);
             }
+            "--hotpatch" => {
+                index += 1;
+                let value = required_value(&args, index, "--hotpatch")?;
+                config.hotpatches.push(parse_hotpatch(value)?);
+            }
             other => return Err(format!("unknown option `{other}`")),
         }
         index += 1;
@@ -465,6 +470,13 @@ fn apply_preset(config: &mut VmConfig, value: &str) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!("unknown preset `{other}`")),
+    }
+}
+
+fn parse_hotpatch(value: &str) -> Result<Hotpatch, String> {
+    match value {
+        "action-q-input" => Ok(Hotpatch::ActionQueuedInput),
+        other => Err(format!("unknown hotpatch `{other}`")),
     }
 }
 
@@ -854,6 +866,7 @@ fn print_help() {
          --dump-screen-on-stop\n  \
                               Dump decoded 40x24 text screen in stop reports\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
+         --hotpatch <name>    Apply an in-memory hotpatch, e.g. action-q-input\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );
 }
@@ -874,6 +887,14 @@ mod tests {
         let options = parse_options(vec!["--q-input".to_string(), "C\\n".to_string()]).unwrap();
 
         assert_eq!(options.scripted_cio_inputs, vec![vec![b'C', 0x9B]]);
+    }
+
+    #[test]
+    fn parses_hotpatch_option() {
+        let options =
+            parse_options(vec!["--hotpatch".to_string(), "action-q-input".to_string()]).unwrap();
+
+        assert_eq!(options.config.hotpatches, vec![Hotpatch::ActionQueuedInput]);
     }
 
     #[test]
