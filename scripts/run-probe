@@ -21,6 +21,8 @@ array_params
 array_refs
 arrays
 bools
+booleq
+boolword
 bool_edges
 control_flow
 external_call
@@ -57,6 +59,8 @@ probe_source() {
     array_refs) echo array_refs.act ;;
     arrays) echo arrays.act ;;
     bools) echo bools.act ;;
+    booleq) echo booleq.act ;;
+    boolword) echo boolword.act ;;
     bool_edges) echo bool_edges.act ;;
     control_flow) echo control_flow.act ;;
     external_call) echo external_call.act ;;
@@ -95,6 +99,8 @@ probe_output() {
     array_refs) echo ARRREF.COM ;;
     arrays) echo ARRAYS.COM ;;
     bools) echo BOOLS.COM ;;
+    booleq) echo BOOLEQ.COM ;;
+    boolword) echo BOOLWORD.COM ;;
     bool_edges) echo BOOLEDGE.COM ;;
     control_flow) echo CONTROL.COM ;;
     external_call) echo EXTCALL.COM ;;
