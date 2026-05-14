@@ -50,6 +50,7 @@ strlit
 strloc
 strmut
 strpass
+tn_value_index
 ywalk
 "
 
@@ -93,6 +94,7 @@ probe_source() {
     strloc) echo strloc.act ;;
     strmut) echo strmut.act ;;
     strpass) echo strpass.act ;;
+    tn_value_index) echo tn_value_index.act ;;
     ywalk) echo ywalk.act ;;
     *) return 1 ;;
   esac
@@ -138,6 +140,7 @@ probe_output() {
     strloc) echo STRLOC.COM ;;
     strmut) echo STRMUT.COM ;;
     strpass) echo STRPASS.COM ;;
+    tn_value_index) echo TNVAL.COM ;;
     ywalk) echo YWALK.COM ;;
     *) return 1 ;;
   esac
