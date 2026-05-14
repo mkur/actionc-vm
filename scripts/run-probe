@@ -29,6 +29,7 @@ bool_edges
 control_flow
 external_call
 drawframe
+empty_proc
 fnamecmp
 functions
 graphics_calls
@@ -78,6 +79,7 @@ probe_source() {
     control_flow) echo control_flow.act ;;
     external_call) echo external_call.act ;;
     drawframe) echo drawframe.act ;;
+    empty_proc) echo empty_proc.act ;;
     fnamecmp) echo fnamecmp.act ;;
     functions) echo functions.act ;;
     graphics_calls) echo graphics_calls.act ;;
@@ -129,6 +131,7 @@ probe_output() {
     control_flow) echo CONTROL.COM ;;
     external_call) echo EXTCALL.COM ;;
     drawframe) echo DRAWFRM.COM ;;
+    empty_proc) echo EMPTYPR.COM ;;
     fnamecmp) echo FNAMECMP.COM ;;
     functions) echo FUNC.COM ;;
     graphics_calls) echo GRCALL.COM ;;
