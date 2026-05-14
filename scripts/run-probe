@@ -17,6 +17,7 @@ abi_system_call
 argthr
 arith
 array_assign
+array_fixed_origin
 array_params
 array_refs
 arrays
@@ -65,6 +66,7 @@ probe_source() {
     argthr) echo argthr.act ;;
     arith) echo arith.act ;;
     array_assign) echo array_assign.act ;;
+    array_fixed_origin) echo array_fixed_origin.act ;;
     array_params) echo array_params.act ;;
     array_refs) echo array_refs.act ;;
     arrays) echo arrays.act ;;
@@ -115,6 +117,7 @@ probe_output() {
     argthr) echo ARGTHR.COM ;;
     arith) echo ARITH.COM ;;
     array_assign) echo ARRASN.COM ;;
+    array_fixed_origin) echo ARRFIX.COM ;;
     array_params) echo ARRPAR.COM ;;
     array_refs) echo ARRREF.COM ;;
     arrays) echo ARRAYS.COM ;;
