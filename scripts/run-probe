@@ -39,6 +39,7 @@ locals
 nested_calls
 optional_args
 pointers
+precode_zp
 record_args
 record_ptr_order
 records
@@ -86,6 +87,7 @@ probe_source() {
     nested_calls) echo nested_calls.act ;;
     optional_args) echo optional_args.act ;;
     pointers) echo pointers.act ;;
+    precode_zp) echo precode_zp.act ;;
     record_args) echo record_args.act ;;
     record_ptr_order) echo record_ptr_order.act ;;
     records) echo records.act ;;
@@ -135,6 +137,7 @@ probe_output() {
     nested_calls) echo NESTED.COM ;;
     optional_args) echo OPTARGS.COM ;;
     pointers) echo POINTERS.COM ;;
+    precode_zp) echo PREZP.COM ;;
     record_args) echo RECARGS.COM ;;
     record_ptr_order) echo RECPTRO.COM ;;
     records) echo RECORDS.COM ;;
