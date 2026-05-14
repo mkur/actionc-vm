@@ -30,6 +30,7 @@ external_call
 functions
 graphics_calls
 index_scaling
+layout_order
 locarr
 locals
 nested_calls
@@ -71,6 +72,7 @@ probe_source() {
     functions) echo functions.act ;;
     graphics_calls) echo graphics_calls.act ;;
     index_scaling) echo index_scaling.act ;;
+    layout_order) echo layout_order.act ;;
     locarr) echo locarr.act ;;
     locals) echo locals.act ;;
     nested_calls) echo nested_calls.act ;;
@@ -114,6 +116,7 @@ probe_output() {
     functions) echo FUNC.COM ;;
     graphics_calls) echo GRCALL.COM ;;
     index_scaling) echo IDXSCALE.COM ;;
+    layout_order) echo LAYOUT.COM ;;
     locarr) echo LOCARR.COM ;;
     locals) echo LOCALS.COM ;;
     nested_calls) echo NESTED.COM ;;
