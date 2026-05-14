@@ -27,6 +27,7 @@ boolword
 bool_edges
 control_flow
 external_call
+drawframe
 fnamecmp
 functions
 graphics_calls
@@ -50,6 +51,7 @@ strinit
 strlit
 strloc
 strmut
+strnam
 strpass
 tn_value_index
 ywalk
@@ -72,6 +74,7 @@ probe_source() {
     bool_edges) echo bool_edges.act ;;
     control_flow) echo control_flow.act ;;
     external_call) echo external_call.act ;;
+    drawframe) echo drawframe.act ;;
     fnamecmp) echo fnamecmp.act ;;
     functions) echo functions.act ;;
     graphics_calls) echo graphics_calls.act ;;
@@ -95,6 +98,7 @@ probe_source() {
     strlit) echo strlit.act ;;
     strloc) echo strloc.act ;;
     strmut) echo strmut.act ;;
+    strnam) echo strnam.act ;;
     strpass) echo strpass.act ;;
     tn_value_index) echo tn_value_index.act ;;
     ywalk) echo ywalk.act ;;
@@ -119,6 +123,7 @@ probe_output() {
     bool_edges) echo BOOLEDGE.COM ;;
     control_flow) echo CONTROL.COM ;;
     external_call) echo EXTCALL.COM ;;
+    drawframe) echo DRAWFRM.COM ;;
     fnamecmp) echo FNAMECMP.COM ;;
     functions) echo FUNC.COM ;;
     graphics_calls) echo GRCALL.COM ;;
@@ -142,6 +147,7 @@ probe_output() {
     strlit) echo STRLIT.COM ;;
     strloc) echo STRLOC.COM ;;
     strmut) echo STRMUT.COM ;;
+    strnam) echo STRNAM.COM ;;
     strpass) echo STRPASS.COM ;;
     tn_value_index) echo TNVAL.COM ;;
     ywalk) echo YWALK.COM ;;
