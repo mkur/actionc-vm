@@ -56,7 +56,32 @@ outputs/vm/POINTERS.COM
 outputs/vm/POINTERS.symbols.json
 ```
 
-## 5. Consume Later In `actionc-compare`
+## 5. Capture Local Symbol Snapshots
+
+`ST.ACT` also reveals a useful compiler hook: `Segvec` at `$04C6`. Action!
+initializes this RAM vector as an `RTS`, and the compiler reaches it at
+routine/segment boundaries. The VM can observe `PC=$04C6` directly instead of
+hotpatching the vector to a custom routine.
+
+Add:
+
+```sh
+--dump-symbol-snapshots-on-stop <path>
+--action-symbol-hooks
+```
+
+With `--action-symbol-hooks`, the VM captures non-empty local symbol tables at
+`Segvec` and also captures the final live local table when execution stops. The
+final stop snapshot matters because the last compiled routine has no following
+routine boundary to trigger `Segvec`.
+
+Probe outputs now include:
+
+```text
+outputs/vm/POINTERS.symbol-snapshots.json
+```
+
+## 6. Consume Later In `actionc-compare`
 
 After dumps exist, teach `actionc-compare` to accept original symbols and report
 routine-relative gaps:

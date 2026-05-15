@@ -218,6 +218,7 @@ run_probe() {
   local source_path="$probe_dir/$source_name"
   local output_path="$output_dir/$output_name"
   local symbol_path="$symbol_output_dir/${output_name%.COM}.symbols.json"
+  local symbol_snapshots_path="$symbol_output_dir/${output_name%.COM}.symbol-snapshots.json"
   local original_path="$original_dir/$output_name"
   local h_source
   local monitor_input
@@ -228,6 +229,7 @@ run_probe() {
   mkdir -p "$output_dir" "$symbol_output_dir"
   rm -f "$output_path"
   rm -f "$symbol_path"
+  rm -f "$symbol_snapshots_path"
 
   echo "==> $probe: $source_name -> $output_name"
   (
@@ -240,6 +242,8 @@ run_probe() {
       --host-file "$h_source:$source_path" \
       --host-output "$output_name:$output_path" \
       --dump-symbols-on-stop "$symbol_path" \
+      --dump-symbol-snapshots-on-stop "$symbol_snapshots_path" \
+      --action-symbol-hooks \
       --monitor-key-at-pc '$A2E0' \
       --q-input-at-pc-after '$A2E0:$B2F5:'"$monitor_input" \
       --max-steps "$max_steps" \

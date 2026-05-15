@@ -42,6 +42,8 @@ pub const ACTION_BUF: u16 = 0x009B;
 pub const ACTION_DIRTYF: u16 = 0x00C3;
 pub const ACTION_GLOBAL_SYMBOL_TABLE_POINTER: u16 = 0x00B1;
 pub const ACTION_LOCAL_SYMBOL_TABLE_POINTER: u16 = 0x00B3;
+pub const ACTION_CURRENT_PROC_POINTER: u16 = 0x008E;
+pub const ACTION_SEGMENT_END_VECTOR: u16 = 0x04C6;
 pub const ACTION_VARS_W1: u16 = 0x0480;
 pub const ACTION_VARS_TOP1: u16 = 0x048F;
 pub const ACTION_LINEMAX: u16 = 0x04CF;
@@ -360,6 +362,26 @@ impl CompilerVm {
 
 pub fn decode_action_symbol_tables(bus: &Bus) -> ActionSymbolTableDump {
     decode_action_symbol_tables_from_memory(bus.ram())
+}
+
+pub fn action_current_proc_name(bus: &Bus) -> Option<String> {
+    action_current_proc_name_from_memory(bus.ram())
+}
+
+pub fn action_current_proc_name_from_memory(memory: &Memory) -> Option<String> {
+    let address = memory.read_word(ACTION_CURRENT_PROC_POINTER);
+    if address == 0 {
+        return None;
+    }
+    let len = memory.read(address);
+    if len == 0 {
+        return None;
+    }
+    Some(decode_action_string_bytes(
+        memory,
+        address.wrapping_add(1),
+        len,
+    ))
 }
 
 pub fn decode_action_symbol_tables_from_memory(memory: &Memory) -> ActionSymbolTableDump {

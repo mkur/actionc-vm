@@ -4,9 +4,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use action_compiler_vm::{
-    ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ATARI_KEY_C, ATARI_KEY_E, ATARI_KEY_RETURN,
-    ActionEditorLine, ActionSourceInjectionReport, AddressRange, BusAccess, BusEvent, CpuError,
-    CpuRegisters, CpuStep, Hotpatch, ImageKind, TextScreenSnapshot, VmConfig,
+    ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ACTION_SEGMENT_END_VECTOR, ATARI_KEY_C,
+    ATARI_KEY_E, ATARI_KEY_RETURN, ActionEditorLine, ActionSourceInjectionReport,
+    ActionSymbolEntry, AddressRange, BusAccess, BusEvent, CpuError, CpuRegisters, CpuStep,
+    Hotpatch, ImageKind, TextScreenSnapshot, VmConfig, action_current_proc_name,
     decode_action_symbol_tables, format_action_symbol_dump_json,
 };
 
@@ -98,6 +99,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     let mut deferred_source_injections = options.deferred_source_injections.clone();
     let mut editor_line_dump_pcs = options.editor_line_dump_pcs.clone();
     let mut screen_dump_pcs = options.screen_dump_pcs.clone();
+    let mut symbol_snapshots = Vec::new();
     println!(
         "compiler VM loaded {} image(s); reset PC=${:04X}",
         vm.images().len(),
@@ -144,6 +146,15 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 print_text_screen(&vm.bus().text_screen_snapshot(40, 24));
             } else {
                 screen_dump_index += 1;
+            }
+        }
+
+        for trigger in &options.symbol_snapshot_triggers {
+            if trigger.pc == pc {
+                let snapshot = capture_symbol_snapshot(trigger, vm.bus());
+                if !trigger.skip_empty || snapshot.has_symbols() {
+                    symbol_snapshots.push(snapshot);
+                }
             }
         }
 
@@ -207,7 +218,14 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                         options.dump_screen_on_stop,
                         &options.memory_dump_ranges,
                     );
+                    capture_final_symbol_snapshot(
+                        &options,
+                        &mut symbol_snapshots,
+                        vm.cpu().registers().pc,
+                        vm.bus(),
+                    );
                     write_stop_outputs(&options, vm.bus())?;
+                    write_symbol_snapshots(&options, &symbol_snapshots)?;
                     return Ok(());
                 }
             }
@@ -224,7 +242,14 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     options.dump_screen_on_stop,
                     &options.memory_dump_ranges,
                 );
+                capture_final_symbol_snapshot(
+                    &options,
+                    &mut symbol_snapshots,
+                    vm.cpu().registers().pc,
+                    vm.bus(),
+                );
                 write_stop_outputs(&options, vm.bus())?;
+                write_symbol_snapshots(&options, &symbol_snapshots)?;
                 return Err(format!("unsupported opcode ${opcode:02X} at ${pc:04X}"));
             }
             Err(CpuError::Halted) => {
@@ -240,7 +265,14 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     options.dump_screen_on_stop,
                     &options.memory_dump_ranges,
                 );
+                capture_final_symbol_snapshot(
+                    &options,
+                    &mut symbol_snapshots,
+                    vm.cpu().registers().pc,
+                    vm.bus(),
+                );
                 write_stop_outputs(&options, vm.bus())?;
+                write_symbol_snapshots(&options, &symbol_snapshots)?;
                 return Err("CPU halted".to_string());
             }
         }
@@ -258,7 +290,14 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 options.dump_screen_on_stop,
                 &options.memory_dump_ranges,
             );
+            capture_final_symbol_snapshot(
+                &options,
+                &mut symbol_snapshots,
+                vm.cpu().registers().pc,
+                vm.bus(),
+            );
             write_stop_outputs(&options, vm.bus())?;
+            write_symbol_snapshots(&options, &symbol_snapshots)?;
         }
     }
 
@@ -267,6 +306,74 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         options.max_steps,
         vm.cpu().cycles(),
         vm.cpu().registers().pc
+    );
+    Ok(())
+}
+
+fn capture_symbol_snapshot(
+    trigger: &SymbolSnapshotTrigger,
+    bus: &action_compiler_vm::Bus,
+) -> SymbolSnapshot {
+    let dump = decode_action_symbol_tables(bus);
+    let proc_name = action_current_proc_name(bus);
+    eprintln!(
+        "captured symbol snapshot `{}` at PC=${:04X}: proc={}, {} local(s)",
+        trigger.label,
+        trigger.pc,
+        proc_name.as_deref().unwrap_or("<none>"),
+        dump.locals.len()
+    );
+    SymbolSnapshot {
+        pc: trigger.pc,
+        label: trigger.label.clone(),
+        proc_name,
+        local_index: dump.local_index,
+        locals: dump.locals,
+    }
+}
+
+fn capture_final_symbol_snapshot(
+    options: &CliOptions,
+    snapshots: &mut Vec<SymbolSnapshot>,
+    pc: u16,
+    bus: &action_compiler_vm::Bus,
+) {
+    if !options.capture_final_symbol_snapshot {
+        return;
+    }
+    let trigger = SymbolSnapshotTrigger {
+        pc,
+        label: "stop".to_string(),
+        skip_empty: true,
+    };
+    let snapshot = capture_symbol_snapshot(&trigger, bus);
+    if !snapshot.has_symbols() {
+        return;
+    }
+    if snapshots.last().is_some_and(|last| last.matches_symbols(&snapshot)) {
+        return;
+    }
+    snapshots.push(snapshot);
+}
+
+fn write_symbol_snapshots(
+    options: &CliOptions,
+    snapshots: &[SymbolSnapshot],
+) -> Result<(), String> {
+    let Some(path) = &options.symbol_snapshots_path else {
+        return Ok(());
+    };
+    let json = format_symbol_snapshots_json(snapshots);
+    fs::write(path, json.as_bytes()).map_err(|err| {
+        format!(
+            "failed to write symbol snapshots `{}`: {err}",
+            path.display()
+        )
+    })?;
+    eprintln!(
+        "wrote {} symbol snapshot(s) to {}",
+        snapshots.len(),
+        path.display()
     );
     Ok(())
 }
@@ -355,7 +462,38 @@ struct CliOptions {
     memory_dump_ranges: Vec<AddressRange>,
     raw_memory_dump_path: Option<PathBuf>,
     symbol_dump_path: Option<PathBuf>,
+    symbol_snapshots_path: Option<PathBuf>,
+    symbol_snapshot_triggers: Vec<SymbolSnapshotTrigger>,
+    capture_final_symbol_snapshot: bool,
     dump_screen_on_stop: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SymbolSnapshotTrigger {
+    pc: u16,
+    label: String,
+    skip_empty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SymbolSnapshot {
+    pc: u16,
+    label: String,
+    proc_name: Option<String>,
+    local_index: Option<u16>,
+    locals: Vec<ActionSymbolEntry>,
+}
+
+impl SymbolSnapshot {
+    fn has_symbols(&self) -> bool {
+        self.proc_name.is_some() || !self.locals.is_empty()
+    }
+
+    fn matches_symbols(&self, other: &Self) -> bool {
+        self.proc_name == other.proc_name
+            && self.local_index == other.local_index
+            && self.locals == other.locals
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,6 +537,9 @@ impl Default for CliOptions {
             memory_dump_ranges: Vec::new(),
             raw_memory_dump_path: None,
             symbol_dump_path: None,
+            symbol_snapshots_path: None,
+            symbol_snapshot_triggers: Vec::new(),
+            capture_final_symbol_snapshot: false,
             dump_screen_on_stop: false,
         }
     }
@@ -429,6 +570,9 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut memory_dump_ranges = Vec::new();
     let mut raw_memory_dump_path = None;
     let mut symbol_dump_path = None;
+    let mut symbol_snapshots_path = None;
+    let mut symbol_snapshot_triggers = Vec::new();
+    let mut capture_final_symbol_snapshot = false;
     let mut dump_screen_on_stop = false;
     let mut index = 0;
 
@@ -554,6 +698,24 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let value = required_value(&args, index, "--dump-symbols-on-stop")?;
                 symbol_dump_path = Some(PathBuf::from(value));
             }
+            "--dump-symbol-snapshots-on-stop" => {
+                index += 1;
+                let value = required_value(&args, index, "--dump-symbol-snapshots-on-stop")?;
+                symbol_snapshots_path = Some(PathBuf::from(value));
+            }
+            "--symbol-snapshot-at-pc" => {
+                index += 1;
+                let value = required_value(&args, index, "--symbol-snapshot-at-pc")?;
+                symbol_snapshot_triggers.push(parse_symbol_snapshot_trigger(value)?);
+            }
+            "--action-symbol-hooks" => {
+                symbol_snapshot_triggers.push(SymbolSnapshotTrigger {
+                    pc: ACTION_SEGMENT_END_VECTOR,
+                    label: "segvec".to_string(),
+                    skip_empty: true,
+                });
+                capture_final_symbol_snapshot = true;
+            }
             "--preset" => {
                 index += 1;
                 let value = required_value(&args, index, "--preset")?;
@@ -628,6 +790,9 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         memory_dump_ranges,
         raw_memory_dump_path,
         symbol_dump_path,
+        symbol_snapshots_path,
+        symbol_snapshot_triggers,
+        capture_final_symbol_snapshot,
         dump_screen_on_stop,
     })
 }
@@ -648,6 +813,20 @@ fn parse_hotpatch(value: &str) -> Result<Hotpatch, String> {
         "action-headless-getkey" => Ok(Hotpatch::ActionHeadlessGetkey),
         other => Err(format!("unknown hotpatch `{other}`")),
     }
+}
+
+fn parse_symbol_snapshot_trigger(value: &str) -> Result<SymbolSnapshotTrigger, String> {
+    let Some((pc, label)) = value.split_once(':') else {
+        return Err(format!("symbol snapshot trigger `{value}` must be pc:label"));
+    };
+    if label.trim().is_empty() {
+        return Err("symbol snapshot label must not be empty".to_string());
+    }
+    Ok(SymbolSnapshotTrigger {
+        pc: parse_address(pc)?,
+        label: label.to_string(),
+        skip_empty: false,
+    })
 }
 
 fn required_value<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
@@ -1009,6 +1188,94 @@ fn format_optional_address(address: Option<u16>) -> String {
         .unwrap_or_else(|| "<none>".to_string())
 }
 
+fn format_symbol_snapshots_json(snapshots: &[SymbolSnapshot]) -> String {
+    let mut out = String::new();
+    out.push_str("{\n  \"snapshots\": ");
+    if snapshots.is_empty() {
+        out.push_str("[]\n}\n");
+        return out;
+    }
+    out.push_str("[\n");
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        let comma = if index + 1 == snapshots.len() { "" } else { "," };
+        out.push_str(&format!(
+            "    {{\"pc\":\"${:04X}\",\"label\":\"{}\",\"proc\":{},\"local_index\":{},\"locals\":[{}]}}{comma}\n",
+            snapshot.pc,
+            escape_json(&snapshot.label),
+            format_json_optional_string(snapshot.proc_name.as_deref()),
+            format_json_optional_address(snapshot.local_index),
+            format_symbol_entries_inline_json(&snapshot.locals),
+        ));
+    }
+    out.push_str("  ]\n}\n");
+    out
+}
+
+fn format_symbol_entries_inline_json(entries: &[ActionSymbolEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{{\"slot\":\"${:02X}\",\"name_addr\":\"${:04X}\",\"name\":\"{}\",\"vtype\":\"${:02X}\",\"address\":{},\"class\":\"{}\",\"numargs\":{},\"arg_types_raw\":[{}],\"args\":[{}]}}",
+                entry.slot,
+                entry.name_addr,
+                escape_json(&entry.name),
+                entry.vtype,
+                format_json_optional_address(entry.address),
+                escape_json(&entry.class),
+                entry.numargs,
+                format_json_byte_array(&entry.arg_types_raw),
+                format_json_string_array(&entry.args),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_json_optional_address(address: Option<u16>) -> String {
+    address
+        .map(|address| format!("\"${address:04X}\""))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn format_json_optional_string(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn format_json_byte_array(values: &[u8]) -> String {
+    values
+        .iter()
+        .map(|value| format!("\"${value:02X}\""))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_json_string_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn escape_json(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04X}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 fn cart_word(cartridge: &action_compiler_vm::Cartridge, address: u16) -> u16 {
     let lo = cartridge.read(address).unwrap_or(0xFF);
     let hi = cartridge.read(address.wrapping_add(1)).unwrap_or(0xFF);
@@ -1124,6 +1391,12 @@ fn print_help() {
                               Write raw 64K RAM image when execution stops\n  \
          --dump-symbols-on-stop <path>\n  \
                               Write decoded Action! symbol tables as JSON when execution stops\n  \
+         --dump-symbol-snapshots-on-stop <path>\n  \
+                              Write captured Action! local symbol snapshots as JSON when execution stops\n  \
+         --symbol-snapshot-at-pc <pc:label>\n  \
+                              Capture local symbols whenever execution reaches pc\n  \
+         --action-symbol-hooks\n  \
+                              Capture local symbols at Action!'s segment-end vector ($04C6)\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
          --host-file <n:path> Register a host file visible as H:n\n  \
          --host-output <n:path>\n  \
@@ -1299,6 +1572,11 @@ mod tests {
             "memory.bin".to_string(),
             "--dump-symbols-on-stop".to_string(),
             "symbols.json".to_string(),
+            "--dump-symbol-snapshots-on-stop".to_string(),
+            "symbol-snapshots.json".to_string(),
+            "--symbol-snapshot-at-pc".to_string(),
+            "$04C6:segvec".to_string(),
+            "--action-symbol-hooks".to_string(),
         ])
         .unwrap();
 
@@ -1318,6 +1596,25 @@ mod tests {
         assert_eq!(
             options.symbol_dump_path,
             Some(PathBuf::from("symbols.json"))
+        );
+        assert_eq!(
+            options.symbol_snapshots_path,
+            Some(PathBuf::from("symbol-snapshots.json"))
+        );
+        assert_eq!(
+            options.symbol_snapshot_triggers,
+            vec![
+                SymbolSnapshotTrigger {
+                    pc: 0x04C6,
+                    label: "segvec".to_string(),
+                    skip_empty: false
+                },
+                SymbolSnapshotTrigger {
+                    pc: ACTION_SEGMENT_END_VECTOR,
+                    label: "segvec".to_string(),
+                    skip_empty: true
+                }
+            ]
         );
         assert!(options.dump_screen_on_stop);
     }
