@@ -51,6 +51,12 @@ precode_zp
 record_args
 record_ptr_order
 records
+resident_file
+resident_graphics_game
+resident_input
+resident_misc_memory
+resident_output
+resident_string_convert
 retflow
 returns
 sargs
@@ -106,6 +112,12 @@ probe_source() {
     record_args) echo record_args.act ;;
     record_ptr_order) echo record_ptr_order.act ;;
     records) echo records.act ;;
+    resident_file) echo resident_file.act ;;
+    resident_graphics_game) echo resident_graphics_game.act ;;
+    resident_input) echo resident_input.act ;;
+    resident_misc_memory) echo resident_misc_memory.act ;;
+    resident_output) echo resident_output.act ;;
+    resident_string_convert) echo resident_string_convert.act ;;
     retflow) echo retflow.act ;;
     returns) echo returns.act ;;
     sargs) echo sargs.act ;;
@@ -163,6 +175,12 @@ probe_output() {
     record_args) echo RECARGS.COM ;;
     record_ptr_order) echo RECPTRO.COM ;;
     records) echo RECORDS.COM ;;
+    resident_file) echo RESFILE.COM ;;
+    resident_graphics_game) echo RESGFX.COM ;;
+    resident_input) echo RESIN.COM ;;
+    resident_misc_memory) echo RESMISC.COM ;;
+    resident_output) echo RESOUT.COM ;;
+    resident_string_convert) echo RESSTR.COM ;;
     retflow) echo RETFLOW.COM ;;
     returns) echo RETURNS.COM ;;
     sargs) echo SARGS.COM ;;
