@@ -6,6 +6,7 @@ repo_root="$(cd "$script_dir/.." && pwd)"
 
 probe_dir="${ACTION_PROBES_DIR:-$repo_root/../actionc/experiments/original-compiler-probes}"
 output_dir="${ACTION_VM_OUTPUT_DIR:-$probe_dir/outputs/vm}"
+symbol_output_dir="${ACTION_VM_SYMBOL_OUTPUT_DIR:-$output_dir}"
 original_dir="${ACTION_ORIGINAL_OUTPUT_DIR:-$probe_dir/outputs/original}"
 cart_rom="${ACTION_VM_CART:-$repo_root/../roms/action.rom}"
 os_rom="${ACTION_VM_OS:-$repo_root/../roms/rev02.rom}"
@@ -181,6 +182,7 @@ Usage:
 Environment:
   ACTION_PROBES_DIR          Probe source directory
   ACTION_VM_OUTPUT_DIR       Output directory for VM-generated .COM files
+  ACTION_VM_SYMBOL_OUTPUT_DIR Output directory for VM symbol JSON files
   ACTION_ORIGINAL_OUTPUT_DIR Original .COM directory for cmp summaries
   ACTION_VM_CART             Action! cartridge ROM path
   ACTION_VM_OS               Atari OS ROM path
@@ -215,6 +217,7 @@ run_probe() {
 
   local source_path="$probe_dir/$source_name"
   local output_path="$output_dir/$output_name"
+  local symbol_path="$symbol_output_dir/${output_name%.COM}.symbols.json"
   local original_path="$original_dir/$output_name"
   local h_source
   local monitor_input
@@ -222,8 +225,9 @@ run_probe() {
   printf -v monitor_input 'C "H:%s"\nW "H:%s"\n' "$h_source" "$output_name"
 
   require_file "$source_path" "probe source"
-  mkdir -p "$output_dir"
+  mkdir -p "$output_dir" "$symbol_output_dir"
   rm -f "$output_path"
+  rm -f "$symbol_path"
 
   echo "==> $probe: $source_name -> $output_name"
   (
@@ -235,6 +239,7 @@ run_probe() {
       --hotpatch action-headless-getkey \
       --host-file "$h_source:$source_path" \
       --host-output "$output_name:$output_path" \
+      --dump-symbols-on-stop "$symbol_path" \
       --monitor-key-at-pc '$A2E0' \
       --q-input-at-pc-after '$A2E0:$B2F5:'"$monitor_input" \
       --max-steps "$max_steps" \

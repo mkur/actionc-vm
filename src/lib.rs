@@ -40,6 +40,8 @@ pub const ACTION_BOT: u16 = 0x0092;
 pub const ACTION_CUR: u16 = 0x0094;
 pub const ACTION_BUF: u16 = 0x009B;
 pub const ACTION_DIRTYF: u16 = 0x00C3;
+pub const ACTION_GLOBAL_SYMBOL_TABLE_POINTER: u16 = 0x00B1;
+pub const ACTION_LOCAL_SYMBOL_TABLE_POINTER: u16 = 0x00B3;
 pub const ACTION_VARS_W1: u16 = 0x0480;
 pub const ACTION_VARS_TOP1: u16 = 0x048F;
 pub const ACTION_LINEMAX: u16 = 0x04CF;
@@ -356,6 +358,288 @@ impl CompilerVm {
     }
 }
 
+pub fn decode_action_symbol_tables(bus: &Bus) -> ActionSymbolTableDump {
+    decode_action_symbol_tables_from_memory(bus.ram())
+}
+
+pub fn decode_action_symbol_tables_from_memory(memory: &Memory) -> ActionSymbolTableDump {
+    let global_index = symbol_index_root(memory, ACTION_GLOBAL_SYMBOL_TABLE_POINTER);
+    let local_index = symbol_index_root(memory, ACTION_LOCAL_SYMBOL_TABLE_POINTER);
+    ActionSymbolTableDump {
+        global_index,
+        local_index,
+        globals: global_index
+            .map(|index| decode_action_symbol_table(memory, index, ActionSymbolScope::Global))
+            .unwrap_or_default(),
+        locals: local_index
+            .map(|index| decode_action_symbol_table(memory, index, ActionSymbolScope::Local))
+            .unwrap_or_default(),
+    }
+}
+
+pub fn format_action_symbol_dump_json(dump: &ActionSymbolTableDump) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str(&format!(
+        "  \"global_index\": {},\n",
+        format_json_optional_address(dump.global_index)
+    ));
+    out.push_str(&format!(
+        "  \"local_index\": {},\n",
+        format_json_optional_address(dump.local_index)
+    ));
+    out.push_str("  \"globals\": ");
+    push_symbol_entries_json(&mut out, &dump.globals, 2);
+    out.push_str(",\n");
+    out.push_str("  \"locals\": ");
+    push_symbol_entries_json(&mut out, &dump.locals, 2);
+    out.push('\n');
+    out.push_str("}\n");
+    out
+}
+
+fn symbol_index_root(memory: &Memory, pointer_address: u16) -> Option<u16> {
+    let root = memory.read_word(pointer_address);
+    let root_end = u32::from(root) + 0x01FF;
+    (root != 0 && root_end <= u32::from(u16::MAX)).then_some(root)
+}
+
+fn decode_action_symbol_table(
+    memory: &Memory,
+    index_root: u16,
+    scope: ActionSymbolScope,
+) -> Vec<ActionSymbolEntry> {
+    let st_high = index_root;
+    let st_low = st_high.wrapping_add(256);
+    let mut entries = Vec::new();
+    for slot in 0..=255u16 {
+        let high = memory.read(st_high.wrapping_add(slot));
+        if high == 0 {
+            continue;
+        }
+        let low = memory.read(st_low.wrapping_add(slot));
+        let name_addr = u16::from(low) | (u16::from(high) << 8);
+        if let Some(entry) = decode_action_symbol_entry(memory, scope, slot as u8, name_addr) {
+            entries.push(entry);
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.name
+            .to_ascii_uppercase()
+            .cmp(&right.name.to_ascii_uppercase())
+            .then(left.name_addr.cmp(&right.name_addr))
+    });
+    entries
+}
+
+fn decode_action_symbol_entry(
+    memory: &Memory,
+    scope: ActionSymbolScope,
+    slot: u8,
+    name_addr: u16,
+) -> Option<ActionSymbolEntry> {
+    let name_len = memory.read(name_addr);
+    if name_len == 0 {
+        return None;
+    }
+    let name_start = name_addr.wrapping_add(1);
+    let entry_addr = name_start.wrapping_add(u16::from(name_len));
+    let vtype = memory.read(entry_addr);
+    if vtype == 0x88 {
+        return None;
+    }
+
+    let name = decode_action_string_bytes(memory, name_start, name_len);
+    let address = if vtype == 27 {
+        None
+    } else {
+        Some(memory.read_word(entry_addr.wrapping_add(1)))
+    };
+    let numargs = if is_action_routine_type(vtype) {
+        memory.read(entry_addr.wrapping_add(3))
+    } else {
+        0
+    };
+    let mut arg_types_raw = Vec::new();
+    let mut args = Vec::new();
+    for index in 0..numargs {
+        let raw = memory.read(entry_addr.wrapping_add(4 + u16::from(index)));
+        arg_types_raw.push(raw);
+        args.push(describe_action_symbol_type(memory, entry_addr, raw | 0x80));
+    }
+
+    Some(ActionSymbolEntry {
+        scope,
+        slot,
+        name_addr,
+        name,
+        vtype,
+        address,
+        class: describe_action_symbol_type(memory, entry_addr, vtype),
+        numargs,
+        arg_types_raw,
+        args,
+    })
+}
+
+fn describe_action_symbol_type(memory: &Memory, entry_addr: u16, vtype: u8) -> String {
+    if vtype == 27 {
+        return format!(
+            "DEFINE `{}`",
+            decode_action_string(memory, entry_addr.wrapping_add(3))
+        );
+    }
+    if vtype == 39 {
+        return "TYPE".to_string();
+    }
+
+    let mut parts = Vec::new();
+    if is_action_routine_type(vtype) {
+        if (vtype & 0xF7) == 0xC0 {
+            parts.push("PROC".to_string());
+        } else {
+            let base = action_base_type(vtype);
+            if base.is_empty() {
+                parts.push("FUNC".to_string());
+            } else {
+                parts.push(format!("{base} FUNC"));
+            }
+        }
+    } else if vtype < 128 {
+        if (vtype & 7) == 0 {
+            if (vtype & 8) == 8 {
+                parts.push("RECORD POINTER".to_string());
+            } else {
+                parts.push("RECORD".to_string());
+            }
+        } else {
+            let base = action_base_type(vtype);
+            if base.is_empty() {
+                parts.push("record field".to_string());
+            } else {
+                parts.push(format!("{base} record field"));
+            }
+        }
+    } else {
+        let base = action_base_type(vtype);
+        if !base.is_empty() {
+            parts.push(base.to_string());
+        }
+        if (vtype & 0x10) != 0 {
+            parts.push("ARRAY".to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        format!("vtype ${vtype:02X}")
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn is_action_routine_type(vtype: u8) -> bool {
+    (vtype & 0x40) != 0 && (vtype & 0x10) == 0
+}
+
+fn action_base_type(vtype: u8) -> &'static str {
+    match vtype & 7 {
+        1 => "CHAR",
+        2 => "BYTE",
+        3 => "INT",
+        4 => "CARD",
+        _ => "",
+    }
+}
+
+fn decode_action_string(memory: &Memory, address: u16) -> String {
+    let len = memory.read(address);
+    decode_action_string_bytes(memory, address.wrapping_add(1), len)
+}
+
+fn decode_action_string_bytes(memory: &Memory, start: u16, len: u8) -> String {
+    (0..len)
+        .map(|offset| {
+            let byte = memory.read(start.wrapping_add(u16::from(offset)));
+            match byte {
+                0x20..=0x7E => byte as char,
+                _ => '.',
+            }
+        })
+        .collect()
+}
+
+fn push_symbol_entries_json(out: &mut String, entries: &[ActionSymbolEntry], indent: usize) {
+    if entries.is_empty() {
+        out.push_str("[]");
+        return;
+    }
+    let pad = " ".repeat(indent);
+    let item_pad = " ".repeat(indent + 2);
+    out.push_str("[\n");
+    for (index, entry) in entries.iter().enumerate() {
+        let comma = if index + 1 == entries.len() { "" } else { "," };
+        out.push_str(&format!(
+            "{item_pad}{{\"scope\":\"{}\",\"slot\":\"${:02X}\",\"name_addr\":\"${:04X}\",\"name\":\"{}\",\"vtype\":\"${:02X}\",\"address\":{},\"class\":\"{}\",\"numargs\":{},\"arg_types_raw\":[{}],\"args\":[{}]}}{comma}\n",
+            action_symbol_scope_name(entry.scope),
+            entry.slot,
+            entry.name_addr,
+            escape_json(&entry.name),
+            entry.vtype,
+            format_json_optional_address(entry.address),
+            escape_json(&entry.class),
+            entry.numargs,
+            format_json_byte_array(&entry.arg_types_raw),
+            format_json_string_array(&entry.args),
+        ));
+    }
+    out.push_str(&format!("{pad}]"));
+}
+
+fn action_symbol_scope_name(scope: ActionSymbolScope) -> &'static str {
+    match scope {
+        ActionSymbolScope::Global => "global",
+        ActionSymbolScope::Local => "local",
+    }
+}
+
+fn format_json_optional_address(address: Option<u16>) -> String {
+    address
+        .map(|address| format!("\"${address:04X}\""))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn format_json_byte_array(values: &[u8]) -> String {
+    values
+        .iter()
+        .map(|value| format!("\"${value:02X}\""))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_json_string_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn escape_json(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04X}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionSourceInjectionReport {
     pub line_count: usize,
@@ -373,6 +657,34 @@ pub struct ActionEditorLine {
     pub allocation_size: u16,
     pub length: u8,
     pub text: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionSymbolTableDump {
+    pub global_index: Option<u16>,
+    pub local_index: Option<u16>,
+    pub globals: Vec<ActionSymbolEntry>,
+    pub locals: Vec<ActionSymbolEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionSymbolEntry {
+    pub scope: ActionSymbolScope,
+    pub slot: u8,
+    pub name_addr: u16,
+    pub name: String,
+    pub vtype: u8,
+    pub address: Option<u16>,
+    pub class: String,
+    pub numargs: u8,
+    pub arg_types_raw: Vec<u8>,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionSymbolScope {
+    Global,
+    Local,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5140,6 +5452,61 @@ mod tests {
         assert!(cpu.halted());
     }
 
+    #[test]
+    fn decodes_action_symbol_tables_from_official_table_shape() {
+        let mut memory = Memory::default();
+        memory.write_word(ACTION_GLOBAL_SYMBOL_TABLE_POINTER, 0x2000);
+        memory.write(0x2001, 0x30);
+        memory.write(0x2101, 0x00);
+        write_symbol_entry(
+            &mut memory,
+            0x3000,
+            "Plot",
+            0xC0,
+            Some(0xA6C3),
+            &[4, 2],
+        );
+
+        memory.write_word(ACTION_LOCAL_SYMBOL_TABLE_POINTER, 0x2200);
+        memory.write(0x2202, 0x31);
+        memory.write(0x2302, 0x00);
+        write_symbol_entry(&mut memory, 0x3100, "i", 0x82, Some(0x3028), &[]);
+
+        let dump = decode_action_symbol_tables_from_memory(&memory);
+
+        assert_eq!(dump.global_index, Some(0x2000));
+        assert_eq!(dump.local_index, Some(0x2200));
+        assert_eq!(dump.globals.len(), 1);
+        assert_eq!(dump.locals.len(), 1);
+        assert_eq!(dump.globals[0].scope, ActionSymbolScope::Global);
+        assert_eq!(dump.globals[0].slot, 1);
+        assert_eq!(dump.globals[0].name, "Plot");
+        assert_eq!(dump.globals[0].address, Some(0xA6C3));
+        assert_eq!(dump.globals[0].class, "PROC");
+        assert_eq!(dump.globals[0].numargs, 2);
+        assert_eq!(dump.globals[0].arg_types_raw, vec![4, 2]);
+        assert_eq!(dump.globals[0].args, vec!["CARD", "BYTE"]);
+        assert_eq!(dump.locals[0].scope, ActionSymbolScope::Local);
+        assert_eq!(dump.locals[0].name, "i");
+        assert_eq!(dump.locals[0].class, "BYTE");
+    }
+
+    #[test]
+    fn formats_action_symbol_dump_as_json() {
+        let mut memory = Memory::default();
+        memory.write_word(ACTION_GLOBAL_SYMBOL_TABLE_POINTER, 0x2000);
+        memory.write(0x2001, 0x30);
+        memory.write(0x2101, 0x00);
+        write_symbol_entry(&mut memory, 0x3000, "Main", 0xC0, Some(0x316C), &[]);
+
+        let json = format_action_symbol_dump_json(&decode_action_symbol_tables_from_memory(&memory));
+
+        assert!(json.contains("\"global_index\": \"$2000\""));
+        assert!(json.contains("\"name\":\"Main\""));
+        assert!(json.contains("\"address\":\"$316C\""));
+        assert!(json.contains("\"locals\": []"));
+    }
+
     fn car_bytes(cartridge_type: u32, chunks: &[&[u8]]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(CAR_MAGIC);
@@ -5150,5 +5517,30 @@ mod tests {
             bytes.extend_from_slice(chunk);
         }
         bytes
+    }
+
+    fn write_symbol_entry(
+        memory: &mut Memory,
+        name_addr: u16,
+        name: &str,
+        vtype: u8,
+        address: Option<u16>,
+        args: &[u8],
+    ) {
+        memory.write(name_addr, name.len() as u8);
+        for (offset, byte) in name.bytes().enumerate() {
+            memory.write(name_addr.wrapping_add(1 + offset as u16), byte);
+        }
+        let entry = name_addr.wrapping_add(1 + name.len() as u16);
+        memory.write(entry, vtype);
+        if let Some(address) = address {
+            memory.write_word(entry.wrapping_add(1), address);
+        }
+        if !args.is_empty() {
+            memory.write(entry.wrapping_add(3), args.len() as u8);
+            for (index, arg) in args.iter().copied().enumerate() {
+                memory.write(entry.wrapping_add(4 + index as u16), arg);
+            }
+        }
     }
 }

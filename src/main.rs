@@ -7,6 +7,7 @@ use action_compiler_vm::{
     ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ATARI_KEY_C, ATARI_KEY_E, ATARI_KEY_RETURN,
     ActionEditorLine, ActionSourceInjectionReport, AddressRange, BusAccess, BusEvent, CpuError,
     CpuRegisters, CpuStep, Hotpatch, ImageKind, TextScreenSnapshot, VmConfig,
+    decode_action_symbol_tables, format_action_symbol_dump_json,
 };
 
 fn main() {
@@ -275,6 +276,9 @@ fn write_stop_outputs(options: &CliOptions, bus: &action_compiler_vm::Bus) -> Re
     if let Some(path) = &options.raw_memory_dump_path {
         write_raw_memory_dump(path, bus)?;
     }
+    if let Some(path) = &options.symbol_dump_path {
+        write_symbol_dump(path, bus)?;
+    }
     Ok(())
 }
 
@@ -313,6 +317,24 @@ fn write_raw_memory_dump(path: &PathBuf, bus: &action_compiler_vm::Bus) -> Resul
     Ok(())
 }
 
+fn write_symbol_dump(path: &PathBuf, bus: &action_compiler_vm::Bus) -> Result<(), String> {
+    let dump = decode_action_symbol_tables(bus);
+    let json = format_action_symbol_dump_json(&dump);
+    fs::write(path, json.as_bytes()).map_err(|err| {
+        format!(
+            "failed to write symbol dump `{}`: {err}",
+            path.display()
+        )
+    })?;
+    eprintln!(
+        "wrote symbol dump: {} global(s), {} local(s) to {}",
+        dump.globals.len(),
+        dump.locals.len(),
+        path.display()
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliOptions {
     config: VmConfig,
@@ -332,6 +354,7 @@ struct CliOptions {
     screen_dump_pcs: Vec<u16>,
     memory_dump_ranges: Vec<AddressRange>,
     raw_memory_dump_path: Option<PathBuf>,
+    symbol_dump_path: Option<PathBuf>,
     dump_screen_on_stop: bool,
 }
 
@@ -375,6 +398,7 @@ impl Default for CliOptions {
             screen_dump_pcs: Vec::new(),
             memory_dump_ranges: Vec::new(),
             raw_memory_dump_path: None,
+            symbol_dump_path: None,
             dump_screen_on_stop: false,
         }
     }
@@ -404,6 +428,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut screen_dump_pcs = Vec::new();
     let mut memory_dump_ranges = Vec::new();
     let mut raw_memory_dump_path = None;
+    let mut symbol_dump_path = None;
     let mut dump_screen_on_stop = false;
     let mut index = 0;
 
@@ -524,6 +549,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let value = required_value(&args, index, "--dump-memory-on-stop")?;
                 raw_memory_dump_path = Some(PathBuf::from(value));
             }
+            "--dump-symbols-on-stop" => {
+                index += 1;
+                let value = required_value(&args, index, "--dump-symbols-on-stop")?;
+                symbol_dump_path = Some(PathBuf::from(value));
+            }
             "--preset" => {
                 index += 1;
                 let value = required_value(&args, index, "--preset")?;
@@ -597,6 +627,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         screen_dump_pcs,
         memory_dump_ranges,
         raw_memory_dump_path,
+        symbol_dump_path,
         dump_screen_on_stop,
     })
 }
@@ -1091,6 +1122,8 @@ fn print_help() {
                               Dump RAM bytes in range when execution stops\n  \
          --dump-memory-on-stop <path>\n  \
                               Write raw 64K RAM image when execution stops\n  \
+         --dump-symbols-on-stop <path>\n  \
+                              Write decoded Action! symbol tables as JSON when execution stops\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
          --host-file <n:path> Register a host file visible as H:n\n  \
          --host-output <n:path>\n  \
@@ -1264,6 +1297,8 @@ mod tests {
             "--dump-screen-on-stop".to_string(),
             "--dump-memory-on-stop".to_string(),
             "memory.bin".to_string(),
+            "--dump-symbols-on-stop".to_string(),
+            "symbols.json".to_string(),
         ])
         .unwrap();
 
@@ -1279,6 +1314,10 @@ mod tests {
         assert_eq!(
             options.raw_memory_dump_path,
             Some(PathBuf::from("memory.bin"))
+        );
+        assert_eq!(
+            options.symbol_dump_path,
+            Some(PathBuf::from("symbols.json"))
         );
         assert!(options.dump_screen_on_stop);
     }
