@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -100,6 +100,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     let mut editor_line_dump_pcs = options.editor_line_dump_pcs.clone();
     let mut screen_dump_pcs = options.screen_dump_pcs.clone();
     let mut symbol_snapshots = Vec::new();
+    let mut action_fixup_trace = ActionFixupTrace::new(options.trace_action_fixups);
     println!(
         "compiler VM loaded {} image(s); reset PC=${:04X}",
         vm.images().len(),
@@ -204,6 +205,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     print_step(&step);
                 }
                 let reached_trace_until = options.trace_until == Some(step.pc);
+                action_fixup_trace.observe(&step, vm.bus());
                 history.push(step);
                 if reached_trace_until {
                     print_stop_report(
@@ -214,6 +216,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                         vm.bus().cio_summary(),
                         vm.bus().cio_observations(),
                         vm.bus().cartridge().map(|cart| cart.mapping_info()),
+                        &action_fixup_trace,
                     );
                     print_run_observations(
                         vm.bus(),
@@ -240,6 +243,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     vm.bus().cio_summary(),
                     vm.bus().cio_observations(),
                     vm.bus().cartridge().map(|cart| cart.mapping_info()),
+                    &action_fixup_trace,
                 );
                 print_run_observations(
                     vm.bus(),
@@ -265,6 +269,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     vm.bus().cio_summary(),
                     vm.bus().cio_observations(),
                     vm.bus().cartridge().map(|cart| cart.mapping_info()),
+                    &action_fixup_trace,
                 );
                 print_run_observations(
                     vm.bus(),
@@ -292,6 +297,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 vm.bus().cio_summary(),
                 vm.bus().cio_observations(),
                 vm.bus().cartridge().map(|cart| cart.mapping_info()),
+                &action_fixup_trace,
             );
             print_run_observations(
                 vm.bus(),
@@ -473,6 +479,7 @@ struct CliOptions {
     symbol_snapshot_triggers: Vec<SymbolSnapshotTrigger>,
     capture_final_symbol_snapshot: bool,
     dump_screen_on_stop: bool,
+    trace_action_fixups: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,6 +555,7 @@ impl Default for CliOptions {
             symbol_snapshot_triggers: Vec::new(),
             capture_final_symbol_snapshot: false,
             dump_screen_on_stop: false,
+            trace_action_fixups: false,
         }
     }
 }
@@ -581,6 +589,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut symbol_snapshot_triggers = Vec::new();
     let mut capture_final_symbol_snapshot = false;
     let mut dump_screen_on_stop = false;
+    let mut trace_action_fixups = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -644,6 +653,9 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
             }
             "--trace-cio" => {
                 config.trace_cio = true;
+            }
+            "--trace-action-fixups" => {
+                trace_action_fixups = true;
             }
             "--key-at-pc" => {
                 index += 1;
@@ -801,6 +813,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         symbol_snapshot_triggers,
         capture_final_symbol_snapshot,
         dump_screen_on_stop,
+        trace_action_fixups,
     })
 }
 
@@ -1295,6 +1308,124 @@ fn cart_word(cartridge: &action_compiler_vm::Cartridge, address: u16) -> u16 {
     u16::from_le_bytes([lo, hi])
 }
 
+#[derive(Debug, Clone)]
+struct ActionFixupTrace {
+    enabled: bool,
+    observations: VecDeque<ActionFixupObservation>,
+    pointer_counts: HashMap<u16, u64>,
+}
+
+#[derive(Debug, Clone)]
+struct ActionFixupObservation {
+    cycle: u64,
+    pc: u16,
+    label: &'static str,
+    opcode: u8,
+    a_before: u8,
+    x_before: u8,
+    y_before: u8,
+    a_after: u8,
+    x_after: u8,
+    y_after: u8,
+    current: u16,
+    next: u16,
+    scratch: u16,
+    current_bytes: [u8; 5],
+    repeated: u64,
+}
+
+impl ActionFixupTrace {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            observations: VecDeque::new(),
+            pointer_counts: HashMap::new(),
+        }
+    }
+
+    fn observe(&mut self, step: &CpuStep, bus: &action_compiler_vm::Bus) {
+        if !self.enabled {
+            return;
+        }
+        let Some(label) = action_fixup_pc_label(step.pc) else {
+            return;
+        };
+
+        let current = read_ram_word(bus, 0x00A4);
+        let next = read_ram_word(bus, 0x00A0);
+        let scratch = read_ram_word(bus, 0x00A2);
+        let repeated = {
+            let count = self.pointer_counts.entry(current).or_insert(0);
+            *count += 1;
+            *count
+        };
+        let current_bytes = read_ram_window(bus, current.wrapping_sub(2));
+        let before = step.registers_before;
+        let after = step.registers_after;
+        self.observations.push_back(ActionFixupObservation {
+            cycle: step.cycles,
+            pc: step.pc,
+            label,
+            opcode: step.opcode,
+            a_before: before.a,
+            x_before: before.x,
+            y_before: before.y,
+            a_after: after.a,
+            x_after: after.x,
+            y_after: after.y,
+            current,
+            next,
+            scratch,
+            current_bytes,
+            repeated,
+        });
+        if self.observations.len() > 64 {
+            self.observations.pop_front();
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.observations.is_empty()
+    }
+
+    fn hot_pointers(&self) -> Vec<(u16, u64)> {
+        let mut pointers = self
+            .pointer_counts
+            .iter()
+            .map(|(pointer, count)| (*pointer, *count))
+            .collect::<Vec<_>>();
+        pointers.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        pointers.truncate(8);
+        pointers
+    }
+}
+
+fn action_fixup_pc_label(pc: u16) -> Option<&'static str> {
+    match pc {
+        0xA7E9 => Some("loop"),
+        0xA836 => Some("advance"),
+        0xA874 => Some("next"),
+        0xA88A => Some("patch"),
+        _ => None,
+    }
+}
+
+fn read_ram_word(bus: &action_compiler_vm::Bus, address: u16) -> u16 {
+    let lo = bus.ram().read(address);
+    let hi = bus.ram().read(address.wrapping_add(1));
+    u16::from_le_bytes([lo, hi])
+}
+
+fn read_ram_window(bus: &action_compiler_vm::Bus, start: u16) -> [u8; 5] {
+    [
+        bus.ram().read(start),
+        bus.ram().read(start.wrapping_add(1)),
+        bus.ram().read(start.wrapping_add(2)),
+        bus.ram().read(start.wrapping_add(3)),
+        bus.ram().read(start.wrapping_add(4)),
+    ]
+}
+
 fn print_stop_report(
     reason: &str,
     registers: Option<CpuRegisters>,
@@ -1303,6 +1434,7 @@ fn print_stop_report(
     cio_summary: &CioSummary,
     cio_observations: &VecDeque<CioObservation>,
     cartridge: Option<action_compiler_vm::CartridgeMappingInfo>,
+    action_fixup_trace: &ActionFixupTrace,
 ) {
     eprintln!("stop: {reason}");
     if let Some(regs) = registers {
@@ -1405,6 +1537,56 @@ fn print_stop_report(
             );
         }
     }
+    print_action_fixup_trace(action_fixup_trace);
+}
+
+fn print_action_fixup_trace(trace: &ActionFixupTrace) {
+    if trace.is_empty() {
+        return;
+    }
+    eprintln!("Action! fixup trace:");
+    let hot = trace.hot_pointers();
+    if !hot.is_empty() {
+        let hot = hot
+            .iter()
+            .map(|(pointer, count)| format!("${pointer:04X}x{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("  hot pointers: {hot}");
+    }
+    eprintln!("  recent fixups:");
+    for observation in trace
+        .observations
+        .iter()
+        .rev()
+        .take(32)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        eprintln!(
+            "  cyc={} pc=${:04X} {:<7} op=${:02X} A/X/Y ${:02X}/${:02X}/${:02X}->${:02X}/${:02X}/${:02X} cur=${:04X} next=${:04X} scratch=${:04X} rep={} bytes=[{:02X} {:02X} {:02X} {:02X} {:02X}]",
+            observation.cycle,
+            observation.pc,
+            observation.label,
+            observation.opcode,
+            observation.a_before,
+            observation.x_before,
+            observation.y_before,
+            observation.a_after,
+            observation.x_after,
+            observation.y_after,
+            observation.current,
+            observation.next,
+            observation.scratch,
+            observation.repeated,
+            observation.current_bytes[0],
+            observation.current_bytes[1],
+            observation.current_bytes[2],
+            observation.current_bytes[3],
+            observation.current_bytes[4],
+        );
+    }
 }
 
 fn format_cio_detail(observation: &CioObservation) -> String {
@@ -1438,6 +1620,8 @@ fn print_help() {
          --trace-pc           Print one line per executed instruction\n  \
          --trace-range <a:b>  Print instructions with PC inside the range\n  \
          --trace-until <addr> Stop after executing an instruction at addr\n  \
+         --trace-action-fixups\n  \
+                              Summarize Action! compiler branch-fixup loop activity on stop\n  \
          --history <n>        Recent instruction count in stop reports, default 64\n  \
          --watch <addr>       Record bus reads/writes at addr\n  \
          --watch-range <a:b>  Record bus reads/writes inside the range\n  \
@@ -1518,6 +1702,13 @@ mod tests {
                 PathBuf::from("/tmp/functions.com")
             )]
         );
+    }
+
+    #[test]
+    fn parses_action_fixup_trace_option() {
+        let options = parse_options(vec!["--trace-action-fixups".to_string()]).unwrap();
+
+        assert!(options.trace_action_fixups);
     }
 
     #[test]
