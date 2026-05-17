@@ -1881,7 +1881,8 @@ impl Cpu {
         let command_address = IOCB_COMMAND_BASE.wrapping_add(self.registers.x as u16);
         let command = bus.ram().read(command_address);
         let return_pc = self.peek_return_address(bus);
-        let mut observation = bus.start_cio_observation(self.registers.x, command, return_pc);
+        let mut observation =
+            bus.start_cio_observation(self.registers.x, command, return_pc, self.cycles);
         bus.trace_cio_call(&observation);
         match command {
             CIO_COMMAND_OPEN => {
@@ -3077,12 +3078,24 @@ impl Bus {
         }
     }
 
-    fn start_cio_observation(&self, x: u8, command: u8, return_pc: u16) -> CioObservation {
+    fn start_cio_observation(
+        &self,
+        x: u8,
+        command: u8,
+        return_pc: u16,
+        cycle: u64,
+    ) -> CioObservation {
         let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(x as u16));
         let length = self.ram.read_word(IOCB_LENGTH_BASE.wrapping_add(x as u16));
         let aux1 = self.ram.read(IOCB_AUX1_BASE.wrapping_add(x as u16));
         let aux2 = self.ram.read(IOCB_AUX2_BASE.wrapping_add(x as u16));
+        let previous_cycle = self
+            .cio_observations
+            .back()
+            .map(|observation| observation.cycle);
         CioObservation {
+            cycle,
+            delta_cycles: previous_cycle.map(|previous| cycle.saturating_sub(previous)),
             x,
             channel: cio_channel_index(x).map(|channel| channel as u8),
             command,
@@ -3510,6 +3523,8 @@ pub struct CioSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CioObservation {
+    pub cycle: u64,
+    pub delta_cycles: Option<u64>,
     pub x: u8,
     pub channel: Option<u8>,
     pub command: u8,

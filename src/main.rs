@@ -1373,7 +1373,12 @@ fn print_stop_report(
             .rev()
         {
             eprintln!(
-                "  x=${:02X} ch={} cmd=${:02X} ret=${:04X} aux=${:02X}/${:02X} buf=${:04X} len={} dev={} {} A={} Y={} {}",
+                "  cyc={} dcyc={} x=${:02X} ch={} cmd=${:02X} ret=${:04X} aux=${:02X}/${:02X} buf=${:04X} len={} dev={} {} A={} Y={} {}",
+                observation.cycle,
+                observation
+                    .delta_cycles
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
                 observation.x,
                 observation.channel.unwrap_or(0xFF),
                 observation.command,
