@@ -2484,14 +2484,19 @@ impl Bus {
         ));
         let device = match self.peek_mapped(spec_buffer).to_ascii_uppercase() {
             b'Q' => CioHarnessDevice::QueuedInput,
-            b'H' => {
+            b'H' | b'D' => {
+                let device_name = self.peek_mapped(spec_buffer).to_ascii_uppercase() as char;
                 let spec = self.read_iocb_string(spec_buffer, spec_length);
                 let name = normalize_host_file_name(&spec);
                 let Some(file_index) = self.host_file_lookup.get(&name).copied() else {
-                    self.trace_cio(format_args!("  H: open miss spec=`{spec}` name=`{name}`"));
+                    self.trace_cio(format_args!(
+                        "  {device_name}: open miss spec=`{spec}` name=`{name}`"
+                    ));
                     return false;
                 };
-                self.trace_cio(format_args!("  H: open spec=`{spec}` name=`{name}`"));
+                self.trace_cio(format_args!(
+                    "  {device_name}: open spec=`{spec}` name=`{name}`"
+                ));
                 if self.host_files[file_index].writable && self.open_mode_is_write(x) {
                     self.host_files[file_index].bytes.clear();
                 }
@@ -2507,7 +2512,9 @@ impl Bus {
         }
 
         self.cio_harness_devices[channel] = Some(device);
-        self.trace_cio(format_args!("  harness open channel={channel} device={device:?}"));
+        self.trace_cio(format_args!(
+            "  harness open channel={channel} device={device:?}"
+        ));
         true
     }
 
@@ -2549,10 +2556,7 @@ impl Bus {
 
     fn cio_spec_buffer(&mut self, buffer: u16, length: u16) -> (u16, u16) {
         let first = self.peek_mapped(buffer);
-        if length > 0
-            && first == length as u8
-            && self.peek_mapped(buffer.wrapping_add(2)) == b':'
-        {
+        if length > 0 && first == length as u8 && self.peek_mapped(buffer.wrapping_add(2)) == b':' {
             (buffer.wrapping_add(1), length)
         } else {
             (buffer, length)
@@ -2662,7 +2666,7 @@ impl Bus {
             offset: offset.saturating_add(bytes.len()),
         });
         self.trace_cio(format_args!(
-            "  H: wrote {} byte(s) to `{}`",
+            "  host wrote {} byte(s) to `{}`",
             bytes.len(),
             self.host_files[file_index].name
         ));
@@ -2690,9 +2694,11 @@ impl Bus {
         for byte in bytes {
             if *byte == 0x9B {
                 self.ram.write(COLCRS, 0);
-                self.ram.write(ROWCRS, self.ram.read(ROWCRS).wrapping_add(1));
+                self.ram
+                    .write(ROWCRS, self.ram.read(ROWCRS).wrapping_add(1));
             } else {
-                self.ram.write(COLCRS, self.ram.read(COLCRS).wrapping_add(1));
+                self.ram
+                    .write(COLCRS, self.ram.read(COLCRS).wrapping_add(1));
             }
         }
     }
@@ -2921,6 +2927,8 @@ fn normalize_host_file_name(name: &str) -> String {
     let without_device = trimmed
         .strip_prefix("H:")
         .or_else(|| trimmed.strip_prefix("h:"))
+        .or_else(|| trimmed.strip_prefix("D:"))
+        .or_else(|| trimmed.strip_prefix("d:"))
         .unwrap_or(trimmed);
     without_device.trim().to_ascii_uppercase()
 }
@@ -3775,7 +3783,10 @@ mod tests {
         assert_eq!(bus.read(BOOTQ_SUCCESSFUL_BOOT_FLAG), 0x01);
         assert_eq!(bus.read(DOSVEC_START_VECTOR), 0x34);
         assert_eq!(bus.read(DOSVEC_START_VECTOR.wrapping_add(1)), 0x12);
-        assert_eq!(bus.read(RAMTOP_MEMORY_TOP_PAGE), DEFAULT_HEADLESS_RAMTOP_PAGE);
+        assert_eq!(
+            bus.read(RAMTOP_MEMORY_TOP_PAGE),
+            DEFAULT_HEADLESS_RAMTOP_PAGE
+        );
         assert_eq!(
             bus.ram().read_word(MEMTOP_OS_TOP_OF_FREE_MEMORY),
             DEFAULT_HEADLESS_MEMTOP
@@ -5367,8 +5378,7 @@ mod tests {
         bus.add_host_output("OUT.COM");
         bus.ram_mut()
             .write(IOCB_COMMAND_BASE.wrapping_add(0x10), CIO_COMMAND_OPEN);
-        bus.ram_mut()
-            .write(IOCB_AUX1_BASE.wrapping_add(0x10), 0x08);
+        bus.ram_mut().write(IOCB_AUX1_BASE.wrapping_add(0x10), 0x08);
         bus.ram_mut()
             .write_word(IOCB_BUFFER_BASE.wrapping_add(0x10), 0x3000);
         bus.ram_mut()
@@ -5389,7 +5399,9 @@ mod tests {
             .write_word(IOCB_BUFFER_BASE.wrapping_add(0x10), 0x3100);
         bus.ram_mut()
             .write_word(IOCB_LENGTH_BASE.wrapping_add(0x10), 4);
-        bus.ram_mut().map(0x3100, &[0xFF, 0xFF, 0x00, 0x30]).unwrap();
+        bus.ram_mut()
+            .map(0x3100, &[0xFF, 0xFF, 0x00, 0x30])
+            .unwrap();
         bus.ram_mut().write(0x01FC, 0xFF);
         bus.ram_mut().write(0x01FD, 0x1F);
         cpu.registers.pc = CIOV;
@@ -5398,7 +5410,39 @@ mod tests {
 
         cpu.step(&mut bus).unwrap();
 
-        assert_eq!(bus.host_file_bytes("OUT.COM"), Some(&[0xFF, 0xFF, 0x00, 0x30][..]));
+        assert_eq!(
+            bus.host_file_bytes("OUT.COM"),
+            Some(&[0xFF, 0xFF, 0x00, 0x30][..])
+        );
+    }
+
+    #[test]
+    fn cpu_opens_harness_host_files_through_d_device() {
+        let mut bus = Bus::default();
+        bus.add_host_file("LIB.ACT", b"BYTE x\n".to_vec());
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x30), CIO_COMMAND_OPEN);
+        bus.ram_mut()
+            .write_word(IOCB_BUFFER_BASE.wrapping_add(0x30), 0x3000);
+        bus.ram_mut()
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(0x30), 9);
+        bus.ram_mut().map(0x3000, b"D:LIB.ACT").unwrap();
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        let mut cpu = Cpu::default();
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x30;
+        cpu.registers.sp = 0xFB;
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(
+            bus.cio_channel_device(0x30),
+            Some(CioHarnessDevice::Host {
+                file_index: 0,
+                offset: 0
+            })
+        );
     }
 
     #[test]
@@ -5480,14 +5524,7 @@ mod tests {
         memory.write_word(ACTION_GLOBAL_SYMBOL_TABLE_POINTER, 0x2000);
         memory.write(0x2001, 0x30);
         memory.write(0x2101, 0x00);
-        write_symbol_entry(
-            &mut memory,
-            0x3000,
-            "Plot",
-            0xC0,
-            Some(0xA6C3),
-            &[4, 2],
-        );
+        write_symbol_entry(&mut memory, 0x3000, "Plot", 0xC0, Some(0xA6C3), &[4, 2]);
 
         memory.write_word(ACTION_LOCAL_SYMBOL_TABLE_POINTER, 0x2200);
         memory.write(0x2202, 0x31);
@@ -5521,7 +5558,8 @@ mod tests {
         memory.write(0x2101, 0x00);
         write_symbol_entry(&mut memory, 0x3000, "Main", 0xC0, Some(0x316C), &[]);
 
-        let json = format_action_symbol_dump_json(&decode_action_symbol_tables_from_memory(&memory));
+        let json =
+            format_action_symbol_dump_json(&decode_action_symbol_tables_from_memory(&memory));
 
         assert!(json.contains("\"global_index\": \"$2000\""));
         assert!(json.contains("\"name\":\"Main\""));

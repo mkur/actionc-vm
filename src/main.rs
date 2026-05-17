@@ -4,11 +4,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use action_compiler_vm::{
-    ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ACTION_SEGMENT_END_VECTOR, ATARI_KEY_C,
-    ATARI_KEY_E, ATARI_KEY_RETURN, ActionEditorLine, ActionSourceInjectionReport,
-    ActionSymbolEntry, AddressRange, BusAccess, BusEvent, CpuError, CpuRegisters, CpuStep,
-    Hotpatch, ImageKind, TextScreenSnapshot, VmConfig, action_current_proc_name,
-    decode_action_symbol_tables, format_action_symbol_dump_json,
+    ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ACTION_SEGMENT_END_VECTOR, ATARI_KEY_C, ATARI_KEY_E,
+    ATARI_KEY_RETURN, ActionEditorLine, ActionSourceInjectionReport, ActionSymbolEntry,
+    AddressRange, BusAccess, BusEvent, CpuError, CpuRegisters, CpuStep, Hotpatch, ImageKind,
+    TextScreenSnapshot, VmConfig, action_current_proc_name, decode_action_symbol_tables,
+    format_action_symbol_dump_json,
 };
 
 fn main() {
@@ -350,7 +350,10 @@ fn capture_final_symbol_snapshot(
     if !snapshot.has_symbols() {
         return;
     }
-    if snapshots.last().is_some_and(|last| last.matches_symbols(&snapshot)) {
+    if snapshots
+        .last()
+        .is_some_and(|last| last.matches_symbols(&snapshot))
+    {
         return;
     }
     snapshots.push(snapshot);
@@ -427,12 +430,8 @@ fn write_raw_memory_dump(path: &PathBuf, bus: &action_compiler_vm::Bus) -> Resul
 fn write_symbol_dump(path: &PathBuf, bus: &action_compiler_vm::Bus) -> Result<(), String> {
     let dump = decode_action_symbol_tables(bus);
     let json = format_action_symbol_dump_json(&dump);
-    fs::write(path, json.as_bytes()).map_err(|err| {
-        format!(
-            "failed to write symbol dump `{}`: {err}",
-            path.display()
-        )
-    })?;
+    fs::write(path, json.as_bytes())
+        .map_err(|err| format!("failed to write symbol dump `{}`: {err}", path.display()))?;
     eprintln!(
         "wrote symbol dump: {} global(s), {} local(s) to {}",
         dump.globals.len(),
@@ -817,7 +816,9 @@ fn parse_hotpatch(value: &str) -> Result<Hotpatch, String> {
 
 fn parse_symbol_snapshot_trigger(value: &str) -> Result<SymbolSnapshotTrigger, String> {
     let Some((pc, label)) = value.split_once(':') else {
-        return Err(format!("symbol snapshot trigger `{value}` must be pc:label"));
+        return Err(format!(
+            "symbol snapshot trigger `{value}` must be pc:label"
+        ));
     };
     if label.trim().is_empty() {
         return Err("symbol snapshot label must not be empty".to_string());
@@ -1197,7 +1198,11 @@ fn format_symbol_snapshots_json(snapshots: &[SymbolSnapshot]) -> String {
     }
     out.push_str("[\n");
     for (index, snapshot) in snapshots.iter().enumerate() {
-        let comma = if index + 1 == snapshots.len() { "" } else { "," };
+        let comma = if index + 1 == snapshots.len() {
+            ""
+        } else {
+            ","
+        };
         out.push_str(&format!(
             "    {{\"pc\":\"${:04X}\",\"label\":\"{}\",\"proc\":{},\"local_index\":{},\"locals\":[{}]}}{comma}\n",
             snapshot.pc,
@@ -1398,9 +1403,9 @@ fn print_help() {
          --action-symbol-hooks\n  \
                               Capture local symbols at Action!'s segment-end vector ($04C6)\n  \
          --source <path>      Source file reserved for the future compiler harness\n  \
-         --host-file <n:path> Register a host file visible as H:n\n  \
+         --host-file <n:path> Register a host file visible as H:n and D:n\n  \
          --host-output <n:path>\n  \
-                              Register writable host file H:n and save it to path on stop\n  \
+                              Register writable host file H:n/D:n and save it to path on stop\n  \
          --hotpatch <name>    Apply an in-memory hotpatch, e.g. action-q-input or action-headless-getkey\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );
