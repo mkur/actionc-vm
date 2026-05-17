@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use action_compiler_vm::{
     ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ACTION_SEGMENT_END_VECTOR, ATARI_KEY_C, ATARI_KEY_E,
     ATARI_KEY_RETURN, ActionEditorLine, ActionSourceInjectionReport, ActionSymbolEntry,
-    AddressRange, BusAccess, BusEvent, CpuError, CpuRegisters, CpuStep, Hotpatch, ImageKind,
-    TextScreenSnapshot, VmConfig, action_current_proc_name, decode_action_symbol_tables,
-    format_action_symbol_dump_json,
+    AddressRange, BusAccess, BusEvent, CioObservation, CioSummary, CpuError, CpuRegisters, CpuStep,
+    Hotpatch, ImageKind, TextScreenSnapshot, VmConfig, action_current_proc_name,
+    decode_action_symbol_tables, format_action_symbol_dump_json,
 };
 
 fn main() {
@@ -211,6 +211,8 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                         Some(step.registers_after),
                         Some(&history),
                         vm.bus().events(),
+                        vm.bus().cio_summary(),
+                        vm.bus().cio_observations(),
                         vm.bus().cartridge().map(|cart| cart.mapping_info()),
                     );
                     print_run_observations(
@@ -235,6 +237,8 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     Some(vm.cpu().registers()),
                     Some(&history),
                     vm.bus().events(),
+                    vm.bus().cio_summary(),
+                    vm.bus().cio_observations(),
                     vm.bus().cartridge().map(|cart| cart.mapping_info()),
                 );
                 print_run_observations(
@@ -258,6 +262,8 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     Some(vm.cpu().registers()),
                     Some(&history),
                     vm.bus().events(),
+                    vm.bus().cio_summary(),
+                    vm.bus().cio_observations(),
                     vm.bus().cartridge().map(|cart| cart.mapping_info()),
                 );
                 print_run_observations(
@@ -283,6 +289,8 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 Some(vm.cpu().registers()),
                 Some(&history),
                 vm.bus().events(),
+                vm.bus().cio_summary(),
+                vm.bus().cio_observations(),
                 vm.bus().cartridge().map(|cart| cart.mapping_info()),
             );
             print_run_observations(
@@ -1292,6 +1300,8 @@ fn print_stop_report(
     registers: Option<CpuRegisters>,
     history: Option<&StepHistory>,
     events: &[BusEvent],
+    cio_summary: &CioSummary,
+    cio_observations: &VecDeque<CioObservation>,
     cartridge: Option<action_compiler_vm::CartridgeMappingInfo>,
 ) {
     eprintln!("stop: {reason}");
@@ -1335,6 +1345,58 @@ fn print_stop_report(
             eprintln!(
                 "  {access} ${:04X}=${:02X} {:?}",
                 event.address, event.value, event.region
+            );
+        }
+    }
+    if cio_summary.calls > 0 {
+        eprintln!(
+            "CIO summary: calls={} handled={} passthrough={} open={} close={} status={} read={} write={} eof={} bytes_read={} bytes_written={}",
+            cio_summary.calls,
+            cio_summary.handled,
+            cio_summary.passthrough,
+            cio_summary.opens,
+            cio_summary.closes,
+            cio_summary.statuses,
+            cio_summary.reads,
+            cio_summary.writes,
+            cio_summary.eof,
+            cio_summary.bytes_read,
+            cio_summary.bytes_written
+        );
+        eprintln!("recent CIO:");
+        for observation in cio_observations
+            .iter()
+            .rev()
+            .take(32)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            eprintln!(
+                "  x=${:02X} ch={} cmd=${:02X} ret=${:04X} aux=${:02X}/${:02X} buf=${:04X} len={} dev={} {} A={} Y={} {}",
+                observation.x,
+                observation.channel.unwrap_or(0xFF),
+                observation.command,
+                observation.return_pc,
+                observation.aux1,
+                observation.aux2,
+                observation.buffer,
+                observation.length,
+                observation.device_before.as_deref().unwrap_or("-"),
+                if observation.handled {
+                    "handled"
+                } else {
+                    "pass"
+                },
+                observation
+                    .result_a
+                    .map(|value| format!("${value:02X}"))
+                    .unwrap_or_else(|| "--".to_string()),
+                observation
+                    .result_y
+                    .map(|value| format!("${value:02X}"))
+                    .unwrap_or_else(|| "--".to_string()),
+                observation.detail
             );
         }
     }

@@ -72,6 +72,7 @@ pub const CIO_COMMAND_PUTREC: u8 = 0x09;
 pub const CIO_COMMAND_PUTCHR: u8 = 0x0B;
 pub const CIO_COMMAND_CLOSE: u8 = 0x0C;
 pub const CIO_COMMAND_STATUS: u8 = 0x0D;
+pub const CIO_OBSERVATION_LIMIT: usize = 128;
 pub const CARTCS_COLDSTART_VECTOR: u16 = 0xBFFA;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
@@ -1879,13 +1880,21 @@ impl Cpu {
         let command_address = IOCB_COMMAND_BASE.wrapping_add(self.registers.x as u16);
         let command = bus.ram().read(command_address);
         let return_pc = self.peek_return_address(bus);
-        bus.trace_cio_call(self.registers.x, command, return_pc);
+        let mut observation = bus.start_cio_observation(self.registers.x, command, return_pc);
+        bus.trace_cio_call(&observation);
         match command {
             CIO_COMMAND_OPEN => {
                 if bus.try_open_harness_cio_device(self.registers.x) {
+                    observation.handled = true;
+                    observation.detail = "open harness device".to_string();
+                    observation.result_a = Some(self.registers.a);
+                    observation.result_y = Some(0x01);
+                    bus.finish_cio_observation(observation);
                     self.return_from_ciov(bus, self.registers.a, 0x01);
                     return true;
                 }
+                observation.detail = "open passthrough".to_string();
+                bus.finish_cio_observation(observation);
                 false
             }
             CIO_COMMAND_GETCHR | CIO_COMMAND_GETREC => {
@@ -1896,6 +1905,12 @@ impl Cpu {
                                 "  Q: read ${character:02X} `{}`",
                                 atari_debug_char(character)
                             ));
+                            observation.handled = true;
+                            observation.detail = format!("read queued input ${character:02X}");
+                            observation.result_a = Some(character);
+                            observation.result_y = Some(0x01);
+                            observation.bytes_read = Some(1);
+                            bus.finish_cio_observation(observation);
                             self.return_from_ciov(bus, character, 0x01);
                             return true;
                         }
@@ -1906,7 +1921,15 @@ impl Cpu {
                         } else {
                             bus.read_host_character(self.registers.x)
                         };
-                        if let Some((accumulator, status)) = result {
+                        if let Some(result) = result {
+                            observation.handled = true;
+                            observation.detail = result.detail;
+                            observation.result_a = Some(result.accumulator);
+                            observation.result_y = Some(result.status);
+                            observation.bytes_read = Some(result.bytes_read as u16);
+                            bus.finish_cio_observation(observation);
+                            let accumulator = result.accumulator;
+                            let status = result.status;
                             self.return_from_ciov(bus, accumulator, status);
                             return true;
                         }
@@ -1915,48 +1938,89 @@ impl Cpu {
                 }
 
                 if self.registers.x != 0x70 {
+                    observation.detail = "read passthrough".to_string();
+                    bus.finish_cio_observation(observation);
                     return false;
                 }
                 let raw_key = bus.ram().read(CH_KEY_CODE);
                 let Some(character) = atari_key_code_to_character(raw_key) else {
+                    observation.detail = "keyboard read waiting".to_string();
+                    bus.finish_cio_observation(observation);
                     return false;
                 };
 
                 bus.write(CH_KEY_CODE, 0xFF);
+                observation.handled = true;
+                observation.detail = format!("keyboard read ${character:02X}");
+                observation.result_a = Some(character);
+                observation.result_y = Some(0x01);
+                observation.bytes_read = Some(1);
+                bus.finish_cio_observation(observation);
                 self.return_from_ciov(bus, character, 0x01);
                 true
             }
             CIO_COMMAND_CLOSE => {
                 if bus.close_harness_cio_device(self.registers.x) {
+                    observation.handled = true;
+                    observation.detail = "close harness device".to_string();
+                    observation.result_a = Some(self.registers.a);
+                    observation.result_y = Some(0x01);
+                    bus.finish_cio_observation(observation);
                     self.return_from_ciov(bus, self.registers.a, 0x01);
                     return true;
                 }
+                observation.detail = "close passthrough".to_string();
+                bus.finish_cio_observation(observation);
                 false
             }
             CIO_COMMAND_STATUS => {
                 if bus.cio_channel_device(self.registers.x).is_some() {
+                    observation.handled = true;
+                    observation.detail = "status harness device".to_string();
+                    observation.result_a = Some(self.registers.a);
+                    observation.result_y = Some(0x01);
+                    bus.finish_cio_observation(observation);
                     self.return_from_ciov(bus, self.registers.a, 0x01);
                     return true;
                 }
+                observation.detail = "status passthrough".to_string();
+                bus.finish_cio_observation(observation);
                 false
             }
             CIO_COMMAND_PUTCHR | CIO_COMMAND_PUTREC => {
-                if bus
-                    .write_host_bytes_for_iocb(self.registers.x, self.registers.a)
-                    .is_some()
+                if let Some(written) =
+                    bus.write_host_bytes_for_iocb(self.registers.x, self.registers.a)
                 {
+                    observation.handled = true;
+                    observation.detail = format!("write host {written} byte(s)");
+                    observation.result_a = Some(self.registers.a);
+                    observation.result_y = Some(0x01);
+                    observation.bytes_written = Some(written as u16);
+                    bus.finish_cio_observation(observation);
                     self.return_from_ciov(bus, self.registers.a, 0x01);
                     return true;
                 }
                 if self.registers.x != 0x00 {
+                    observation.detail = "write passthrough".to_string();
+                    bus.finish_cio_observation(observation);
                     return false;
                 }
                 let bytes = bus.cio_output_bytes_for_iocb(self.registers.x, self.registers.a);
                 bus.capture_cio_channel0_output(&bytes);
+                observation.handled = true;
+                observation.detail = format!("write E: {} byte(s)", bytes.len());
+                observation.result_a = Some(self.registers.a);
+                observation.result_y = Some(0x01);
+                observation.bytes_written = Some(bytes.len() as u16);
+                bus.finish_cio_observation(observation);
                 self.return_from_ciov(bus, self.registers.a, 0x01);
                 true
             }
-            _ => false,
+            _ => {
+                observation.detail = format!("command ${command:02X} passthrough");
+                bus.finish_cio_observation(observation);
+                false
+            }
         }
     }
 
@@ -2177,6 +2241,8 @@ pub struct Bus {
     host_files: Vec<HostFile>,
     host_file_lookup: HashMap<String, usize>,
     trace_cio: bool,
+    cio_summary: CioSummary,
+    cio_observations: VecDeque<CioObservation>,
     sio_timeout_pending: bool,
     redirect_disk_boot_to_cart: bool,
 }
@@ -2199,6 +2265,8 @@ impl Default for Bus {
             host_files: Vec::new(),
             host_file_lookup: HashMap::new(),
             trace_cio: false,
+            cio_summary: CioSummary::default(),
+            cio_observations: VecDeque::new(),
             sio_timeout_pending: false,
             redirect_disk_boot_to_cart: false,
         }
@@ -2245,6 +2313,14 @@ impl Bus {
 
     pub fn events(&self) -> &[BusEvent] {
         &self.events
+    }
+
+    pub fn cio_summary(&self) -> &CioSummary {
+        &self.cio_summary
+    }
+
+    pub fn cio_observations(&self) -> &VecDeque<CioObservation> {
+        &self.cio_observations
     }
 
     pub fn clear_events(&mut self) {
@@ -2815,7 +2891,7 @@ impl Bus {
         self.read(address)
     }
 
-    fn read_host_character(&mut self, x: u8) -> Option<(u8, u8)> {
+    fn read_host_character(&mut self, x: u8) -> Option<CioReadResult> {
         let channel = cio_channel_index(x)?;
         let Some(CioHarnessDevice::Host { file_index, offset }) = self.cio_harness_devices[channel]
         else {
@@ -2836,12 +2912,23 @@ impl Bus {
                 file_index,
                 offset: next_offset,
             });
-            return Some((host_source_byte_to_atascii(byte), 0x01));
+            let output = host_source_byte_to_atascii(byte);
+            return Some(CioReadResult {
+                accumulator: output,
+                status: 0x01,
+                bytes_read: 1,
+                detail: format!("read host char ${output:02X}"),
+            });
         }
-        Some((0x88, 0x88))
+        Some(CioReadResult {
+            accumulator: 0x88,
+            status: 0x88,
+            bytes_read: 0,
+            detail: "read host char EOF".to_string(),
+        })
     }
 
-    fn read_host_record(&mut self, x: u8) -> Option<(u8, u8)> {
+    fn read_host_record(&mut self, x: u8) -> Option<CioReadResult> {
         let channel = cio_channel_index(x)?;
         let Some(CioHarnessDevice::Host { file_index, offset }) = self.cio_harness_devices[channel]
         else {
@@ -2856,7 +2943,12 @@ impl Bus {
         if requested == 0 || offset >= file.bytes.len() {
             self.ram
                 .write_word(IOCB_LENGTH_BASE.wrapping_add(x as u16), 0);
-            return Some((0x88, 0x88));
+            return Some(CioReadResult {
+                accumulator: 0x88,
+                status: 0x88,
+                bytes_read: 0,
+                detail: "read host record EOF".to_string(),
+            });
         }
 
         let mut next_offset = offset;
@@ -2880,7 +2972,12 @@ impl Bus {
         if written == 0 {
             self.ram
                 .write_word(IOCB_LENGTH_BASE.wrapping_add(x as u16), 0);
-            return Some((0x88, 0x88));
+            return Some(CioReadResult {
+                accumulator: 0x88,
+                status: 0x88,
+                bytes_read: 0,
+                detail: "read host record EOF".to_string(),
+            });
         }
 
         if !wrote_eol && written < requested {
@@ -2894,10 +2991,15 @@ impl Bus {
             file_index,
             offset: next_offset,
         });
-        Some((0, 0x01))
+        Some(CioReadResult {
+            accumulator: 0,
+            status: 0x01,
+            bytes_read: written as usize,
+            detail: format!("read host record {written} byte(s)"),
+        })
     }
 
-    fn write_host_bytes_for_iocb(&mut self, x: u8, accumulator: u8) -> Option<()> {
+    fn write_host_bytes_for_iocb(&mut self, x: u8, accumulator: u8) -> Option<usize> {
         let channel = cio_channel_index(x)?;
         let Some(CioHarnessDevice::Host { file_index, offset }) = self.cio_harness_devices[channel]
         else {
@@ -2918,7 +3020,7 @@ impl Bus {
             bytes.len(),
             self.host_files[file_index].name
         ));
-        Some(())
+        Some(bytes.len())
     }
 
     fn cio_output_bytes_for_iocb(&self, x: u8, accumulator: u8) -> Vec<u8> {
@@ -2957,24 +3059,104 @@ impl Bus {
         }
     }
 
-    fn trace_cio_call(&self, x: u8, command: u8, return_pc: u16) {
-        if !self.trace_cio {
-            return;
-        }
+    fn start_cio_observation(&self, x: u8, command: u8, return_pc: u16) -> CioObservation {
         let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(x as u16));
         let length = self.ram.read_word(IOCB_LENGTH_BASE.wrapping_add(x as u16));
         let aux1 = self.ram.read(IOCB_AUX1_BASE.wrapping_add(x as u16));
         let aux2 = self.ram.read(IOCB_AUX2_BASE.wrapping_add(x as u16));
+        CioObservation {
+            x,
+            channel: cio_channel_index(x).map(|channel| channel as u8),
+            command,
+            return_pc,
+            aux1,
+            aux2,
+            buffer,
+            length,
+            device_before: self
+                .cio_channel_device(x)
+                .map(|device| self.describe_cio_device(device)),
+            handled: false,
+            detail: String::new(),
+            result_a: None,
+            result_y: None,
+            bytes_read: None,
+            bytes_written: None,
+        }
+    }
+
+    fn finish_cio_observation(&mut self, observation: CioObservation) {
+        self.cio_summary.calls = self.cio_summary.calls.saturating_add(1);
+        if observation.handled {
+            self.cio_summary.handled = self.cio_summary.handled.saturating_add(1);
+        } else {
+            self.cio_summary.passthrough = self.cio_summary.passthrough.saturating_add(1);
+        }
+        match observation.command {
+            CIO_COMMAND_OPEN => self.cio_summary.opens = self.cio_summary.opens.saturating_add(1),
+            CIO_COMMAND_CLOSE => {
+                self.cio_summary.closes = self.cio_summary.closes.saturating_add(1)
+            }
+            CIO_COMMAND_STATUS => {
+                self.cio_summary.statuses = self.cio_summary.statuses.saturating_add(1)
+            }
+            CIO_COMMAND_GETREC | CIO_COMMAND_GETCHR => {
+                self.cio_summary.reads = self.cio_summary.reads.saturating_add(1);
+                self.cio_summary.bytes_read = self
+                    .cio_summary
+                    .bytes_read
+                    .saturating_add(observation.bytes_read.unwrap_or(0) as u64);
+                if matches!(observation.result_y, Some(0x88)) {
+                    self.cio_summary.eof = self.cio_summary.eof.saturating_add(1);
+                }
+            }
+            CIO_COMMAND_PUTREC | CIO_COMMAND_PUTCHR => {
+                self.cio_summary.writes = self.cio_summary.writes.saturating_add(1);
+                self.cio_summary.bytes_written = self
+                    .cio_summary
+                    .bytes_written
+                    .saturating_add(observation.bytes_written.unwrap_or(0) as u64);
+            }
+            _ => {}
+        }
+        if self.cio_observations.len() == CIO_OBSERVATION_LIMIT {
+            self.cio_observations.pop_front();
+        }
+        self.cio_observations.push_back(observation);
+    }
+
+    fn trace_cio_call(&self, observation: &CioObservation) {
+        if !self.trace_cio {
+            return;
+        }
         eprintln!(
-            "CIO x=${x:02X} ch={} cmd=${command:02X} ret=${return_pc:04X} aux=${aux1:02X}/${aux2:02X} buf=${buffer:04X} len={length} dev={:?}",
-            cio_channel_index(x).map_or(0xFF, |channel| channel as u8),
-            self.cio_channel_device(x)
+            "CIO x=${:02X} ch={} cmd=${:02X} ret=${:04X} aux=${:02X}/${:02X} buf=${:04X} len={} dev={}",
+            observation.x,
+            observation.channel.unwrap_or(0xFF),
+            observation.command,
+            observation.return_pc,
+            observation.aux1,
+            observation.aux2,
+            observation.buffer,
+            observation.length,
+            observation.device_before.as_deref().unwrap_or("-")
         );
     }
 
     fn trace_cio(&self, args: std::fmt::Arguments<'_>) {
         if self.trace_cio {
             eprintln!("{args}");
+        }
+    }
+
+    fn describe_cio_device(&self, device: CioHarnessDevice) -> String {
+        match device {
+            CioHarnessDevice::QueuedInput => "Q:".to_string(),
+            CioHarnessDevice::Host { file_index, offset } => self
+                .host_files
+                .get(file_index)
+                .map(|file| format!("{}@{offset}", file.name))
+                .unwrap_or_else(|| format!("#{file_index}@{offset}")),
         }
     }
 
@@ -3170,6 +3352,14 @@ enum CioHarnessDevice {
     Host { file_index: usize, offset: usize },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CioReadResult {
+    accumulator: u8,
+    status: u8,
+    bytes_read: usize,
+    detail: String,
+}
+
 fn normalize_host_file_name(name: &str) -> String {
     let trimmed = name.trim();
     let without_device = trimmed
@@ -3267,6 +3457,40 @@ pub struct BusEvent {
     pub address: u16,
     pub value: u8,
     pub region: BusRegion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CioSummary {
+    pub calls: u64,
+    pub handled: u64,
+    pub passthrough: u64,
+    pub opens: u64,
+    pub closes: u64,
+    pub statuses: u64,
+    pub reads: u64,
+    pub writes: u64,
+    pub eof: u64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CioObservation {
+    pub x: u8,
+    pub channel: Option<u8>,
+    pub command: u8,
+    pub return_pc: u16,
+    pub aux1: u8,
+    pub aux2: u8,
+    pub buffer: u16,
+    pub length: u16,
+    pub device_before: Option<String>,
+    pub handled: bool,
+    pub detail: String,
+    pub result_a: Option<u8>,
+    pub result_y: Option<u8>,
+    pub bytes_read: Option<u16>,
+    pub bytes_written: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
