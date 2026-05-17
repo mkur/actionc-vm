@@ -12,6 +12,9 @@ pub const SELF_TEST_SIZE: usize = 0x0800;
 pub const BOOTQ_SUCCESSFUL_BOOT_FLAG: u16 = 0x0009;
 pub const DOSVEC_START_VECTOR: u16 = 0x000A;
 pub const PORTB: u16 = 0xD301;
+pub const PACTL_PORTA_CONTROL: u16 = 0xD302;
+pub const PBCTL_PORTB_CONTROL: u16 = 0xD303;
+pub const PIA_DDR_ACCESS_DISABLE: u8 = 0x04;
 pub const PORTB_SELF_TEST_DISABLE: u8 = 0x80;
 pub const ANTIC_VCOUNT: u16 = 0xD40B;
 pub const RTCLOK_LOW: u16 = 0x0014;
@@ -2252,6 +2255,7 @@ pub struct Bus {
     cio_observations: VecDeque<CioObservation>,
     sio_timeout_pending: bool,
     redirect_disk_boot_to_cart: bool,
+    self_test_rom_enabled: bool,
 }
 
 impl Default for Bus {
@@ -2276,6 +2280,7 @@ impl Default for Bus {
             cio_observations: VecDeque::new(),
             sio_timeout_pending: false,
             redirect_disk_boot_to_cart: false,
+            self_test_rom_enabled: true,
         }
     }
 }
@@ -2737,6 +2742,8 @@ impl Bus {
         };
 
         self.apply_headless_memory_defaults();
+        self.io.disable_self_test_rom();
+        self.self_test_rom_enabled = false;
         let [lo, hi] = target.to_le_bytes();
         self.ram.write(BOOTQ_SUCCESSFUL_BOOT_FLAG, 0x01);
         self.ram.write(DOSVEC_START_VECTOR, lo);
@@ -3215,6 +3222,9 @@ impl Bus {
     }
 
     fn read_self_test(&self, address: u16) -> Option<u8> {
+        if !self.self_test_rom_enabled {
+            return None;
+        }
         if !AddressRange::with_size(SELF_TEST_BASE, SELF_TEST_SIZE)
             .expect("valid self-test range")
             .contains(address)
@@ -3575,6 +3585,9 @@ pub struct RomRegion {
 pub struct IoRegion {
     range: AddressRange,
     bytes: Vec<u8>,
+    portb_data: u8,
+    portb_ddr: u8,
+    portb_control: u8,
     console_switches: u8,
     speaker_write_count: u64,
     last_speaker_write: Option<u8>,
@@ -3585,6 +3598,9 @@ impl Default for IoRegion {
         Self {
             range: AddressRange::with_size(IO_BASE, IO_SIZE).expect("valid I/O range"),
             bytes: vec![0xFF; IO_SIZE],
+            portb_data: 0xFF,
+            portb_ddr: 0xFF,
+            portb_control: 0xFF,
             console_switches: CONSOL_NO_KEYS,
             speaker_write_count: 0,
             last_speaker_write: None,
@@ -3604,6 +3620,15 @@ impl IoRegion {
         if address == CONSOL {
             return Some(self.console_switches);
         }
+        if address == PORTB {
+            if self.portb_control & PIA_DDR_ACCESS_DISABLE != 0 {
+                return Some(self.portb_effective());
+            }
+            return Some(self.portb_ddr);
+        }
+        if address == PBCTL_PORTB_CONTROL {
+            return Some(self.portb_control);
+        }
         Some(self.bytes[(address - self.range.start) as usize])
     }
 
@@ -3616,12 +3641,36 @@ impl IoRegion {
             self.last_speaker_write = Some(value);
             return true;
         }
+        if address == PORTB {
+            if self.portb_control & PIA_DDR_ACCESS_DISABLE != 0 {
+                self.portb_data = value;
+            } else {
+                self.portb_ddr = value;
+            }
+            self.bytes[(address - self.range.start) as usize] = value;
+            return true;
+        }
+        if address == PBCTL_PORTB_CONTROL {
+            self.portb_control = value;
+            self.bytes[(address - self.range.start) as usize] = value;
+            return true;
+        }
         self.bytes[(address - self.range.start) as usize] = value;
         true
     }
 
     pub fn portb(&self) -> u8 {
-        self.read(PORTB).expect("PORTB is inside I/O range")
+        self.portb_effective()
+    }
+
+    fn disable_self_test_rom(&mut self) {
+        self.portb_data |= PORTB_SELF_TEST_DISABLE;
+        self.portb_ddr |= PORTB_SELF_TEST_DISABLE;
+        self.bytes[(PORTB - self.range.start) as usize] = self.portb_effective();
+    }
+
+    fn portb_effective(&self) -> u8 {
+        self.portb_data | !self.portb_ddr
     }
 
     pub fn speaker_write_count(&self) -> u64 {
@@ -4391,6 +4440,31 @@ mod tests {
         assert_eq!(bus.read(0x5001), 0x09);
         assert_eq!(bus.read(0x5002), 0x50);
         assert_eq!(bus.read(0xD000), 0xFF);
+    }
+
+    #[test]
+    fn portb_ddr_writes_do_not_change_memory_management_latch() {
+        let mut bus = Bus::default();
+        let mut os_rom = vec![0xAA; 0x4000];
+        os_rom[0x1000] = 0x4C;
+        bus.map_os_rom(0xC000, os_rom).unwrap();
+
+        bus.write(PBCTL_PORTB_CONTROL, 0xFB);
+        bus.write(PORTB, 0x7D);
+        assert_eq!(bus.read(PORTB), 0x7D);
+        assert_eq!(bus.io().portb(), 0xFF);
+        assert_eq!(bus.visible_region(0x5000), BusRegion::Ram);
+        assert_eq!(bus.read(0x5000), 0x00);
+
+        bus.write(PBCTL_PORTB_CONTROL, 0xFF);
+        assert_eq!(bus.read(PORTB), 0xFF);
+        bus.write(PBCTL_PORTB_CONTROL, 0xFB);
+        bus.write(PORTB, 0xFF);
+        bus.write(PBCTL_PORTB_CONTROL, 0xFF);
+        bus.write(PORTB, 0x7D);
+        assert_eq!(bus.io().portb(), 0x7D);
+        assert_eq!(bus.visible_region(0x5000), BusRegion::SelfTestRom);
+        assert_eq!(bus.read(0x5000), 0x4C);
     }
 
     #[test]
