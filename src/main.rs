@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use action_compiler_vm::{
     ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ACTION_SEGMENT_END_VECTOR, ATARI_KEY_C, ATARI_KEY_E,
     ATARI_KEY_RETURN, ActionEditorLine, ActionSourceInjectionReport, ActionSymbolEntry,
-    AddressRange, BusAccess, BusEvent, CioObservation, CioSummary, CpuError, CpuRegisters, CpuStep,
-    Hotpatch, ImageKind, TextScreenSnapshot, VmConfig, action_current_proc_name,
-    decode_action_symbol_tables, format_action_symbol_dump_json,
+    AddressRange, BusAccess, BusEvent, BusRegion, CioObservation, CioSummary, CpuError,
+    CpuRegisters, CpuStep, Hotpatch, ImageKind, TextScreenSnapshot, VmConfig,
+    action_current_proc_name, decode_action_symbol_tables, format_action_symbol_dump_json,
 };
 
 fn main() {
@@ -101,6 +101,8 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     let mut screen_dump_pcs = options.screen_dump_pcs.clone();
     let mut symbol_snapshots = Vec::new();
     let mut action_fixup_trace = ActionFixupTrace::new(options.trace_action_fixups);
+    let mut action_code_pointer_trace =
+        ActionCodePointerTrace::new(options.trace_action_code_pointer, vm.bus());
     println!(
         "compiler VM loaded {} image(s); reset PC=${:04X}",
         vm.images().len(),
@@ -206,6 +208,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 }
                 let reached_trace_until = options.trace_until == Some(step.pc);
                 action_fixup_trace.observe(&step, vm.bus());
+                action_code_pointer_trace.observe(&step, vm.bus());
                 history.push(step);
                 if reached_trace_until {
                     print_stop_report(
@@ -217,6 +220,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                         vm.bus().cio_observations(),
                         vm.bus().cartridge().map(|cart| cart.mapping_info()),
                         &action_fixup_trace,
+                        &action_code_pointer_trace,
                     );
                     print_run_observations(
                         vm.bus(),
@@ -244,6 +248,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     vm.bus().cio_observations(),
                     vm.bus().cartridge().map(|cart| cart.mapping_info()),
                     &action_fixup_trace,
+                    &action_code_pointer_trace,
                 );
                 print_run_observations(
                     vm.bus(),
@@ -270,6 +275,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                     vm.bus().cio_observations(),
                     vm.bus().cartridge().map(|cart| cart.mapping_info()),
                     &action_fixup_trace,
+                    &action_code_pointer_trace,
                 );
                 print_run_observations(
                     vm.bus(),
@@ -298,6 +304,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 vm.bus().cio_observations(),
                 vm.bus().cartridge().map(|cart| cart.mapping_info()),
                 &action_fixup_trace,
+                &action_code_pointer_trace,
             );
             print_run_observations(
                 vm.bus(),
@@ -480,6 +487,7 @@ struct CliOptions {
     capture_final_symbol_snapshot: bool,
     dump_screen_on_stop: bool,
     trace_action_fixups: bool,
+    trace_action_code_pointer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -556,6 +564,7 @@ impl Default for CliOptions {
             capture_final_symbol_snapshot: false,
             dump_screen_on_stop: false,
             trace_action_fixups: false,
+            trace_action_code_pointer: false,
         }
     }
 }
@@ -590,6 +599,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut capture_final_symbol_snapshot = false;
     let mut dump_screen_on_stop = false;
     let mut trace_action_fixups = false;
+    let mut trace_action_code_pointer = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -656,6 +666,9 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
             }
             "--trace-action-fixups" => {
                 trace_action_fixups = true;
+            }
+            "--trace-action-code-pointer" => {
+                trace_action_code_pointer = true;
             }
             "--key-at-pc" => {
                 index += 1;
@@ -814,6 +827,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         capture_final_symbol_snapshot,
         dump_screen_on_stop,
         trace_action_fixups,
+        trace_action_code_pointer,
     })
 }
 
@@ -1426,6 +1440,112 @@ fn read_ram_window(bus: &action_compiler_vm::Bus, start: u16) -> [u8; 5] {
     ]
 }
 
+#[derive(Debug, Clone)]
+struct ActionCodePointerTrace {
+    enabled: bool,
+    last_pointer: u16,
+    last_page: u8,
+    last_region: BusRegion,
+    observations: VecDeque<ActionCodePointerObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct ActionCodePointerObservation {
+    cycle: u64,
+    pc: u16,
+    pointer: u16,
+    codebase: u16,
+    region: BusRegion,
+    portb: u8,
+    reason: &'static str,
+}
+
+impl ActionCodePointerTrace {
+    fn new(enabled: bool, bus: &action_compiler_vm::Bus) -> Self {
+        let pointer = action_code_pointer(bus);
+        let region = bus.visible_region(pointer);
+        let mut trace = Self {
+            enabled,
+            last_pointer: pointer,
+            last_page: (pointer >> 8) as u8,
+            last_region: region,
+            observations: VecDeque::new(),
+        };
+        if enabled {
+            trace.push(0, 0, bus, "initial");
+        }
+        trace
+    }
+
+    fn observe(&mut self, step: &CpuStep, bus: &action_compiler_vm::Bus) {
+        if !self.enabled {
+            return;
+        }
+
+        let pointer = action_code_pointer(bus);
+        let page = (pointer >> 8) as u8;
+        let region = bus.visible_region(pointer);
+        let reason = if crossed_boundary(self.last_pointer, pointer, 0x5000) {
+            Some("crossed $5000")
+        } else if crossed_boundary(self.last_pointer, pointer, 0x5800) {
+            Some("crossed $5800")
+        } else if region != self.last_region {
+            Some("visible region changed")
+        } else if page != self.last_page {
+            Some("page changed")
+        } else {
+            None
+        };
+
+        self.last_pointer = pointer;
+        self.last_page = page;
+        self.last_region = region;
+
+        if let Some(reason) = reason {
+            self.push(step.cycles, step.pc, bus, reason);
+        }
+    }
+
+    fn push(&mut self, cycle: u64, pc: u16, bus: &action_compiler_vm::Bus, reason: &'static str) {
+        self.observations.push_back(ActionCodePointerObservation {
+            cycle,
+            pc,
+            pointer: action_code_pointer(bus),
+            codebase: action_codebase(bus),
+            region: bus.visible_region(action_code_pointer(bus)),
+            portb: bus.io().portb(),
+            reason,
+        });
+        if self.observations.len() > 64 {
+            self.observations.pop_front();
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.observations.is_empty()
+    }
+
+    fn final_pointer(&self) -> u16 {
+        self.last_pointer
+    }
+
+    fn final_region(&self) -> BusRegion {
+        self.last_region
+    }
+}
+
+fn action_code_pointer(bus: &action_compiler_vm::Bus) -> u16 {
+    read_ram_word(bus, 0x000E)
+}
+
+fn action_codebase(bus: &action_compiler_vm::Bus) -> u16 {
+    read_ram_word(bus, 0x0491)
+}
+
+fn crossed_boundary(previous: u16, current: u16, boundary: u16) -> bool {
+    previous < boundary && current >= boundary
+}
+
 fn print_stop_report(
     reason: &str,
     registers: Option<CpuRegisters>,
@@ -1435,6 +1555,7 @@ fn print_stop_report(
     cio_observations: &VecDeque<CioObservation>,
     cartridge: Option<action_compiler_vm::CartridgeMappingInfo>,
     action_fixup_trace: &ActionFixupTrace,
+    action_code_pointer_trace: &ActionCodePointerTrace,
 ) {
     eprintln!("stop: {reason}");
     if let Some(regs) = registers {
@@ -1538,6 +1659,31 @@ fn print_stop_report(
         }
     }
     print_action_fixup_trace(action_fixup_trace);
+    print_action_code_pointer_trace(action_code_pointer_trace);
+}
+
+fn print_action_code_pointer_trace(trace: &ActionCodePointerTrace) {
+    if trace.is_empty() {
+        return;
+    }
+    eprintln!(
+        "Action! code pointer: *=${:04X} visible={:?}",
+        trace.final_pointer(),
+        trace.final_region()
+    );
+    eprintln!("  recent * changes:");
+    for observation in &trace.observations {
+        eprintln!(
+            "  cyc={} pc=${:04X} *=${:04X} codebase=${:04X} visible={:?} PORTB=${:02X} {}",
+            observation.cycle,
+            observation.pc,
+            observation.pointer,
+            observation.codebase,
+            observation.region,
+            observation.portb,
+            observation.reason
+        );
+    }
 }
 
 fn print_action_fixup_trace(trace: &ActionFixupTrace) {
@@ -1622,6 +1768,8 @@ fn print_help() {
          --trace-until <addr> Stop after executing an instruction at addr\n  \
          --trace-action-fixups\n  \
                               Summarize Action! compiler branch-fixup loop activity on stop\n  \
+         --trace-action-code-pointer\n  \
+                              Summarize Action!'s code pointer $0E/$0F and visible memory region\n  \
          --history <n>        Recent instruction count in stop reports, default 64\n  \
          --watch <addr>       Record bus reads/writes at addr\n  \
          --watch-range <a:b>  Record bus reads/writes inside the range\n  \
@@ -1709,6 +1857,13 @@ mod tests {
         let options = parse_options(vec!["--trace-action-fixups".to_string()]).unwrap();
 
         assert!(options.trace_action_fixups);
+    }
+
+    #[test]
+    fn parses_action_code_pointer_trace_option() {
+        let options = parse_options(vec!["--trace-action-code-pointer".to_string()]).unwrap();
+
+        assert!(options.trace_action_code_pointer);
     }
 
     #[test]

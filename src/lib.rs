@@ -2650,6 +2650,28 @@ impl Bus {
         value
     }
 
+    pub fn visible_region(&self, address: u16) -> BusRegion {
+        if let Some(cartridge) = self.cartridge.as_ref() {
+            if cartridge.read(address).is_some() {
+                return BusRegion::Cartridge;
+            }
+        }
+        if self.io.contains(address) {
+            return BusRegion::Io;
+        }
+        if self.read_self_test(address).is_some() {
+            return BusRegion::SelfTestRom;
+        }
+        if self
+            .os_rom
+            .as_ref()
+            .is_some_and(|os_rom| os_rom.contains(address))
+        {
+            return BusRegion::OsRom;
+        }
+        BusRegion::Ram
+    }
+
     pub fn write(&mut self, address: u16, value: u8) {
         let region = if let Some(cartridge) = self.cartridge.as_mut() {
             if cartridge.write(address, value) {
