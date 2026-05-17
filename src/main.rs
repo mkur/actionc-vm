@@ -1396,9 +1396,16 @@ fn print_stop_report(
                     .result_y
                     .map(|value| format!("${value:02X}"))
                     .unwrap_or_else(|| "--".to_string()),
-                observation.detail
+                format_cio_detail(observation)
             );
         }
+    }
+}
+
+fn format_cio_detail(observation: &CioObservation) -> String {
+    match observation.preview.as_deref() {
+        Some(preview) => format!("{} read=\"{}\"", observation.detail, preview),
+        None => observation.detail.clone(),
     }
 }
 

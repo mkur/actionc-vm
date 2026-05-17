@@ -73,6 +73,7 @@ pub const CIO_COMMAND_PUTCHR: u8 = 0x0B;
 pub const CIO_COMMAND_CLOSE: u8 = 0x0C;
 pub const CIO_COMMAND_STATUS: u8 = 0x0D;
 pub const CIO_OBSERVATION_LIMIT: usize = 128;
+pub const CIO_READ_PREVIEW_LIMIT: usize = 80;
 pub const CARTCS_COLDSTART_VECTOR: u16 = 0xBFFA;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
@@ -1910,6 +1911,7 @@ impl Cpu {
                             observation.result_a = Some(character);
                             observation.result_y = Some(0x01);
                             observation.bytes_read = Some(1);
+                            observation.preview = Some(format_cio_preview(&[character]));
                             bus.finish_cio_observation(observation);
                             self.return_from_ciov(bus, character, 0x01);
                             return true;
@@ -1927,6 +1929,9 @@ impl Cpu {
                             observation.result_a = Some(result.accumulator);
                             observation.result_y = Some(result.status);
                             observation.bytes_read = Some(result.bytes_read as u16);
+                            if !result.preview.is_empty() {
+                                observation.preview = Some(result.preview);
+                            }
                             bus.finish_cio_observation(observation);
                             let accumulator = result.accumulator;
                             let status = result.status;
@@ -1955,6 +1960,7 @@ impl Cpu {
                 observation.result_a = Some(character);
                 observation.result_y = Some(0x01);
                 observation.bytes_read = Some(1);
+                observation.preview = Some(format_cio_preview(&[character]));
                 bus.finish_cio_observation(observation);
                 self.return_from_ciov(bus, character, 0x01);
                 true
@@ -2918,6 +2924,7 @@ impl Bus {
                 status: 0x01,
                 bytes_read: 1,
                 detail: format!("read host char ${output:02X}"),
+                preview: format_cio_preview(&[output]),
             });
         }
         Some(CioReadResult {
@@ -2925,6 +2932,7 @@ impl Bus {
             status: 0x88,
             bytes_read: 0,
             detail: "read host char EOF".to_string(),
+            preview: String::new(),
         })
     }
 
@@ -2948,12 +2956,14 @@ impl Bus {
                 status: 0x88,
                 bytes_read: 0,
                 detail: "read host record EOF".to_string(),
+                preview: String::new(),
             });
         }
 
         let mut next_offset = offset;
         let mut written = 0u16;
         let mut wrote_eol = false;
+        let mut preview = Vec::new();
         while written < requested && next_offset < file.bytes.len() {
             let byte = file.bytes[next_offset];
             next_offset += 1;
@@ -2962,6 +2972,9 @@ impl Bus {
             }
             let output = host_source_byte_to_atascii(byte);
             self.ram.write(buffer.wrapping_add(written), output);
+            if preview.len() < CIO_READ_PREVIEW_LIMIT {
+                preview.push(output);
+            }
             written = written.wrapping_add(1);
             if output == 0x9B {
                 wrote_eol = true;
@@ -2977,11 +2990,15 @@ impl Bus {
                 status: 0x88,
                 bytes_read: 0,
                 detail: "read host record EOF".to_string(),
+                preview: String::new(),
             });
         }
 
         if !wrote_eol && written < requested {
             self.ram.write(buffer.wrapping_add(written), 0x9B);
+            if preview.len() < CIO_READ_PREVIEW_LIMIT {
+                preview.push(0x9B);
+            }
             written = written.wrapping_add(1);
         }
 
@@ -2996,6 +3013,7 @@ impl Bus {
             status: 0x01,
             bytes_read: written as usize,
             detail: format!("read host record {written} byte(s)"),
+            preview: format_cio_preview(&preview),
         })
     }
 
@@ -3082,6 +3100,7 @@ impl Bus {
             result_y: None,
             bytes_read: None,
             bytes_written: None,
+            preview: None,
         }
     }
 
@@ -3358,6 +3377,7 @@ struct CioReadResult {
     status: u8,
     bytes_read: usize,
     detail: String,
+    preview: String,
 }
 
 fn normalize_host_file_name(name: &str) -> String {
@@ -3376,6 +3396,20 @@ fn host_source_byte_to_atascii(byte: u8) -> u8 {
         b'\n' => 0x9B,
         _ => byte,
     }
+}
+
+fn format_cio_preview(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    for byte in bytes {
+        match *byte {
+            0x9B => output.push_str("\\n"),
+            b'\\' => output.push_str("\\\\"),
+            b'"' => output.push_str("\\\""),
+            0x20..=0x7E => output.push(*byte as char),
+            value => output.push_str(&format!("\\x{value:02X}")),
+        }
+    }
+    output
 }
 
 fn atari_debug_char(byte: u8) -> char {
@@ -3491,6 +3525,7 @@ pub struct CioObservation {
     pub result_y: Option<u8>,
     pub bytes_read: Option<u16>,
     pub bytes_written: Option<u16>,
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
