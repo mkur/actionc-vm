@@ -784,6 +784,19 @@ impl Cpu {
         let opcode = self.fetch_byte(bus);
 
         match opcode {
+            0x00 => {
+                self.fetch_byte(bus);
+                let return_address = self.registers.pc;
+                self.push(bus, (return_address >> 8) as u8);
+                self.push(bus, return_address as u8);
+                self.push(
+                    bus,
+                    self.registers.status | StatusFlags::UNUSED.bits() | 0x10,
+                );
+                self.set_flag(StatusFlags::INTERRUPT_DISABLE, true);
+                self.registers.pc = self.read_word(bus, 0xFFFE);
+                self.cycles += 7;
+            }
             0x01 => {
                 let zp = self.fetch_byte(bus);
                 let address = self.indexed_indirect(bus, zp);
@@ -863,6 +876,16 @@ impl Cpu {
                 self.set_zn(self.registers.a);
                 self.cycles += 4;
             }
+            0x16 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                self.set_flag(StatusFlags::CARRY, value & 0x80 != 0);
+                let result = value << 1;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 6;
+            }
             0x18 => {
                 self.set_flag(StatusFlags::CARRY, false);
                 self.cycles += 2;
@@ -883,6 +906,16 @@ impl Cpu {
                 self.set_zn(self.registers.a);
                 self.cycles += 4;
             }
+            0x1E => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address);
+                self.set_flag(StatusFlags::CARRY, value & 0x80 != 0);
+                let result = value << 1;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 7;
+            }
             0x20 => {
                 let target = self.fetch_word(bus);
                 let return_address = self.registers.pc.wrapping_sub(1);
@@ -890,6 +923,22 @@ impl Cpu {
                 self.push(bus, return_address as u8);
                 self.registers.pc = target;
                 self.cycles += 6;
+            }
+            0x21 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indexed_indirect(bus, zp);
+                let value = bus.read(address);
+                self.registers.a &= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 6;
+            }
+            0x24 => {
+                let address = self.fetch_byte(bus) as u16;
+                let value = bus.read(address);
+                self.set_flag(StatusFlags::ZERO, self.registers.a & value == 0);
+                self.set_flag(StatusFlags::NEGATIVE, value & 0x80 != 0);
+                self.set_flag(StatusFlags::OVERFLOW, value & 0x40 != 0);
+                self.cycles += 3;
             }
             0x26 => {
                 let address = self.fetch_byte(bus) as u16;
@@ -973,9 +1022,25 @@ impl Cpu {
                 self.set_zn(self.registers.a);
                 self.cycles += 5;
             }
+            0x35 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                self.registers.a &= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
+            }
             0x38 => {
                 self.set_flag(StatusFlags::CARRY, true);
                 self.cycles += 2;
+            }
+            0x39 => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.y as u16);
+                let value = bus.read(address);
+                self.registers.a &= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
             }
             0x3D => {
                 let base = self.fetch_word(bus);
@@ -984,6 +1049,32 @@ impl Cpu {
                 self.registers.a &= value;
                 self.set_zn(self.registers.a);
                 self.cycles += 4;
+            }
+            0x3E => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address);
+                let carry_in = u8::from(self.flag(StatusFlags::CARRY));
+                self.set_flag(StatusFlags::CARRY, value & 0x80 != 0);
+                let result = (value << 1) | carry_in;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 7;
+            }
+            0x40 => {
+                self.registers.status = self.pop(bus) | StatusFlags::UNUSED.bits();
+                let lo = self.pop(bus);
+                let hi = self.pop(bus);
+                self.registers.pc = u16::from_le_bytes([lo, hi]);
+                self.cycles += 6;
+            }
+            0x41 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indexed_indirect(bus, zp);
+                let value = bus.read(address);
+                self.registers.a ^= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 6;
             }
             0x45 => {
                 let address = self.fetch_byte(bus) as u16;
@@ -1039,6 +1130,9 @@ impl Cpu {
                 self.set_zn(result);
                 self.cycles += 6;
             }
+            0x50 => {
+                self.branch(bus, !self.flag(StatusFlags::OVERFLOW), 2, 3);
+            }
             0x51 => {
                 let zp = self.fetch_byte(bus);
                 let address = self.indirect_y(bus, zp);
@@ -1047,14 +1141,65 @@ impl Cpu {
                 self.set_zn(self.registers.a);
                 self.cycles += 5;
             }
+            0x55 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                self.registers.a ^= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
+            }
+            0x56 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                self.set_flag(StatusFlags::CARRY, value & 0x01 != 0);
+                let result = value >> 1;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 6;
+            }
             0x58 => {
                 self.set_flag(StatusFlags::INTERRUPT_DISABLE, false);
                 self.cycles += 2;
+            }
+            0x59 => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.y as u16);
+                let value = bus.read(address);
+                self.registers.a ^= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
+            }
+            0x5D => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address);
+                self.registers.a ^= value;
+                self.set_zn(self.registers.a);
+                self.cycles += 4;
+            }
+            0x5E => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.x as u16);
+                let value = bus.read(address);
+                self.set_flag(StatusFlags::CARRY, value & 0x01 != 0);
+                let result = value >> 1;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 7;
             }
             0x60 => {
                 let lo = self.pop(bus);
                 let hi = self.pop(bus);
                 self.registers.pc = u16::from_le_bytes([lo, hi]).wrapping_add(1);
+                self.cycles += 6;
+            }
+            0x61 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indexed_indirect(bus, zp);
+                let value = bus.read(address);
+                self.adc(value);
                 self.cycles += 6;
             }
             0x65 => {
@@ -1132,6 +1277,9 @@ impl Cpu {
                 self.adc(value);
                 self.cycles += 5;
             }
+            0x70 => {
+                self.branch(bus, self.flag(StatusFlags::OVERFLOW), 2, 3);
+            }
             0x75 => {
                 let base = self.fetch_byte(bus);
                 let address = base.wrapping_add(self.registers.x) as u16;
@@ -1139,9 +1287,31 @@ impl Cpu {
                 self.adc(value);
                 self.cycles += 4;
             }
+            0x76 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                let carry_in = if self.flag(StatusFlags::CARRY) {
+                    0x80
+                } else {
+                    0x00
+                };
+                self.set_flag(StatusFlags::CARRY, value & 0x01 != 0);
+                let result = (value >> 1) | carry_in;
+                bus.write(address, result);
+                self.set_zn(result);
+                self.cycles += 6;
+            }
             0x78 => {
                 self.set_flag(StatusFlags::INTERRUPT_DISABLE, true);
                 self.cycles += 2;
+            }
+            0x79 => {
+                let base = self.fetch_word(bus);
+                let address = base.wrapping_add(self.registers.y as u16);
+                let value = bus.read(address);
+                self.adc(value);
+                self.cycles += 4;
             }
             0x7D => {
                 let base = self.fetch_word(bus);
@@ -1164,6 +1334,12 @@ impl Cpu {
                 bus.write(address, result);
                 self.set_zn(result);
                 self.cycles += 7;
+            }
+            0x81 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indexed_indirect(bus, zp);
+                bus.write(address, self.registers.a);
+                self.cycles += 6;
             }
             0x84 => {
                 let address = self.fetch_byte(bus) as u16;
@@ -1214,10 +1390,22 @@ impl Cpu {
                 bus.write(address, self.registers.a);
                 self.cycles += 6;
             }
+            0x94 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                bus.write(address, self.registers.y);
+                self.cycles += 4;
+            }
             0x95 => {
                 let base = self.fetch_byte(bus);
                 let address = base.wrapping_add(self.registers.x) as u16;
                 bus.write(address, self.registers.a);
+                self.cycles += 4;
+            }
+            0x96 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.y) as u16;
+                bus.write(address, self.registers.x);
                 self.cycles += 4;
             }
             0x98 => {
@@ -1246,6 +1434,14 @@ impl Cpu {
                 self.registers.y = value;
                 self.set_zn(value);
                 self.cycles += 2;
+            }
+            0xA1 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indexed_indirect(bus, zp);
+                let value = bus.read(address);
+                self.registers.a = value;
+                self.set_zn(value);
+                self.cycles += 6;
             }
             0xA2 => {
                 let value = self.fetch_byte(bus);
@@ -1326,11 +1522,27 @@ impl Cpu {
                 self.set_zn(value);
                 self.cycles += 5;
             }
+            0xB4 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                self.registers.y = value;
+                self.set_zn(value);
+                self.cycles += 4;
+            }
             0xB5 => {
                 let base = self.fetch_byte(bus);
                 let address = base.wrapping_add(self.registers.x) as u16;
                 let value = bus.read(address);
                 self.registers.a = value;
+                self.set_zn(value);
+                self.cycles += 4;
+            }
+            0xB6 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.y) as u16;
+                let value = bus.read(address);
+                self.registers.x = value;
                 self.set_zn(value);
                 self.cycles += 4;
             }
@@ -1375,6 +1587,13 @@ impl Cpu {
                 let value = self.fetch_byte(bus);
                 self.compare(self.registers.y, value);
                 self.cycles += 2;
+            }
+            0xC1 => {
+                let zp = self.fetch_byte(bus);
+                let address = self.indexed_indirect(bus, zp);
+                let value = bus.read(address);
+                self.compare(self.registers.a, value);
+                self.cycles += 6;
             }
             0xC4 => {
                 let address = self.fetch_byte(bus) as u16;
@@ -1438,6 +1657,21 @@ impl Cpu {
                 let value = bus.read(address);
                 self.compare(self.registers.a, value);
                 self.cycles += 5;
+            }
+            0xD5 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address);
+                self.compare(self.registers.a, value);
+                self.cycles += 4;
+            }
+            0xD6 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address).wrapping_sub(1);
+                bus.write(address, value);
+                self.set_zn(value);
+                self.cycles += 6;
             }
             0xD8 => {
                 self.set_flag(StatusFlags::DECIMAL, false);
@@ -1509,6 +1743,12 @@ impl Cpu {
             0xEA => {
                 self.cycles += 2;
             }
+            0xEC => {
+                let address = self.fetch_word(bus);
+                let value = bus.read(address);
+                self.compare(self.registers.x, value);
+                self.cycles += 4;
+            }
             0xED => {
                 let address = self.fetch_word(bus);
                 let value = bus.read(address);
@@ -1538,6 +1778,14 @@ impl Cpu {
                 let value = bus.read(address);
                 self.sbc(value);
                 self.cycles += 4;
+            }
+            0xF6 => {
+                let base = self.fetch_byte(bus);
+                let address = base.wrapping_add(self.registers.x) as u16;
+                let value = bus.read(address).wrapping_add(1);
+                bus.write(address, value);
+                self.set_zn(value);
+                self.cycles += 6;
             }
             0xF8 => {
                 self.set_flag(StatusFlags::DECIMAL, true);
@@ -5516,6 +5764,77 @@ mod tests {
             }
         );
         assert!(cpu.halted());
+    }
+
+    #[test]
+    fn cpu_decodes_all_legal_nmos_6502_opcodes() {
+        const LEGAL_NMOS_6502_OPCODES: &[u8] = &[
+            0x00, 0x01, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0D, 0x0E, 0x10, 0x11, 0x15, 0x16, 0x18,
+            0x19, 0x1D, 0x1E, 0x20, 0x21, 0x24, 0x25, 0x26, 0x28, 0x29, 0x2A, 0x2C, 0x2D, 0x2E,
+            0x30, 0x31, 0x35, 0x36, 0x38, 0x39, 0x3D, 0x3E, 0x40, 0x41, 0x45, 0x46, 0x48, 0x49,
+            0x4A, 0x4C, 0x4D, 0x4E, 0x50, 0x51, 0x55, 0x56, 0x58, 0x59, 0x5D, 0x5E, 0x60, 0x61,
+            0x65, 0x66, 0x68, 0x69, 0x6A, 0x6C, 0x6D, 0x6E, 0x70, 0x71, 0x75, 0x76, 0x78, 0x79,
+            0x7D, 0x7E, 0x81, 0x84, 0x85, 0x86, 0x88, 0x8A, 0x8C, 0x8D, 0x8E, 0x90, 0x91, 0x94,
+            0x95, 0x96, 0x98, 0x99, 0x9A, 0x9D, 0xA0, 0xA1, 0xA2, 0xA4, 0xA5, 0xA6, 0xA8, 0xA9,
+            0xAA, 0xAC, 0xAD, 0xAE, 0xB0, 0xB1, 0xB4, 0xB5, 0xB6, 0xB8, 0xB9, 0xBA, 0xBC, 0xBD,
+            0xBE, 0xC0, 0xC1, 0xC4, 0xC5, 0xC6, 0xC8, 0xC9, 0xCA, 0xCC, 0xCD, 0xCE, 0xD0, 0xD1,
+            0xD5, 0xD6, 0xD8, 0xD9, 0xDD, 0xDE, 0xE0, 0xE1, 0xE4, 0xE5, 0xE6, 0xE8, 0xE9, 0xEA,
+            0xEC, 0xED, 0xEE, 0xF0, 0xF1, 0xF5, 0xF6, 0xF8, 0xF9, 0xFD, 0xFE,
+        ];
+
+        for opcode in LEGAL_NMOS_6502_OPCODES {
+            let mut bus = Bus::default();
+            bus.ram_mut()
+                .map(0x0200, &opcode_probe_program(*opcode))
+                .unwrap();
+            bus.ram_mut().write_word(0x0040, 0x3000);
+            bus.ram_mut().write_word(0x0042, 0x3000);
+            bus.ram_mut().write_word(0x0340, 0x3000);
+            bus.ram_mut().write(0x3000, 0x42);
+            bus.ram_mut().write(0x3003, 0x42);
+            bus.ram_mut().write(0xFFFE, 0x34);
+            bus.ram_mut().write(0xFFFF, 0x12);
+            bus.ram_mut().write(0x01FE, 0x20);
+            bus.ram_mut().write(0x01FF, 0x78);
+            bus.ram_mut().write(0x0100, 0x56);
+
+            let mut cpu = Cpu::default();
+            cpu.registers.pc = 0x0200;
+            cpu.registers.sp = 0xFD;
+            cpu.registers.a = 0x55;
+            cpu.registers.x = 0x02;
+            cpu.registers.y = 0x03;
+
+            let result = cpu.step(&mut bus);
+
+            assert!(
+                !matches!(result, Err(CpuError::UnsupportedOpcode { .. })),
+                "legal opcode ${opcode:02X} should decode"
+            );
+        }
+    }
+
+    fn opcode_probe_program(opcode: u8) -> Vec<u8> {
+        let operand_len = match opcode {
+            0x0A | 0x18 | 0x28 | 0x2A | 0x38 | 0x40 | 0x48 | 0x4A | 0x58 | 0x60 | 0x68 | 0x6A
+            | 0x78 | 0x88 | 0x8A | 0x98 | 0x9A | 0xA8 | 0xAA | 0xB8 | 0xBA | 0xC8 | 0xCA | 0xD8
+            | 0xE8 | 0xEA | 0xF8 => 0,
+            0x0D | 0x0E | 0x19 | 0x1D | 0x1E | 0x20 | 0x2C | 0x2D | 0x2E | 0x39 | 0x3D | 0x3E
+            | 0x4C | 0x4D | 0x4E | 0x59 | 0x5D | 0x5E | 0x6C | 0x6D | 0x6E | 0x79 | 0x7D | 0x7E
+            | 0x8C | 0x8D | 0x8E | 0x99 | 0x9D | 0xAC | 0xAD | 0xAE | 0xB9 | 0xBC | 0xBD | 0xBE
+            | 0xCC | 0xCD | 0xCE | 0xD9 | 0xDD | 0xDE | 0xEC | 0xED | 0xEE | 0xF9 | 0xFD | 0xFE => {
+                2
+            }
+            _ => 1,
+        };
+        let mut program = vec![opcode];
+        match operand_len {
+            0 => {}
+            1 => program.push(0x40),
+            2 => program.extend_from_slice(&[0x40, 0x03]),
+            _ => unreachable!(),
+        }
+        program
     }
 
     #[test]
