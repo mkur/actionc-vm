@@ -19,6 +19,10 @@ argthr
 arith
 array_assign
 array_fixed_origin
+array_inline_boundary
+array_inline_global_threshold
+array_inline_local_threshold
+array_inline_threshold
 array_params
 array_refs
 arrays
@@ -80,6 +84,10 @@ probe_source() {
     arith) echo arith.act ;;
     array_assign) echo array_assign.act ;;
     array_fixed_origin) echo array_fixed_origin.act ;;
+    array_inline_boundary) echo array_inline_boundary.act ;;
+    array_inline_global_threshold) echo array_inline_global_threshold.act ;;
+    array_inline_local_threshold) echo array_inline_local_threshold.act ;;
+    array_inline_threshold) echo array_inline_threshold.act ;;
     array_params) echo array_params.act ;;
     array_refs) echo array_refs.act ;;
     arrays) echo arrays.act ;;
@@ -143,6 +151,10 @@ probe_output() {
     arith) echo ARITH.COM ;;
     array_assign) echo ARRASN.COM ;;
     array_fixed_origin) echo ARRFIX.COM ;;
+    array_inline_boundary) echo ARRTHB.COM ;;
+    array_inline_global_threshold) echo ARRTHG.COM ;;
+    array_inline_local_threshold) echo ARRTHL.COM ;;
+    array_inline_threshold) echo ARRTHR.COM ;;
     array_params) echo ARRPAR.COM ;;
     array_refs) echo ARRREF.COM ;;
     arrays) echo ARRAYS.COM ;;
@@ -195,6 +207,16 @@ probe_output() {
     tn_value_index) echo TNVAL.COM ;;
     ywalk) echo YWALK.COM ;;
     *) return 1 ;;
+  esac
+}
+
+probe_host_source() {
+  case "$1" in
+    array_inline_boundary) echo ARRTHB.ACT ;;
+    array_inline_global_threshold) echo ARRTHG.ACT ;;
+    array_inline_local_threshold) echo ARRTHL.ACT ;;
+    array_inline_threshold) echo ARRTHR.ACT ;;
+    *) probe_source "$1" | tr '[:lower:]' '[:upper:]' ;;
   esac
 }
 
@@ -257,7 +279,7 @@ run_probe() {
   local original_path="$original_dir/$output_name"
   local h_source
   local monitor_input
-  h_source="$(printf '%s' "$source_name" | tr '[:lower:]' '[:upper:]')"
+  h_source="$(probe_host_source "$probe")"
   printf -v monitor_input 'C "H:%s"\nW "H:%s"\n' "$h_source" "$output_name"
 
   require_file "$source_path" "probe source"
