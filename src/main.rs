@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use action_compiler_vm::{
     ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ACTION_SEGMENT_END_VECTOR, ATARI_KEY_C, ATARI_KEY_E,
     ATARI_KEY_RETURN, ActionEditorLine, ActionSourceInjectionReport, ActionSymbolEntry,
-    AddressRange, BusAccess, BusEvent, BusRegion, CioObservation, CioSummary, CpuError,
-    CpuRegisters, CpuStep, Hotpatch, ImageKind, TextScreenSnapshot, VmConfig,
+    AddressRange, AtariLoadReport, BusAccess, BusEvent, BusRegion, CioObservation, CioSummary,
+    CpuError, CpuRegisters, CpuStep, Hotpatch, ImageKind, TextScreenSnapshot, VmConfig,
     action_current_proc_name, decode_action_symbol_tables, format_action_symbol_dump_json,
 };
 
@@ -94,6 +94,33 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         vm.bus_mut().queue_scripted_cio_input_bytes(bytes);
     }
     vm.reset_cpu();
+    if options.load_objects.is_empty() {
+        for poke in &options.pokes {
+            vm.bus_mut().ram_mut().write(poke.address, poke.value);
+        }
+    } else {
+        vm.prepare_headless_program_environment();
+        let mut run_address = None;
+        for path in &options.load_objects {
+            let bytes = fs::read(path)
+                .map_err(|err| format!("failed to read load object `{}`: {err}", path.display()))?;
+            let report = vm.load_atari_object(&bytes).map_err(|err| {
+                format!(
+                    "failed to load Atari object `{}` into VM memory: {err}",
+                    path.display()
+                )
+            })?;
+            print_load_object_report(path, &report);
+            run_address = report.run_address.or(run_address);
+        }
+        for poke in &options.pokes {
+            vm.bus_mut().ram_mut().write(poke.address, poke.value);
+        }
+        let run_address = run_address.ok_or_else(|| {
+            "loaded object did not contain RUNAD; pass a load file with a RUNAD segment".to_string()
+        })?;
+        vm.set_pc(run_address);
+    }
     let mut deferred_key_codes = options.deferred_key_codes.clone();
     let mut deferred_scripted_cio_inputs = options.deferred_scripted_cio_inputs.clone();
     let mut deferred_source_injections = options.deferred_source_injections.clone();
@@ -104,7 +131,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     let mut action_code_pointer_trace =
         ActionCodePointerTrace::new(options.trace_action_code_pointer, vm.bus());
     println!(
-        "compiler VM loaded {} image(s); reset PC=${:04X}",
+        "compiler VM loaded {} image(s); start PC=${:04X}",
         vm.images().len(),
         vm.cpu().registers().pc
     );
@@ -331,6 +358,21 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     Ok(())
 }
 
+fn print_load_object_report(path: &std::path::Path, report: &AtariLoadReport) {
+    eprintln!("loaded Atari object `{}`:", path.display());
+    for (index, segment) in report.segments.iter().enumerate() {
+        eprintln!(
+            "  seg {index:02}: ${:04X}-${:04X} len {}",
+            segment.start, segment.end, segment.len
+        );
+    }
+    if let Some(run_address) = report.run_address {
+        eprintln!("  RUNAD ${run_address:04X}");
+    } else {
+        eprintln!("  RUNAD <none>");
+    }
+}
+
 fn capture_symbol_snapshot(
     trigger: &SymbolSnapshotTrigger,
     bus: &action_compiler_vm::Bus,
@@ -488,6 +530,8 @@ struct CliOptions {
     dump_screen_on_stop: bool,
     trace_action_fixups: bool,
     trace_action_code_pointer: bool,
+    load_objects: Vec<PathBuf>,
+    pokes: Vec<MemoryPoke>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,6 +582,12 @@ struct DeferredSourceInjection {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryPoke {
+    address: u16,
+    value: u8,
+}
+
 impl Default for CliOptions {
     fn default() -> Self {
         Self {
@@ -565,6 +615,8 @@ impl Default for CliOptions {
             dump_screen_on_stop: false,
             trace_action_fixups: false,
             trace_action_code_pointer: false,
+            load_objects: Vec::new(),
+            pokes: Vec::new(),
         }
     }
 }
@@ -600,6 +652,8 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut dump_screen_on_stop = false;
     let mut trace_action_fixups = false;
     let mut trace_action_code_pointer = false;
+    let mut load_objects = Vec::new();
+    let mut pokes = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
@@ -798,6 +852,16 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let value = required_value(&args, index, "--hotpatch")?;
                 config.hotpatches.push(parse_hotpatch(value)?);
             }
+            "--load-object" => {
+                index += 1;
+                let path = required_value(&args, index, "--load-object")?;
+                load_objects.push(PathBuf::from(path));
+            }
+            "--poke" => {
+                index += 1;
+                let value = required_value(&args, index, "--poke")?;
+                pokes.push(parse_memory_poke(value)?);
+            }
             other => return Err(format!("unknown option `{other}`")),
         }
         index += 1;
@@ -828,6 +892,8 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         dump_screen_on_stop,
         trace_action_fixups,
         trace_action_code_pointer,
+        load_objects,
+        pokes,
     })
 }
 
@@ -910,6 +976,16 @@ fn parse_byte(value: &str) -> Result<u8, String> {
     }
     let parsed = parse_address(value)?;
     u8::try_from(parsed).map_err(|_| format!("byte value `{value}` is outside $00-$FF"))
+}
+
+fn parse_memory_poke(value: &str) -> Result<MemoryPoke, String> {
+    let Some((address, byte)) = value.split_once('=') else {
+        return Err(format!("memory poke `{value}` must be address=byte"));
+    };
+    Ok(MemoryPoke {
+        address: parse_address(address)?,
+        value: parse_byte(byte)?,
+    })
 }
 
 fn parse_named_key(value: &str) -> Option<u8> {
@@ -1811,7 +1887,9 @@ fn print_help() {
          --source <path>      Source file reserved for the future compiler harness\n  \
          --host-file <n:path> Register a host file visible as H:n and D:n\n  \
          --host-output <n:path>\n  \
-                              Register writable host file H:n/D:n and save it to path on stop\n  \
+         Register writable host file H:n/D:n and save it to path on stop\n  \
+         --load-object <path> Load Atari load-format object into RAM and run RUNAD\n  \
+         --poke <addr=byte>   Write one RAM byte before execution; repeatable\n  \
          --hotpatch <name>    Apply an in-memory hotpatch, e.g. action-q-input or action-headless-getkey\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );

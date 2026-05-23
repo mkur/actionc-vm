@@ -77,6 +77,7 @@ pub const CIO_COMMAND_CLOSE: u8 = 0x0C;
 pub const CIO_COMMAND_STATUS: u8 = 0x0D;
 pub const CIO_OBSERVATION_LIMIT: usize = 128;
 pub const CIO_READ_PREVIEW_LIMIT: usize = 80;
+pub const RUNAD: u16 = 0x02E2;
 pub const CARTCS_COLDSTART_VECTOR: u16 = 0xBFFA;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
 pub const OSS_TYPE_15_BANK_SIZE: usize = 0x1000;
@@ -309,6 +310,18 @@ impl CompilerVm {
         self.cpu.reset(&mut self.bus);
     }
 
+    pub fn set_pc(&mut self, pc: u16) {
+        self.cpu.set_pc(pc);
+    }
+
+    pub fn prepare_headless_program_environment(&mut self) {
+        self.bus.apply_headless_memory_defaults();
+    }
+
+    pub fn load_atari_object(&mut self, bytes: &[u8]) -> Result<AtariLoadReport, String> {
+        load_atari_object_into_memory(self.bus.ram_mut(), bytes)
+    }
+
     pub fn step_cpu(&mut self) -> Result<CpuStep, CpuError> {
         if let Some(target) = self
             .bus
@@ -363,6 +376,85 @@ impl CompilerVm {
         self.images.push(image);
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtariLoadReport {
+    pub segments: Vec<AtariLoadSegment>,
+    pub run_address: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtariLoadSegment {
+    pub start: u16,
+    pub end: u16,
+    pub len: usize,
+}
+
+pub fn load_atari_object_into_memory(
+    memory: &mut Memory,
+    bytes: &[u8],
+) -> Result<AtariLoadReport, String> {
+    let mut offset = 0usize;
+    let mut segments = Vec::new();
+    let mut run_address = None;
+
+    while offset < bytes.len() {
+        if bytes.len().saturating_sub(offset) < 4 {
+            return Err(format!(
+                "truncated Atari load segment header at file offset {offset}"
+            ));
+        }
+
+        if bytes[offset] == 0xFF && bytes[offset + 1] == 0xFF {
+            offset += 2;
+            if offset == bytes.len() {
+                break;
+            }
+        }
+
+        if bytes.len().saturating_sub(offset) < 4 {
+            return Err(format!(
+                "truncated Atari load segment address pair at file offset {offset}"
+            ));
+        }
+
+        let start = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+        let end = u16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]);
+        offset += 4;
+        if end < start {
+            return Err(format!(
+                "invalid Atari load segment ${start:04X}-${end:04X}"
+            ));
+        }
+
+        let len = usize::from(end.wrapping_sub(start)) + 1;
+        let data_end = offset
+            .checked_add(len)
+            .ok_or_else(|| "Atari load segment length overflowed".to_string())?;
+        if data_end > bytes.len() {
+            return Err(format!(
+                "segment ${start:04X}-${end:04X} needs {len} byte(s), only {} remain",
+                bytes.len().saturating_sub(offset)
+            ));
+        }
+
+        memory.map(start, &bytes[offset..data_end])?;
+        if start <= RUNAD && end >= RUNAD.wrapping_add(1) {
+            let run_offset = offset + usize::from(RUNAD.wrapping_sub(start));
+            run_address = Some(u16::from_le_bytes([
+                bytes[run_offset],
+                bytes[run_offset + 1],
+            ]));
+        }
+        segments.push(AtariLoadSegment { start, end, len });
+        offset = data_end;
+    }
+
+    Ok(AtariLoadReport {
+        segments,
+        run_address,
+    })
 }
 
 pub fn decode_action_symbol_tables(bus: &Bus) -> ActionSymbolTableDump {
@@ -1970,18 +2062,17 @@ impl Cpu {
                 true
             }
             CIO_COMMAND_CLOSE => {
-                if bus.close_harness_cio_device(self.registers.x) {
-                    observation.handled = true;
-                    observation.detail = "close harness device".to_string();
-                    observation.result_a = Some(self.registers.a);
-                    observation.result_y = Some(0x01);
-                    bus.finish_cio_observation(observation);
-                    self.return_from_ciov(bus, self.registers.a, 0x01);
-                    return true;
-                }
-                observation.detail = "close passthrough".to_string();
+                observation.handled = true;
+                observation.detail = if bus.close_harness_cio_device(self.registers.x) {
+                    "close harness device".to_string()
+                } else {
+                    "close empty channel".to_string()
+                };
+                observation.result_a = Some(self.registers.a);
+                observation.result_y = Some(0x01);
                 bus.finish_cio_observation(observation);
-                false
+                self.return_from_ciov(bus, self.registers.a, 0x01);
+                true
             }
             CIO_COMMAND_STATUS => {
                 if bus.cio_channel_device(self.registers.x).is_some() {
@@ -5991,6 +6082,26 @@ mod tests {
     }
 
     #[test]
+    fn cpu_treats_closing_empty_cio_channel_as_success() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x10), CIO_COMMAND_CLOSE);
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        let mut cpu = Cpu::default();
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x10;
+        cpu.registers.sp = 0xFB;
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.pc, 0x2000);
+        assert_eq!(cpu.registers.y, 0x01);
+        assert_eq!(bus.cio_channel_device(0x10), None);
+        assert_eq!(bus.cio_summary.closes, 1);
+    }
+
+    #[test]
     fn cpu_writes_harness_host_output() {
         let mut bus = Bus::default();
         bus.add_host_output("OUT.COM");
@@ -6254,6 +6365,38 @@ mod tests {
         assert!(json.contains("\"name\":\"Main\""));
         assert!(json.contains("\"address\":\"$316C\""));
         assert!(json.contains("\"locals\": []"));
+    }
+
+    #[test]
+    fn loads_atari_object_segments_and_runad() {
+        let mut memory = Memory::default();
+        let object = [
+            0xFF, 0xFF, 0x00, 0x30, 0x02, 0x30, 0xA9, 0x01, 0x60, 0xE2, 0x02, 0xE3, 0x02, 0x00,
+            0x30,
+        ];
+
+        let report = load_atari_object_into_memory(&mut memory, &object).unwrap();
+
+        assert_eq!(report.run_address, Some(0x3000));
+        assert_eq!(
+            report.segments,
+            vec![
+                AtariLoadSegment {
+                    start: 0x3000,
+                    end: 0x3002,
+                    len: 3
+                },
+                AtariLoadSegment {
+                    start: RUNAD,
+                    end: RUNAD + 1,
+                    len: 2
+                }
+            ]
+        );
+        assert_eq!(memory.read(0x3000), 0xA9);
+        assert_eq!(memory.read(0x3001), 0x01);
+        assert_eq!(memory.read(0x3002), 0x60);
+        assert_eq!(memory.read_word(RUNAD), 0x3000);
     }
 
     fn car_bytes(cartridge_type: u32, chunks: &[&[u8]]) -> Vec<u8> {
