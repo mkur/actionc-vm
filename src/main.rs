@@ -1512,16 +1512,40 @@ fn dump_menu_trap(trap: &MenuDumpTrap, regs: &CpuRegisters, bus: &action_compile
         regs.y,
         bus.ram().read(0x00A3)
     );
-    dump_menu_entries(pointer, bus, 16);
+    eprintln!("  direct pointer candidate:");
+    let direct_ok = dump_menu_entries(pointer, bus, 16);
+    let indirect = u16::from_le_bytes([
+        bus.ram().read(pointer),
+        bus.ram().read(pointer.wrapping_add(1)),
+    ]);
+    if indirect != pointer {
+        eprintln!(
+            "  indirect CARD candidate from [${pointer:04X}]=${indirect:04X}:{}",
+            if direct_ok {
+                " (direct already looked valid)"
+            } else {
+                ""
+            }
+        );
+        dump_menu_entries(indirect, bus, 16);
+    }
 }
 
-fn dump_menu_entries(start: u16, bus: &action_compiler_vm::Bus, max_entries: usize) {
+fn dump_menu_entries(start: u16, bus: &action_compiler_vm::Bus, max_entries: usize) -> bool {
     let mut address = start;
+    let mut valid = true;
     for index in 0..max_entries {
         let len = bus.ram().read(address);
         if len == 0 {
             eprintln!("  [{index:02}] ${address:04X}: end len=0");
-            return;
+            return valid;
+        }
+        if len > 64 {
+            eprintln!(
+                "  [{index:02}] ${address:04X}: malformed len={len:02}; raw={}",
+                format_menu_raw_bytes(bus, address, 16)
+            );
+            return false;
         }
         let text_start = address.wrapping_add(1);
         let mut text_bytes = Vec::with_capacity(len as usize);
@@ -1545,17 +1569,24 @@ fn dump_menu_entries(start: u16, bus: &action_compiler_vm::Bus, max_entries: usi
         );
         if self_ptr != address {
             eprintln!("       warning: self pointer does not match item address");
+            valid = false;
         }
         if separator != 0x9A {
             eprintln!("       warning: separator is not $9A");
+            valid = false;
         }
         address = next;
     }
     eprintln!("  ... stopped after {max_entries} menu entries without len=0");
+    false
 }
 
 fn format_menu_raw_entry(bus: &action_compiler_vm::Bus, address: u16, len: u8) -> String {
     let total = u16::from(len).saturating_add(5);
+    format_menu_raw_bytes(bus, address, total)
+}
+
+fn format_menu_raw_bytes(bus: &action_compiler_vm::Bus, address: u16, total: u16) -> String {
     let mut out = String::new();
     for offset in 0..total {
         if offset != 0 {
