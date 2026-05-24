@@ -1098,7 +1098,7 @@ fn parse_listing_proc_entry(line: &str) -> Result<Option<(String, u16)>, String>
         };
         parse_address(entry)?
     } else {
-        parse_address(start_text)?
+        parse_address(&format!("${start_text}"))?
     };
     Ok(Some((name.to_string(), entry)))
 }
@@ -2310,6 +2310,16 @@ mod tests {
         assert_eq!(
             parse_listing_proc_entry(line).unwrap(),
             Some(("Items".to_string(), 0x35AA))
+        );
+    }
+
+    #[test]
+    fn parses_listing_proc_entry_without_explicit_entry() {
+        let line = "; ===== PROC r_2 $2C02..$2C24 =====";
+
+        assert_eq!(
+            parse_listing_proc_entry(line).unwrap(),
+            Some(("r_2".to_string(), 0x2C02))
         );
     }
 
