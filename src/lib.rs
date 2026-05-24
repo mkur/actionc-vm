@@ -322,6 +322,14 @@ impl CompilerVm {
         load_atari_object_into_memory(self.bus.ram_mut(), bytes)
     }
 
+    pub fn protect_code_ranges(&mut self, ranges: &[AddressRange]) {
+        self.bus.add_protected_code_ranges(ranges);
+    }
+
+    pub fn allow_code_write_ranges(&mut self, ranges: &[AddressRange]) {
+        self.bus.add_allowed_code_write_ranges(ranges);
+    }
+
     pub fn step_cpu(&mut self) -> Result<CpuStep, CpuError> {
         if let Some(target) = self
             .bus
@@ -1916,6 +1924,17 @@ impl Cpu {
             }
         }
 
+        if let Some(write) = bus.take_protected_code_write() {
+            self.halted = true;
+            return Err(CpuError::ProtectedCodeWrite {
+                pc,
+                address: write.address,
+                old_value: write.old_value,
+                new_value: write.new_value,
+                region: write.region,
+            });
+        }
+
         Ok(CpuStep {
             pc,
             opcode,
@@ -2243,7 +2262,17 @@ pub struct CpuStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuError {
     Halted,
-    UnsupportedOpcode { pc: u16, opcode: u8 },
+    UnsupportedOpcode {
+        pc: u16,
+        opcode: u8,
+    },
+    ProtectedCodeWrite {
+        pc: u16,
+        address: u16,
+        old_value: u8,
+        new_value: u8,
+        region: BusRegion,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2332,6 +2361,9 @@ pub struct Bus {
     os_rom: Option<RomRegion>,
     cartridge: Option<Cartridge>,
     watchpoints: Vec<AddressRange>,
+    protected_code_ranges: Vec<AddressRange>,
+    allowed_code_write_ranges: Vec<AddressRange>,
+    protected_code_write: Option<ProtectedCodeWrite>,
     events: Vec<BusEvent>,
     last_data: u8,
     vcount: u8,
@@ -2357,6 +2389,9 @@ impl Default for Bus {
             os_rom: None,
             cartridge: None,
             watchpoints: Vec::new(),
+            protected_code_ranges: Vec::new(),
+            allowed_code_write_ranges: Vec::new(),
+            protected_code_write: None,
             events: Vec::new(),
             last_data: 0,
             vcount: 0,
@@ -2412,6 +2447,38 @@ impl Bus {
         if !self.watchpoints.contains(&range) {
             self.watchpoints.push(range);
         }
+    }
+
+    pub fn add_protected_code_range(&mut self, range: AddressRange) {
+        if !self.protected_code_ranges.contains(&range) {
+            self.protected_code_ranges.push(range);
+        }
+    }
+
+    pub fn add_protected_code_ranges(&mut self, ranges: &[AddressRange]) {
+        for range in ranges {
+            self.add_protected_code_range(*range);
+        }
+    }
+
+    pub fn protected_code_ranges(&self) -> &[AddressRange] {
+        &self.protected_code_ranges
+    }
+
+    pub fn add_allowed_code_write_range(&mut self, range: AddressRange) {
+        if !self.allowed_code_write_ranges.contains(&range) {
+            self.allowed_code_write_ranges.push(range);
+        }
+    }
+
+    pub fn add_allowed_code_write_ranges(&mut self, ranges: &[AddressRange]) {
+        for range in ranges {
+            self.add_allowed_code_write_range(*range);
+        }
+    }
+
+    pub fn take_protected_code_write(&mut self) -> Option<ProtectedCodeWrite> {
+        self.protected_code_write.take()
     }
 
     pub fn events(&self) -> &[BusEvent] {
@@ -2783,8 +2850,12 @@ impl Bus {
             {
                 BusRegion::OsRom
             } else {
-                self.ram.write(address, value);
-                BusRegion::Ram
+                if self.protect_ram_write(address, value) {
+                    BusRegion::Ram
+                } else {
+                    self.ram.write(address, value);
+                    BusRegion::Ram
+                }
             }
         } else if self.io.write(address, value) {
             BusRegion::Io
@@ -2795,8 +2866,12 @@ impl Bus {
         {
             BusRegion::OsRom
         } else {
-            self.ram.write(address, value);
-            BusRegion::Ram
+            if self.protect_ram_write(address, value) {
+                BusRegion::Ram
+            } else {
+                self.ram.write(address, value);
+                BusRegion::Ram
+            }
         };
 
         if address == SEROUT_SERIAL_OUTPUT {
@@ -2814,6 +2889,29 @@ impl Bus {
 
         self.last_data = value;
         self.record_event(BusAccess::Write, address, value, region);
+    }
+
+    fn protect_ram_write(&mut self, address: u16, value: u8) -> bool {
+        if !self
+            .protected_code_ranges
+            .iter()
+            .any(|range| range.contains(address))
+            || self
+                .allowed_code_write_ranges
+                .iter()
+                .any(|range| range.contains(address))
+        {
+            return false;
+        }
+        if self.protected_code_write.is_none() {
+            self.protected_code_write = Some(ProtectedCodeWrite {
+                address,
+                old_value: self.ram.read(address),
+                new_value: value,
+                region: BusRegion::Ram,
+            });
+        }
+        true
     }
 
     fn record_event(&mut self, access: BusAccess, address: u16, value: u8, region: BusRegion) {
@@ -3626,6 +3724,14 @@ pub struct BusEvent {
     pub access: BusAccess,
     pub address: u16,
     pub value: u8,
+    pub region: BusRegion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectedCodeWrite {
+    pub address: u16,
+    pub old_value: u8,
+    pub new_value: u8,
     pub region: BusRegion,
 }
 
@@ -6244,6 +6350,43 @@ mod tests {
                 opcode: 0x02,
             }
         );
+        assert!(cpu.halted());
+    }
+
+    #[test]
+    fn cpu_traps_writes_to_protected_code_ranges() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .map(
+                0x0200,
+                &[
+                    0xA9, 0x42, // LDA #$42
+                    0x8D, 0x05, 0x30, // STA $3005
+                ],
+            )
+            .unwrap();
+        bus.ram_mut().write(0x3005, 0xEA);
+        bus.ram_mut().write(0xFFFC, 0x00);
+        bus.ram_mut().write(0xFFFD, 0x02);
+        bus.add_protected_code_range(AddressRange {
+            start: 0x3000,
+            end: 0x30FF,
+        });
+        let mut cpu = Cpu::default();
+        cpu.reset(&mut bus);
+
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(
+            cpu.step(&mut bus).unwrap_err(),
+            CpuError::ProtectedCodeWrite {
+                pc: 0x0202,
+                address: 0x3005,
+                old_value: 0xEA,
+                new_value: 0x42,
+                region: BusRegion::Ram,
+            }
+        );
+        assert_eq!(bus.read(0x3005), 0xEA);
         assert!(cpu.halted());
     }
 

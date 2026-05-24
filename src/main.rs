@@ -121,6 +121,20 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         })?;
         vm.set_pc(run_address);
     }
+    if !options.protected_code_ranges.is_empty() {
+        vm.protect_code_ranges(&options.protected_code_ranges);
+        vm.allow_code_write_ranges(&options.allowed_code_write_ranges);
+        eprintln!(
+            "protected {} code range(s) from writes",
+            options.protected_code_ranges.len()
+        );
+        if !options.allowed_code_write_ranges.is_empty() {
+            eprintln!(
+                "allowed {} intentional code write range(s)",
+                options.allowed_code_write_ranges.len()
+            );
+        }
+    }
     let mut deferred_key_codes = options.deferred_key_codes.clone();
     let mut deferred_scripted_cio_inputs = options.deferred_scripted_cio_inputs.clone();
     let mut deferred_source_injections = options.deferred_source_injections.clone();
@@ -291,6 +305,43 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 write_stop_outputs(&options, vm.bus())?;
                 write_symbol_snapshots(&options, &symbol_snapshots)?;
                 return Err(format!("unsupported opcode ${opcode:02X} at ${pc:04X}"));
+            }
+            Err(CpuError::ProtectedCodeWrite {
+                pc,
+                address,
+                old_value,
+                new_value,
+                region,
+            }) => {
+                print_stop_report(
+                    &format!(
+                        "protected code write at ${address:04X}: ${old_value:02X} -> ${new_value:02X} ({region:?}), instruction PC=${pc:04X}"
+                    ),
+                    Some(vm.cpu().registers()),
+                    Some(&history),
+                    vm.bus().events(),
+                    vm.bus().cio_summary(),
+                    vm.bus().cio_observations(),
+                    vm.bus().cartridge().map(|cart| cart.mapping_info()),
+                    &action_fixup_trace,
+                    &action_code_pointer_trace,
+                );
+                print_run_observations(
+                    vm.bus(),
+                    options.dump_screen_on_stop,
+                    &options.memory_dump_ranges,
+                );
+                capture_final_symbol_snapshot(
+                    &options,
+                    &mut symbol_snapshots,
+                    vm.cpu().registers().pc,
+                    vm.bus(),
+                );
+                write_stop_outputs(&options, vm.bus())?;
+                write_symbol_snapshots(&options, &symbol_snapshots)?;
+                return Err(format!(
+                    "protected code write at ${address:04X}: ${old_value:02X} -> ${new_value:02X}"
+                ));
             }
             Err(CpuError::Halted) => {
                 print_stop_report(
@@ -532,6 +583,8 @@ struct CliOptions {
     trace_action_code_pointer: bool,
     load_objects: Vec<PathBuf>,
     pokes: Vec<MemoryPoke>,
+    protected_code_ranges: Vec<AddressRange>,
+    allowed_code_write_ranges: Vec<AddressRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -617,6 +670,8 @@ impl Default for CliOptions {
             trace_action_code_pointer: false,
             load_objects: Vec::new(),
             pokes: Vec::new(),
+            protected_code_ranges: Vec::new(),
+            allowed_code_write_ranges: Vec::new(),
         }
     }
 }
@@ -654,6 +709,8 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut trace_action_code_pointer = false;
     let mut load_objects = Vec::new();
     let mut pokes = Vec::new();
+    let mut protected_code_ranges = Vec::new();
+    let mut allowed_code_write_ranges = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
@@ -862,6 +919,23 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let value = required_value(&args, index, "--poke")?;
                 pokes.push(parse_memory_poke(value)?);
             }
+            "--protect-code-range" => {
+                index += 1;
+                let value = required_value(&args, index, "--protect-code-range")?;
+                protected_code_ranges.push(parse_range(value)?);
+            }
+            "--protect-code-from-listing" => {
+                index += 1;
+                let value = required_value(&args, index, "--protect-code-from-listing")?;
+                protected_code_ranges.extend(parse_protected_code_ranges_from_listing(
+                    &PathBuf::from(value),
+                )?);
+            }
+            "--allow-code-write-range" => {
+                index += 1;
+                let value = required_value(&args, index, "--allow-code-write-range")?;
+                allowed_code_write_ranges.push(parse_range(value)?);
+            }
             other => return Err(format!("unknown option `{other}`")),
         }
         index += 1;
@@ -894,6 +968,8 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         trace_action_code_pointer,
         load_objects,
         pokes,
+        protected_code_ranges,
+        allowed_code_write_ranges,
     })
 }
 
@@ -1142,6 +1218,58 @@ fn parse_range(value: &str) -> Result<AddressRange, String> {
         return Err(format!("range `{value}` starts after it ends"));
     }
     Ok(AddressRange { start, end })
+}
+
+fn parse_protected_code_ranges_from_listing(path: &PathBuf) -> Result<Vec<AddressRange>, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read listing `{}`: {err}", path.display()))?;
+    let mut ranges = Vec::new();
+    for line in text.lines() {
+        if let Some(range) = parse_listing_proc_code_range(line)? {
+            ranges.push(range);
+        }
+    }
+    if ranges.is_empty() {
+        return Err(format!(
+            "listing `{}` did not contain any PROC range headers",
+            path.display()
+        ));
+    }
+    Ok(ranges)
+}
+
+fn parse_listing_proc_code_range(line: &str) -> Result<Option<AddressRange>, String> {
+    let Some(header) = line.strip_prefix("; ===== PROC ") else {
+        return Ok(None);
+    };
+    let Some(range_start) = header.find(" $") else {
+        return Ok(None);
+    };
+    let range_text = &header[range_start + 1..];
+    let Some((start_text, rest)) = range_text.split_once("..") else {
+        return Ok(None);
+    };
+    let Some(end_text) = rest.split_whitespace().next() else {
+        return Ok(None);
+    };
+    let start = if let Some(entry_text) = rest.split(" entry ").nth(1) {
+        let Some(entry) = entry_text.split_whitespace().next() else {
+            return Err(format!("invalid listing PROC entry in `{line}`"));
+        };
+        parse_address(entry)?
+    } else {
+        parse_address(start_text)?
+    };
+    let exclusive_end = parse_address(end_text)?;
+    let end = exclusive_end
+        .checked_sub(1)
+        .ok_or_else(|| format!("listing PROC range has zero end in `{line}`"))?;
+    if start > end {
+        return Err(format!(
+            "listing PROC range starts after it ends in `{line}`"
+        ));
+    }
+    Ok(Some(AddressRange { start, end }))
 }
 
 #[derive(Debug)]
@@ -1890,6 +2018,12 @@ fn print_help() {
          Register writable host file H:n/D:n and save it to path on stop\n  \
          --load-object <path> Load Atari load-format object into RAM and run RUNAD\n  \
          --poke <addr=byte>   Write one RAM byte before execution; repeatable\n  \
+         --protect-code-range <a:b>\n  \
+                              Halt if CPU writes into this RAM code range\n  \
+         --protect-code-from-listing <path>\n  \
+                              Halt if CPU writes into PROC ranges from an actionc source listing\n  \
+         --allow-code-write-range <a:b>\n  \
+                              Allow intentional writes inside protected code ranges\n  \
          --hotpatch <name>    Apply an in-memory hotpatch, e.g. action-q-input or action-headless-getkey\n  \
          --map <k:p:a>        Map an extra image: ram:path:addr, rom:path:addr, cart:path:addr"
     );
@@ -1942,6 +2076,58 @@ mod tests {
         let options = parse_options(vec!["--trace-action-code-pointer".to_string()]).unwrap();
 
         assert!(options.trace_action_code_pointer);
+    }
+
+    #[test]
+    fn parses_protected_code_range_option() {
+        let options = parse_options(vec![
+            "--protect-code-range".to_string(),
+            "$310C:$325F".to_string(),
+            "--allow-code-write-range".to_string(),
+            "$2F7D:$2F7E".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options.protected_code_ranges,
+            vec![AddressRange {
+                start: 0x310C,
+                end: 0x325F,
+            }]
+        );
+        assert_eq!(
+            options.allowed_code_write_ranges,
+            vec![AddressRange {
+                start: 0x2F7D,
+                end: 0x2F7E,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_listing_proc_range_from_entry_to_end() {
+        let line = "; ===== PROC Window $3105..$325F entry $310C =====";
+
+        assert_eq!(
+            parse_listing_proc_code_range(line).unwrap(),
+            Some(AddressRange {
+                start: 0x310C,
+                end: 0x325E,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_machine_listing_proc_range_from_start_to_end() {
+        let line = "; ===== PROC Block $2ED2..$2F19 =====";
+
+        assert_eq!(
+            parse_listing_proc_code_range(line).unwrap(),
+            Some(AddressRange {
+                start: 0x2ED2,
+                end: 0x2F18,
+            })
+        );
     }
 
     #[test]
