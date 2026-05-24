@@ -140,6 +140,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     let mut deferred_source_injections = options.deferred_source_injections.clone();
     let mut editor_line_dump_pcs = options.editor_line_dump_pcs.clone();
     let mut screen_dump_pcs = options.screen_dump_pcs.clone();
+    let menu_dump_traps = options.menu_dump_traps.clone();
     let mut symbol_snapshots = Vec::new();
     let mut action_fixup_trace = ActionFixupTrace::new(options.trace_action_fixups);
     let mut action_code_pointer_trace =
@@ -190,6 +191,12 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 print_text_screen(&vm.bus().text_screen_snapshot(40, 24));
             } else {
                 screen_dump_index += 1;
+            }
+        }
+
+        for trap in &menu_dump_traps {
+            if trap.pc == pc {
+                dump_menu_trap(trap, &vm.cpu().registers(), vm.bus());
             }
         }
 
@@ -572,6 +579,7 @@ struct CliOptions {
     deferred_source_injections: Vec<DeferredSourceInjection>,
     editor_line_dump_pcs: Vec<u16>,
     screen_dump_pcs: Vec<u16>,
+    menu_dump_traps: Vec<MenuDumpTrap>,
     memory_dump_ranges: Vec<AddressRange>,
     raw_memory_dump_path: Option<PathBuf>,
     symbol_dump_path: Option<PathBuf>,
@@ -592,6 +600,12 @@ struct SymbolSnapshotTrigger {
     pc: u16,
     label: String,
     skip_empty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MenuDumpTrap {
+    pc: u16,
+    label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -659,6 +673,7 @@ impl Default for CliOptions {
             deferred_source_injections: Vec::new(),
             editor_line_dump_pcs: Vec::new(),
             screen_dump_pcs: Vec::new(),
+            menu_dump_traps: Vec::new(),
             memory_dump_ranges: Vec::new(),
             raw_memory_dump_path: None,
             symbol_dump_path: None,
@@ -698,6 +713,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut deferred_source_injections = Vec::new();
     let mut editor_line_dump_pcs = Vec::new();
     let mut screen_dump_pcs = Vec::new();
+    let mut menu_dump_traps = Vec::new();
     let mut memory_dump_ranges = Vec::new();
     let mut raw_memory_dump_path = None;
     let mut symbol_dump_path = None;
@@ -822,6 +838,16 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 index += 1;
                 let value = required_value(&args, index, "--dump-screen-at-pc")?;
                 screen_dump_pcs.push(parse_address(value)?);
+            }
+            "--dump-menu-at-pc" => {
+                index += 1;
+                let value = required_value(&args, index, "--dump-menu-at-pc")?;
+                menu_dump_traps.push(parse_menu_dump_trap(value)?);
+            }
+            "--dump-menu-at-proc" => {
+                index += 1;
+                let value = required_value(&args, index, "--dump-menu-at-proc")?;
+                menu_dump_traps.push(parse_menu_dump_trap_from_listing(value)?);
             }
             "--dump-screen-on-stop" => {
                 dump_screen_on_stop = true;
@@ -957,6 +983,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         deferred_source_injections,
         editor_line_dump_pcs,
         screen_dump_pcs,
+        menu_dump_traps,
         memory_dump_ranges,
         raw_memory_dump_path,
         symbol_dump_path,
@@ -1005,6 +1032,75 @@ fn parse_symbol_snapshot_trigger(value: &str) -> Result<SymbolSnapshotTrigger, S
         label: label.to_string(),
         skip_empty: false,
     })
+}
+
+fn parse_menu_dump_trap(value: &str) -> Result<MenuDumpTrap, String> {
+    let (pc, label) = value
+        .split_once(':')
+        .map(|(pc, label)| (pc, label.to_string()))
+        .unwrap_or((value, "menu".to_string()));
+    if label.trim().is_empty() {
+        return Err("menu dump label must not be empty".to_string());
+    }
+    Ok(MenuDumpTrap {
+        pc: parse_address(pc)?,
+        label,
+    })
+}
+
+fn parse_menu_dump_trap_from_listing(value: &str) -> Result<MenuDumpTrap, String> {
+    let mut parts = value.splitn(3, ':');
+    let path = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| format!("menu proc trap `{value}` must be listing:proc[:label]"))?;
+    let proc_name = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| format!("menu proc trap `{value}` must be listing:proc[:label]"))?;
+    let label = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or(proc_name);
+    let listing = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read listing `{path}` for menu trap: {err}"))?;
+    Ok(MenuDumpTrap {
+        pc: find_listing_proc_entry(&listing, proc_name)?,
+        label: label.to_string(),
+    })
+}
+
+fn find_listing_proc_entry(listing: &str, proc_name: &str) -> Result<u16, String> {
+    for line in listing.lines() {
+        let Some((name, entry)) = parse_listing_proc_entry(line)? else {
+            continue;
+        };
+        if name == proc_name {
+            return Ok(entry);
+        }
+    }
+    Err(format!("listing did not contain PROC `{proc_name}`"))
+}
+
+fn parse_listing_proc_entry(line: &str) -> Result<Option<(String, u16)>, String> {
+    let Some(header) = line.strip_prefix("; ===== PROC ") else {
+        return Ok(None);
+    };
+    let Some((name, range_text)) = header.split_once(" $") else {
+        return Ok(None);
+    };
+    let Some((start_text, rest)) = range_text.split_once("..") else {
+        return Ok(None);
+    };
+    let entry = if let Some(entry_text) = rest.split(" entry ").nth(1) {
+        let Some(entry) = entry_text.split_whitespace().next() else {
+            return Err(format!("invalid listing PROC entry in `{line}`"));
+        };
+        parse_address(entry)?
+    } else {
+        parse_address(start_text)?
+    };
+    Ok(Some((name.to_string(), entry)))
 }
 
 fn required_value<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
@@ -1402,6 +1498,79 @@ fn print_memory_dumps(bus: &action_compiler_vm::Bus, ranges: &[AddressRange]) {
             line_start = line_end + 1;
         }
     }
+}
+
+fn dump_menu_trap(trap: &MenuDumpTrap, regs: &CpuRegisters, bus: &action_compiler_vm::Bus) {
+    let pointer = u16::from_le_bytes([regs.a, regs.x]);
+    eprintln!(
+        "menu dump `{}` at PC=${:04X}: input A/X=${:02X}/${:02X} ptr=${:04X} Y=${:02X} A3=${:02X}",
+        trap.label,
+        trap.pc,
+        regs.a,
+        regs.x,
+        pointer,
+        regs.y,
+        bus.ram().read(0x00A3)
+    );
+    dump_menu_entries(pointer, bus, 16);
+}
+
+fn dump_menu_entries(start: u16, bus: &action_compiler_vm::Bus, max_entries: usize) {
+    let mut address = start;
+    for index in 0..max_entries {
+        let len = bus.ram().read(address);
+        if len == 0 {
+            eprintln!("  [{index:02}] ${address:04X}: end len=0");
+            return;
+        }
+        let text_start = address.wrapping_add(1);
+        let mut text_bytes = Vec::with_capacity(len as usize);
+        for offset in 0..len {
+            text_bytes.push(bus.ram().read(text_start.wrapping_add(offset as u16)));
+        }
+        let self_ptr_address = text_start.wrapping_add(len as u16);
+        let self_ptr = u16::from_le_bytes([
+            bus.ram().read(self_ptr_address),
+            bus.ram().read(self_ptr_address.wrapping_add(1)),
+        ]);
+        let key_address = self_ptr_address.wrapping_add(2);
+        let key = bus.ram().read(key_address);
+        let separator = bus.ram().read(key_address.wrapping_add(1));
+        let next = address.wrapping_add(len as u16).wrapping_add(5);
+        eprintln!(
+            "  [{index:02}] ${address:04X}: len={len:02} text=\"{}\" self=${self_ptr:04X} key=${key:02X} '{}' sep=${separator:02X} next=${next:04X} raw={}",
+            format_menu_text(&text_bytes),
+            memory_dump_char(key),
+            format_menu_raw_entry(bus, address, len)
+        );
+        if self_ptr != address {
+            eprintln!("       warning: self pointer does not match item address");
+        }
+        if separator != 0x9A {
+            eprintln!("       warning: separator is not $9A");
+        }
+        address = next;
+    }
+    eprintln!("  ... stopped after {max_entries} menu entries without len=0");
+}
+
+fn format_menu_raw_entry(bus: &action_compiler_vm::Bus, address: u16, len: u8) -> String {
+    let total = u16::from(len).saturating_add(5);
+    let mut out = String::new();
+    for offset in 0..total {
+        if offset != 0 {
+            out.push(' ');
+        }
+        out.push_str(&format!(
+            "{:02X}",
+            bus.ram().read(address.wrapping_add(offset))
+        ));
+    }
+    out
+}
+
+fn format_menu_text(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| memory_dump_char(*byte)).collect()
 }
 
 fn memory_dump_char(value: u8) -> char {
@@ -1998,6 +2167,10 @@ fn print_help() {
                               Dump Action! editor line list when execution reaches pc\n  \
          --dump-screen-at-pc <pc>\n  \
                               Dump decoded 40x24 text screen when execution reaches pc\n  \
+         --dump-menu-at-pc <pc[:label]>\n  \
+                              Dump Action/TN popup menu entries from incoming A/X pointer at pc\n  \
+         --dump-menu-at-proc <listing:proc[:label]>\n  \
+                              Dump Action/TN popup menu entries at a PROC entry from listing\n  \
          --dump-screen-on-stop\n  \
                               Dump decoded 40x24 text screen in stop reports\n  \
          --dump-range-on-stop <a:b>\n  \
@@ -2131,6 +2304,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_listing_proc_entry() {
+        let line = "; ===== PROC Items $35A7..$35EA entry $35AA =====";
+
+        assert_eq!(
+            parse_listing_proc_entry(line).unwrap(),
+            Some(("Items".to_string(), 0x35AA))
+        );
+    }
+
+    #[test]
+    fn parses_menu_dump_trap_from_listing_proc() {
+        let path = env::temp_dir().join(format!(
+            "action-compiler-vm-menu-trap-{}.lst",
+            std::process::id()
+        ));
+        fs::write(&path, "; ===== PROC Items $35A7..$35EA entry $35AA =====\n").unwrap();
+
+        let options = parse_options(vec![
+            "--dump-menu-at-proc".to_string(),
+            format!("{}:Items", path.display()),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options.menu_dump_traps,
+            vec![MenuDumpTrap {
+                pc: 0x35AA,
+                label: "Items".to_string()
+            }]
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn parses_hotpatch_option() {
         let options = parse_options(vec![
             "--hotpatch".to_string(),
@@ -2256,6 +2463,8 @@ mod tests {
             "$A2E0".to_string(),
             "--dump-screen-at-pc".to_string(),
             "$A2F0".to_string(),
+            "--dump-menu-at-pc".to_string(),
+            "$35AA:Items".to_string(),
             "--dump-screen-on-stop".to_string(),
             "--dump-memory-on-stop".to_string(),
             "memory.bin".to_string(),
@@ -2278,6 +2487,13 @@ mod tests {
         );
         assert_eq!(options.editor_line_dump_pcs, vec![0xA2E0]);
         assert_eq!(options.screen_dump_pcs, vec![0xA2F0]);
+        assert_eq!(
+            options.menu_dump_traps,
+            vec![MenuDumpTrap {
+                pc: 0x35AA,
+                label: "Items".to_string()
+            }]
+        );
         assert_eq!(
             options.raw_memory_dump_path,
             Some(PathBuf::from("memory.bin"))
