@@ -148,6 +148,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     let mut action_call_trace = ActionCallTrace::new(
         options.trace_action_calls,
         load_action_call_listings(&options)?,
+        load_action_call_maps(&options)?,
     );
     println!(
         "compiler VM loaded {} image(s); start PC=${:04X}",
@@ -596,6 +597,7 @@ struct CliOptions {
     trace_action_code_pointer: bool,
     trace_action_calls: bool,
     action_call_listings: Vec<PathBuf>,
+    action_call_maps: Vec<PathBuf>,
     load_objects: Vec<PathBuf>,
     pokes: Vec<MemoryPoke>,
     protected_code_ranges: Vec<AddressRange>,
@@ -692,6 +694,7 @@ impl Default for CliOptions {
             trace_action_code_pointer: false,
             trace_action_calls: false,
             action_call_listings: Vec::new(),
+            action_call_maps: Vec::new(),
             load_objects: Vec::new(),
             pokes: Vec::new(),
             protected_code_ranges: Vec::new(),
@@ -734,6 +737,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut trace_action_code_pointer = false;
     let mut trace_action_calls = false;
     let mut action_call_listings = Vec::new();
+    let mut action_call_maps = Vec::new();
     let mut load_objects = Vec::new();
     let mut pokes = Vec::new();
     let mut protected_code_ranges = Vec::new();
@@ -816,6 +820,12 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let value = required_value(&args, index, "--trace-action-calls-from-listing")?;
                 trace_action_calls = true;
                 action_call_listings.push(PathBuf::from(value));
+            }
+            "--trace-action-calls-from-map" => {
+                index += 1;
+                let value = required_value(&args, index, "--trace-action-calls-from-map")?;
+                trace_action_calls = true;
+                action_call_maps.push(PathBuf::from(value));
             }
             "--key-at-pc" => {
                 index += 1;
@@ -1015,6 +1025,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         trace_action_code_pointer,
         trace_action_calls,
         action_call_listings,
+        action_call_maps,
         load_objects,
         pokes,
         protected_code_ranges,
@@ -1118,6 +1129,23 @@ fn load_action_call_listings(options: &CliOptions) -> Result<HashMap<u16, String
                 continue;
             };
             entries.entry(entry).or_insert(name);
+        }
+    }
+    Ok(entries)
+}
+
+fn load_action_call_maps(
+    options: &CliOptions,
+) -> Result<HashMap<u16, ActionMapRoutineSignature>, String> {
+    let mut entries = HashMap::new();
+    for path in &options.action_call_maps {
+        let map = fs::read_to_string(path)
+            .map_err(|err| format!("failed to read action call map `{}`: {err}", path.display()))?;
+        for line in map.lines() {
+            let Some(signature) = parse_action_map_signature_line(line)? else {
+                continue;
+            };
+            entries.entry(signature.address).or_insert(signature);
         }
     }
     Ok(entries)
@@ -1439,10 +1467,26 @@ impl StepHistory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ActionMapRoutineSignature {
+    address: u16,
+    name: String,
+    kind: String,
+    params: Vec<ActionMapParam>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActionMapParam {
+    name: String,
+    type_name: String,
+    width: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActionRoutineTraceInfo {
     name: String,
     class: Option<String>,
     args: Vec<String>,
+    params: Vec<ActionMapParam>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1455,14 +1499,20 @@ struct ActionCallFrame {
 struct ActionCallTrace {
     enabled: bool,
     listing_entries: HashMap<u16, String>,
+    map_entries: HashMap<u16, ActionMapRoutineSignature>,
     frames: Vec<ActionCallFrame>,
 }
 
 impl ActionCallTrace {
-    fn new(enabled: bool, listing_entries: HashMap<u16, String>) -> Self {
+    fn new(
+        enabled: bool,
+        listing_entries: HashMap<u16, String>,
+        map_entries: HashMap<u16, ActionMapRoutineSignature>,
+    ) -> Self {
         Self {
             enabled,
             listing_entries,
+            map_entries,
             frames: Vec::new(),
         }
     }
@@ -1498,13 +1548,15 @@ impl ActionCallTrace {
             .ram()
             .read(0x0100u16.wrapping_add(u16::from(after.sp.wrapping_add(2))));
         let signature = format_action_call_signature(&info);
+        let args = format_action_call_args(&info.params, before, bus);
         eprintln!(
-            "{:indent$}CALL cyc={} pc=${:04X} target=${:04X} {} ret=${:04X} regs_before=A:${:02X} X:${:02X} Y:${:02X} SP:${:02X} entry=A:${:02X} X:${:02X} Y:${:02X} SP:${:02X} stack_ret=${:02X}{:02X}",
+            "{:indent$}CALL cyc={} pc=${:04X} target=${:04X} {} {} ret=${:04X} regs_before=A:${:02X} X:${:02X} Y:${:02X} SP:${:02X} entry=A:${:02X} X:${:02X} Y:${:02X} SP:${:02X} stack_ret=${:02X}{:02X}",
             "",
             step.cycles,
             step.pc,
             target,
             signature,
+            args,
             expected_return,
             before.a,
             before.x,
@@ -1555,6 +1607,18 @@ impl ActionCallTrace {
         bus: &action_compiler_vm::Bus,
     ) -> Option<ActionRoutineTraceInfo> {
         let symbol = find_action_routine_symbol(target, bus);
+        if let Some(signature) = self.map_entries.get(&target) {
+            return Some(ActionRoutineTraceInfo {
+                name: signature.name.clone(),
+                class: Some(signature.kind.clone()),
+                args: signature
+                    .params
+                    .iter()
+                    .map(|param| format!("{} {}", param.type_name, param.name))
+                    .collect(),
+                params: signature.params.clone(),
+            });
+        }
         if let Some(name) = self.listing_entries.get(&target) {
             return Some(ActionRoutineTraceInfo {
                 name: name.clone(),
@@ -1563,13 +1627,156 @@ impl ActionCallTrace {
                     .as_ref()
                     .map(|entry| entry.args.clone())
                     .unwrap_or_default(),
+                params: Vec::new(),
             });
         }
         symbol.map(|entry| ActionRoutineTraceInfo {
             name: scoped_symbol_name(&entry),
             class: Some(entry.class),
             args: entry.args,
+            params: Vec::new(),
         })
+    }
+}
+
+fn parse_action_map_signature_line(
+    line: &str,
+) -> Result<Option<ActionMapRoutineSignature>, String> {
+    let Some(rest) = line.strip_prefix("signature ") else {
+        return Ok(None);
+    };
+    let mut parts = rest.split_whitespace();
+    let address = parts
+        .next()
+        .ok_or_else(|| format!("invalid action map signature `{line}`"))
+        .and_then(parse_address)?;
+    let name = parts
+        .next()
+        .ok_or_else(|| format!("invalid action map signature `{line}`"))?
+        .to_string();
+    let mut kind = None;
+    let mut params = None;
+    for part in parts {
+        if let Some(value) = part.strip_prefix("kind=") {
+            kind = Some(value.to_string());
+        } else if let Some(value) = part.strip_prefix("params=") {
+            params = Some(parse_action_map_params(value)?);
+        }
+    }
+    Ok(Some(ActionMapRoutineSignature {
+        address,
+        name,
+        kind: kind.unwrap_or_else(|| "PROC".to_string()),
+        params: params.unwrap_or_default(),
+    }))
+}
+
+fn parse_action_map_params(value: &str) -> Result<Vec<ActionMapParam>, String> {
+    if value == "-" {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|part| {
+            let mut fields = part.split(':');
+            let name = fields
+                .next()
+                .filter(|field| !field.is_empty())
+                .ok_or_else(|| format!("invalid action map param `{part}`"))?;
+            let type_name = fields
+                .next()
+                .filter(|field| !field.is_empty())
+                .ok_or_else(|| format!("invalid action map param `{part}`"))?;
+            let width_text = fields
+                .next()
+                .filter(|field| !field.is_empty())
+                .ok_or_else(|| format!("invalid action map param `{part}`"))?;
+            if fields.next().is_some() {
+                return Err(format!("invalid action map param `{part}`"));
+            }
+            let width = width_text
+                .parse::<u16>()
+                .map_err(|_| format!("invalid action map param width `{width_text}`"))?;
+            Ok(ActionMapParam {
+                name: name.to_string(),
+                type_name: type_name.to_string(),
+                width,
+            })
+        })
+        .collect()
+}
+
+fn format_action_call_args(
+    params: &[ActionMapParam],
+    regs: CpuRegisters,
+    bus: &action_compiler_vm::Bus,
+) -> String {
+    if params.is_empty() {
+        return "args=[]".to_string();
+    }
+    let mut offset = 0u16;
+    let mut rendered = Vec::new();
+    for param in params {
+        let bytes = (0..param.width)
+            .map(|index| action_abi_arg_byte(offset.saturating_add(index), regs, bus))
+            .collect::<Vec<_>>();
+        let value = bytes
+            .iter()
+            .enumerate()
+            .fold(0u16, |acc, (index, (_, byte))| {
+                acc | (u16::from(*byte) << (index * 8))
+            });
+        let homes = bytes
+            .iter()
+            .map(|(home, _)| *home)
+            .collect::<Vec<_>>()
+            .join(":");
+        let value_text = if param.width == 1 {
+            format!("${:02X}", value & 0x00FF)
+        } else {
+            format!("${value:04X}")
+        };
+        rendered.push(format!(
+            "{}:{}@{}={}",
+            param.name, param.type_name, homes, value_text
+        ));
+        offset = offset.saturating_add(param.width);
+    }
+    format!("args=[{}]", rendered.join(", "))
+}
+
+fn action_abi_arg_byte(
+    offset: u16,
+    regs: CpuRegisters,
+    bus: &action_compiler_vm::Bus,
+) -> (&'static str, u8) {
+    match offset {
+        0 => ("A", regs.a),
+        1 => ("X", regs.x),
+        2 => ("Y", regs.y),
+        _ => {
+            let address = 0x00A0u16.wrapping_add(offset);
+            (action_abi_fixed_zp_home(offset), bus.ram().read(address))
+        }
+    }
+}
+
+fn action_abi_fixed_zp_home(offset: u16) -> &'static str {
+    match offset {
+        3 => "$A3",
+        4 => "$A4",
+        5 => "$A5",
+        6 => "$A6",
+        7 => "$A7",
+        8 => "$A8",
+        9 => "$A9",
+        10 => "$AA",
+        11 => "$AB",
+        12 => "$AC",
+        13 => "$AD",
+        14 => "$AE",
+        15 => "$AF",
+        _ => "$A0+",
     }
 }
 
@@ -2395,6 +2602,8 @@ fn print_help() {
          --trace-action-calls Print named Action! JSR/RTS call boundaries\n  \
          --trace-action-calls-from-listing <path>\n  \
                               Name traced calls from an actionc listing; repeatable\n  \
+         --trace-action-calls-from-map <path>\n  \
+                              Decode traced calls from an actionc --emit-map file; repeatable\n  \
          --history <n>        Recent instruction count in stop reports, default 64\n  \
          --watch <addr>       Record bus reads/writes at addr\n  \
          --watch-range <a:b>  Record bus reads/writes inside the range\n  \
@@ -2509,6 +2718,7 @@ mod tests {
 
         assert!(options.trace_action_calls);
         assert!(options.action_call_listings.is_empty());
+        assert!(options.action_call_maps.is_empty());
     }
 
     #[test]
@@ -2524,14 +2734,55 @@ mod tests {
     }
 
     #[test]
+    fn parses_action_call_trace_map_option() {
+        let options = parse_options(vec![
+            "--trace-action-calls-from-map".to_string(),
+            "tn.map".to_string(),
+        ])
+        .unwrap();
+
+        assert!(options.trace_action_calls);
+        assert_eq!(options.action_call_maps, vec![PathBuf::from("tn.map")]);
+    }
+
+    #[test]
     fn formats_action_call_signature() {
         let signature = format_action_call_signature(&ActionRoutineTraceInfo {
             name: "Convert".to_string(),
             class: Some("PROC".to_string()),
             args: vec!["BYTE c".to_string(), "CARD ptr".to_string()],
+            params: Vec::new(),
         });
 
         assert_eq!(signature, "Convert [PROC](BYTE c, CARD ptr)");
+    }
+
+    #[test]
+    fn parses_action_map_signature_line() {
+        let signature = parse_action_map_signature_line(
+            "signature $3210 Convert kind=PROC params=c:BYTE:1,ptr:CARD:2 return=-",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(signature.address, 0x3210);
+        assert_eq!(signature.name, "Convert");
+        assert_eq!(signature.kind, "PROC");
+        assert_eq!(
+            signature.params,
+            vec![
+                ActionMapParam {
+                    name: "c".to_string(),
+                    type_name: "BYTE".to_string(),
+                    width: 1,
+                },
+                ActionMapParam {
+                    name: "ptr".to_string(),
+                    type_name: "CARD".to_string(),
+                    width: 2,
+                }
+            ]
+        );
     }
 
     #[test]
