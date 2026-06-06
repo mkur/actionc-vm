@@ -145,6 +145,10 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
     let mut action_fixup_trace = ActionFixupTrace::new(options.trace_action_fixups);
     let mut action_code_pointer_trace =
         ActionCodePointerTrace::new(options.trace_action_code_pointer, vm.bus());
+    let mut action_call_trace = ActionCallTrace::new(
+        options.trace_action_calls,
+        load_action_call_listings(&options)?,
+    );
     println!(
         "compiler VM loaded {} image(s); start PC=${:04X}",
         vm.images().len(),
@@ -257,6 +261,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
                 let reached_trace_until = options.trace_until == Some(step.pc);
                 action_fixup_trace.observe(&step, vm.bus());
                 action_code_pointer_trace.observe(&step, vm.bus());
+                action_call_trace.observe(&step, vm.bus());
                 history.push(step);
                 if reached_trace_until {
                     print_stop_report(
@@ -589,6 +594,8 @@ struct CliOptions {
     dump_screen_on_stop: bool,
     trace_action_fixups: bool,
     trace_action_code_pointer: bool,
+    trace_action_calls: bool,
+    action_call_listings: Vec<PathBuf>,
     load_objects: Vec<PathBuf>,
     pokes: Vec<MemoryPoke>,
     protected_code_ranges: Vec<AddressRange>,
@@ -683,6 +690,8 @@ impl Default for CliOptions {
             dump_screen_on_stop: false,
             trace_action_fixups: false,
             trace_action_code_pointer: false,
+            trace_action_calls: false,
+            action_call_listings: Vec::new(),
             load_objects: Vec::new(),
             pokes: Vec::new(),
             protected_code_ranges: Vec::new(),
@@ -723,6 +732,8 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut dump_screen_on_stop = false;
     let mut trace_action_fixups = false;
     let mut trace_action_code_pointer = false;
+    let mut trace_action_calls = false;
+    let mut action_call_listings = Vec::new();
     let mut load_objects = Vec::new();
     let mut pokes = Vec::new();
     let mut protected_code_ranges = Vec::new();
@@ -796,6 +807,15 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
             }
             "--trace-action-code-pointer" => {
                 trace_action_code_pointer = true;
+            }
+            "--trace-action-calls" => {
+                trace_action_calls = true;
+            }
+            "--trace-action-calls-from-listing" => {
+                index += 1;
+                let value = required_value(&args, index, "--trace-action-calls-from-listing")?;
+                trace_action_calls = true;
+                action_call_listings.push(PathBuf::from(value));
             }
             "--key-at-pc" => {
                 index += 1;
@@ -993,6 +1013,8 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         dump_screen_on_stop,
         trace_action_fixups,
         trace_action_code_pointer,
+        trace_action_calls,
+        action_call_listings,
         load_objects,
         pokes,
         protected_code_ranges,
@@ -1080,6 +1102,25 @@ fn find_listing_proc_entry(listing: &str, proc_name: &str) -> Result<u16, String
         }
     }
     Err(format!("listing did not contain PROC `{proc_name}`"))
+}
+
+fn load_action_call_listings(options: &CliOptions) -> Result<HashMap<u16, String>, String> {
+    let mut entries = HashMap::new();
+    for path in &options.action_call_listings {
+        let listing = fs::read_to_string(path).map_err(|err| {
+            format!(
+                "failed to read action call listing `{}`: {err}",
+                path.display()
+            )
+        })?;
+        for line in listing.lines() {
+            let Some((name, entry)) = parse_listing_proc_entry(line)? else {
+                continue;
+            };
+            entries.entry(entry).or_insert(name);
+        }
+    }
+    Ok(entries)
 }
 
 fn parse_listing_proc_entry(line: &str) -> Result<Option<(String, u16)>, String> {
@@ -1395,6 +1436,183 @@ impl StepHistory {
     fn steps(&self) -> impl Iterator<Item = &CpuStep> {
         self.steps.iter()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActionRoutineTraceInfo {
+    name: String,
+    class: Option<String>,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActionCallFrame {
+    name: String,
+    expected_return: u16,
+}
+
+#[derive(Debug)]
+struct ActionCallTrace {
+    enabled: bool,
+    listing_entries: HashMap<u16, String>,
+    frames: Vec<ActionCallFrame>,
+}
+
+impl ActionCallTrace {
+    fn new(enabled: bool, listing_entries: HashMap<u16, String>) -> Self {
+        Self {
+            enabled,
+            listing_entries,
+            frames: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, step: &CpuStep, bus: &action_compiler_vm::Bus) {
+        if !self.enabled {
+            return;
+        }
+
+        if step.opcode == 0x20 {
+            self.observe_jsr(step, bus);
+            return;
+        }
+
+        if step.opcode == 0x60 {
+            self.observe_rts(step);
+        }
+    }
+
+    fn observe_jsr(&mut self, step: &CpuStep, bus: &action_compiler_vm::Bus) {
+        let target = bus.ram().read_word(step.pc.wrapping_add(1));
+        let Some(info) = self.resolve_target(target, bus) else {
+            return;
+        };
+        let expected_return = step.pc.wrapping_add(3);
+        let depth = self.frames.len();
+        let before = step.registers_before;
+        let after = step.registers_after;
+        let stack_lo = bus
+            .ram()
+            .read(0x0100u16.wrapping_add(u16::from(after.sp.wrapping_add(1))));
+        let stack_hi = bus
+            .ram()
+            .read(0x0100u16.wrapping_add(u16::from(after.sp.wrapping_add(2))));
+        let signature = format_action_call_signature(&info);
+        eprintln!(
+            "{:indent$}CALL cyc={} pc=${:04X} target=${:04X} {} ret=${:04X} regs_before=A:${:02X} X:${:02X} Y:${:02X} SP:${:02X} entry=A:${:02X} X:${:02X} Y:${:02X} SP:${:02X} stack_ret=${:02X}{:02X}",
+            "",
+            step.cycles,
+            step.pc,
+            target,
+            signature,
+            expected_return,
+            before.a,
+            before.x,
+            before.y,
+            before.sp,
+            after.a,
+            after.x,
+            after.y,
+            after.sp,
+            stack_hi,
+            stack_lo,
+            indent = depth * 2
+        );
+        self.frames.push(ActionCallFrame {
+            name: info.name,
+            expected_return,
+        });
+    }
+
+    fn observe_rts(&mut self, step: &CpuStep) {
+        let Some(frame) = self.frames.last() else {
+            return;
+        };
+        if step.registers_after.pc != frame.expected_return {
+            return;
+        }
+        let frame = self.frames.pop().expect("call frame");
+        let depth = self.frames.len();
+        let after = step.registers_after;
+        eprintln!(
+            "{:indent$}RET  cyc={} pc=${:04X} {} => pc=${:04X} A:${:02X} X:${:02X} Y:${:02X} SP:${:02X}",
+            "",
+            step.cycles,
+            step.pc,
+            frame.name,
+            after.pc,
+            after.a,
+            after.x,
+            after.y,
+            after.sp,
+            indent = depth * 2
+        );
+    }
+
+    fn resolve_target(
+        &self,
+        target: u16,
+        bus: &action_compiler_vm::Bus,
+    ) -> Option<ActionRoutineTraceInfo> {
+        let symbol = find_action_routine_symbol(target, bus);
+        if let Some(name) = self.listing_entries.get(&target) {
+            return Some(ActionRoutineTraceInfo {
+                name: name.clone(),
+                class: symbol.as_ref().map(|entry| entry.class.clone()),
+                args: symbol
+                    .as_ref()
+                    .map(|entry| entry.args.clone())
+                    .unwrap_or_default(),
+            });
+        }
+        symbol.map(|entry| ActionRoutineTraceInfo {
+            name: scoped_symbol_name(&entry),
+            class: Some(entry.class),
+            args: entry.args,
+        })
+    }
+}
+
+fn find_action_routine_symbol(
+    target: u16,
+    bus: &action_compiler_vm::Bus,
+) -> Option<ActionSymbolEntry> {
+    let dump = decode_action_symbol_tables(bus);
+    dump.locals
+        .into_iter()
+        .chain(dump.globals)
+        .find(|entry| is_named_routine(entry, target))
+}
+
+fn is_named_routine(entry: &ActionSymbolEntry, target: u16) -> bool {
+    entry.address == Some(target) && (entry.class.contains("PROC") || entry.class.contains("FUNC"))
+}
+
+fn scoped_symbol_name(entry: &ActionSymbolEntry) -> String {
+    let scope = match entry.scope {
+        action_compiler_vm::ActionSymbolScope::Global => "global",
+        action_compiler_vm::ActionSymbolScope::Local => "local",
+    };
+    format!("{scope}::{}", entry.name)
+}
+
+fn format_action_call_signature(info: &ActionRoutineTraceInfo) -> String {
+    let mut signature = String::new();
+    signature.push_str(&info.name);
+    if let Some(class) = &info.class {
+        signature.push_str(" [");
+        signature.push_str(class);
+        signature.push(']');
+    }
+    signature.push('(');
+    for (index, arg) in info.args.iter().enumerate() {
+        if index > 0 {
+            signature.push_str(", ");
+        }
+        signature.push_str(arg);
+    }
+    signature.push(')');
+    signature
 }
 
 fn print_step(step: &CpuStep) {
@@ -2174,6 +2392,9 @@ fn print_help() {
                               Summarize Action! compiler branch-fixup loop activity on stop\n  \
          --trace-action-code-pointer\n  \
                               Summarize Action!'s code pointer $0E/$0F and visible memory region\n  \
+         --trace-action-calls Print named Action! JSR/RTS call boundaries\n  \
+         --trace-action-calls-from-listing <path>\n  \
+                              Name traced calls from an actionc listing; repeatable\n  \
          --history <n>        Recent instruction count in stop reports, default 64\n  \
          --watch <addr>       Record bus reads/writes at addr\n  \
          --watch-range <a:b>  Record bus reads/writes inside the range\n  \
@@ -2280,6 +2501,37 @@ mod tests {
         let options = parse_options(vec!["--trace-action-code-pointer".to_string()]).unwrap();
 
         assert!(options.trace_action_code_pointer);
+    }
+
+    #[test]
+    fn parses_action_call_trace_option() {
+        let options = parse_options(vec!["--trace-action-calls".to_string()]).unwrap();
+
+        assert!(options.trace_action_calls);
+        assert!(options.action_call_listings.is_empty());
+    }
+
+    #[test]
+    fn parses_action_call_trace_listing_option() {
+        let options = parse_options(vec![
+            "--trace-action-calls-from-listing".to_string(),
+            "tn.lst".to_string(),
+        ])
+        .unwrap();
+
+        assert!(options.trace_action_calls);
+        assert_eq!(options.action_call_listings, vec![PathBuf::from("tn.lst")]);
+    }
+
+    #[test]
+    fn formats_action_call_signature() {
+        let signature = format_action_call_signature(&ActionRoutineTraceInfo {
+            name: "Convert".to_string(),
+            class: Some("PROC".to_string()),
+            args: vec!["BYTE c".to_string(), "CARD ptr".to_string()],
+        });
+
+        assert_eq!(signature, "Convert [PROC](BYTE c, CARD ptr)");
     }
 
     #[test]
