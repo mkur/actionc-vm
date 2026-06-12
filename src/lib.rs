@@ -11,6 +11,7 @@ pub const SELF_TEST_BASE: u16 = 0x5000;
 pub const SELF_TEST_SIZE: usize = 0x0800;
 pub const BOOTQ_SUCCESSFUL_BOOT_FLAG: u16 = 0x0009;
 pub const DOSVEC_START_VECTOR: u16 = 0x000A;
+pub const BRKKEY_BREAK_KEY_FLAG: u16 = 0x0011;
 pub const PORTB: u16 = 0xD301;
 pub const PACTL_PORTA_CONTROL: u16 = 0xD302;
 pub const PBCTL_PORTB_CONTROL: u16 = 0xD303;
@@ -30,6 +31,7 @@ pub const MEMTOP_OS_TOP_OF_FREE_MEMORY: u16 = 0x02E5;
 pub const DEFAULT_HEADLESS_RAMTOP_PAGE: u8 = 0xA0;
 pub const DEFAULT_HEADLESS_MEMTOP: u16 = 0x9C1F;
 pub const DEFAULT_HEADLESS_SCREEN: u16 = 0x9C40;
+pub const DEFAULT_HEADLESS_BRKKEY_NOT_PRESSED: u8 = 0x80;
 pub const ACTION_MONITOR_KEY_CODE: u8 = 0xE5;
 pub const ATARI_KEY_RETURN: u8 = 0x0C;
 pub const ATARI_KEY_C: u8 = 0x12;
@@ -2941,6 +2943,8 @@ impl Bus {
 
     fn apply_headless_memory_defaults(&mut self) {
         self.ram
+            .write(BRKKEY_BREAK_KEY_FLAG, DEFAULT_HEADLESS_BRKKEY_NOT_PRESSED);
+        self.ram
             .write(RAMTOP_MEMORY_TOP_PAGE, DEFAULT_HEADLESS_RAMTOP_PAGE);
         self.ram
             .write_word(MEMTOP_OS_TOP_OF_FREE_MEMORY, DEFAULT_HEADLESS_MEMTOP);
@@ -4573,6 +4577,10 @@ mod tests {
         assert_eq!(bus.read(BOOTQ_SUCCESSFUL_BOOT_FLAG), 0x01);
         assert_eq!(bus.read(DOSVEC_START_VECTOR), 0x34);
         assert_eq!(bus.read(DOSVEC_START_VECTOR.wrapping_add(1)), 0x12);
+        assert_eq!(
+            bus.read(BRKKEY_BREAK_KEY_FLAG),
+            DEFAULT_HEADLESS_BRKKEY_NOT_PRESSED
+        );
         assert_eq!(
             bus.read(RAMTOP_MEMORY_TOP_PAGE),
             DEFAULT_HEADLESS_RAMTOP_PAGE
