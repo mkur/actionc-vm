@@ -41,8 +41,10 @@ Implemented and committed:
   gated PC triggers;
 - CLI adoption of the scheduled key/CIO queue;
 - the first source split, moving Atari object parsing into `src/object.rs`;
-- ROM-free classic and MIR6502 execution in the `actionc`
-  `initialized_arrays` shell gate.
+- ROM-free classic and MIR6502 execution in an isolated `actionc`
+  `tools/vm-runtime-tests` Cargo consumer. The compatibility shell gate now
+  delegates to that crate, which invokes both libraries directly and inspects
+  VM memory without temporary dumps or a ROM.
 
 Still incomplete:
 
@@ -50,9 +52,6 @@ Still incomplete:
   types rather than structured library observations;
 - the remaining monolithic CPU, bus, image, CIO, and Action-specific code has
   not yet been split mechanically;
-- the `initialized_arrays` gate still invokes the thin CLI. A direct Cargo
-  consumer must wait for these VM commits to have a pushed, pinnable Git
-  revision; do not replace that requirement with a permanent sibling path;
 - the remaining runtime gates have not migrated.
 
 ## Ownership Boundary
@@ -214,10 +213,13 @@ Migrate the `initialized_arrays` runtime gate first:
 - remove the temporary memory dump and `od` parsing from the new path;
 - keep the existing shell gate until both paths agree.
 
-The dependency must be non-default and pinned.  Normal `actionc` builds must not
-compile the VM or require ROM files.  Do not encode a permanent sibling path in
-`actionc`'s `Cargo.toml`; use a versioned Git dependency behind a dedicated
-`vm-tests` feature, or vendor the crate only if offline builds require it.
+The first direct consumer is implemented as a separate, non-workspace Cargo
+crate under `actionc/tools/vm-runtime-tests`. It pins this repository by exact
+Git revision. This leaves `actionc`'s root `Cargo.toml` and `Cargo.lock`
+unchanged, so normal builds and tests neither resolve nor fetch the private VM
+repository. The isolated crate enables Cargo's Git CLI fetching so existing
+private-repository credentials can be reused. Do not replace this boundary
+with a permanent sibling path dependency.
 
 ### Slice 8: gradual runtime-gate migration
 
