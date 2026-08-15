@@ -28,6 +28,33 @@ At the start of the refactor:
 The passing CLI behavior, exit status, trace ordering, and capture artifacts are
 compatibility contracts until their consumers have migrated.
 
+## Implementation Status
+
+Implemented and committed:
+
+- the structured `VmRunner`, run requests, stop reasons, reports, final VM
+  state, bounded history, and lifecycle hooks;
+- CLI execution through the library-owned loop with characterized stop text;
+- byte-oriented image, source, object, and host-file APIs;
+- explicit execution profiles and ROM-free standalone-object execution;
+- structured scheduled key, CIO, and source-injection actions with direct and
+  gated PC triggers;
+- CLI adoption of the scheduled key/CIO queue;
+- the first source split, moving Atari object parsing into `src/object.rs`;
+- ROM-free classic and MIR6502 execution in the `actionc`
+  `initialized_arrays` shell gate.
+
+Still incomplete:
+
+- Action call/fixup/code-pointer observers and symbol snapshots remain CLI
+  types rather than structured library observations;
+- the remaining monolithic CPU, bus, image, CIO, and Action-specific code has
+  not yet been split mechanically;
+- the `initialized_arrays` gate still invokes the thin CLI. A direct Cargo
+  consumer must wait for these VM commits to have a pushed, pinnable Git
+  revision; do not replace that requirement with a permanent sibling path;
+- the remaining runtime gates have not migrated.
+
 ## Ownership Boundary
 
 ### Library owns
