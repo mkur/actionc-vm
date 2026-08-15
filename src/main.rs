@@ -7,8 +7,9 @@ use action_compiler_vm::{
     ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ACTION_SEGMENT_END_VECTOR, ATARI_KEY_C, ATARI_KEY_E,
     ATARI_KEY_RETURN, ActionEditorLine, ActionSourceInjectionReport, ActionSymbolEntry,
     AddressRange, AtariLoadReport, BusAccess, BusEvent, BusRegion, CioObservation, CioSummary,
-    CpuError, CpuRegisters, CpuStep, Hotpatch, ImageKind, TextScreenSnapshot, VmConfig,
-    action_current_proc_name, decode_action_symbol_tables, format_action_symbol_dump_json,
+    CpuRegisters, CpuStep, Hotpatch, ImageKind, RunRequest, StopReason, TextScreenSnapshot,
+    VmConfig, VmRunHooks, VmRunner, action_current_proc_name, decode_action_symbol_tables,
+    format_action_symbol_dump_json,
 };
 
 fn main() {
@@ -77,6 +78,138 @@ fn inspect(config: VmConfig) -> Result<(), String> {
     Ok(())
 }
 
+struct CliRunHooks<'a> {
+    options: &'a CliOptions,
+    deferred_key_codes: Vec<DeferredKeyCode>,
+    deferred_scripted_cio_inputs: Vec<DeferredScriptedCioInput>,
+    deferred_source_injections: Vec<DeferredSourceInjection>,
+    editor_line_dump_pcs: Vec<u16>,
+    screen_dump_pcs: Vec<u16>,
+    menu_dump_traps: Vec<MenuDumpTrap>,
+    symbol_snapshots: Vec<SymbolSnapshot>,
+    action_fixup_trace: ActionFixupTrace,
+    action_code_pointer_trace: ActionCodePointerTrace,
+    action_call_trace: ActionCallTrace,
+}
+
+impl VmRunHooks for CliRunHooks<'_> {
+    type Error = String;
+
+    fn before_step(&mut self, vm: &mut action_compiler_vm::CompilerVm) -> Result<(), Self::Error> {
+        let pc = vm.cpu().registers().pc;
+        let mut source_index = 0;
+        while source_index < self.deferred_source_injections.len() {
+            if self.deferred_source_injections[source_index].pc == pc {
+                let deferred = self.deferred_source_injections.remove(source_index);
+                let source = fs::read(&deferred.path).map_err(|err| {
+                    format!(
+                        "failed to read source `{}` for injection: {err}",
+                        deferred.path.display()
+                    )
+                })?;
+                let report = vm.bus_mut().inject_action_source(&source)?;
+                print_source_injection_report(&deferred, &report);
+                print_editor_lines(vm.bus())?;
+            } else {
+                source_index += 1;
+            }
+        }
+
+        let mut dump_index = 0;
+        while dump_index < self.editor_line_dump_pcs.len() {
+            if self.editor_line_dump_pcs[dump_index] == pc {
+                let dump_pc = self.editor_line_dump_pcs.remove(dump_index);
+                eprintln!("Action! editor lines at PC=${dump_pc:04X}:");
+                print_editor_lines(vm.bus())?;
+            } else {
+                dump_index += 1;
+            }
+        }
+
+        let mut screen_dump_index = 0;
+        while screen_dump_index < self.screen_dump_pcs.len() {
+            if self.screen_dump_pcs[screen_dump_index] == pc {
+                let dump_pc = self.screen_dump_pcs.remove(screen_dump_index);
+                eprintln!("text screen at PC=${dump_pc:04X}:");
+                print_text_screen(&vm.bus().text_screen_snapshot(40, 24));
+            } else {
+                screen_dump_index += 1;
+            }
+        }
+
+        for trap in &self.menu_dump_traps {
+            if trap.pc == pc {
+                dump_menu_trap(trap, &vm.cpu().registers(), vm.bus());
+            }
+        }
+
+        for trigger in &self.options.symbol_snapshot_triggers {
+            if trigger.pc == pc {
+                let snapshot = capture_symbol_snapshot(trigger, vm.bus());
+                if !trigger.skip_empty || snapshot.has_symbols() {
+                    self.symbol_snapshots.push(snapshot);
+                }
+            }
+        }
+
+        let mut deferred_index = 0;
+        while deferred_index < self.deferred_scripted_cio_inputs.len() {
+            if self.deferred_scripted_cio_inputs[deferred_index].after_pc == Some(pc) {
+                self.deferred_scripted_cio_inputs[deferred_index].after_pc = None;
+            }
+            if self.deferred_scripted_cio_inputs[deferred_index]
+                .after_pc
+                .is_none()
+                && self.deferred_scripted_cio_inputs[deferred_index].pc == pc
+            {
+                let deferred = self.deferred_scripted_cio_inputs.remove(deferred_index);
+                vm.bus_mut().queue_scripted_cio_input_bytes(&deferred.bytes);
+                eprintln!(
+                    "queued {} scripted CIO byte(s) at PC=${:04X}",
+                    deferred.bytes.len(),
+                    deferred.pc
+                );
+            } else {
+                deferred_index += 1;
+            }
+        }
+
+        let mut deferred_index = 0;
+        while deferred_index < self.deferred_key_codes.len() {
+            if self.deferred_key_codes[deferred_index].after_pc == Some(pc) {
+                self.deferred_key_codes[deferred_index].after_pc = None;
+            }
+            if self.deferred_key_codes[deferred_index].after_pc.is_none()
+                && self.deferred_key_codes[deferred_index].pc == pc
+            {
+                let deferred = self.deferred_key_codes.remove(deferred_index);
+                vm.bus_mut().queue_key_code(deferred.key_code);
+                eprintln!(
+                    "queued key ${:02X} at PC=${:04X}",
+                    deferred.key_code, deferred.pc
+                );
+            } else {
+                deferred_index += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn after_step(
+        &mut self,
+        vm: &action_compiler_vm::CompilerVm,
+        step: &CpuStep,
+    ) -> Result<(), Self::Error> {
+        if self.options.should_trace(step.pc) {
+            print_step(step);
+        }
+        self.action_fixup_trace.observe(step, vm.bus());
+        self.action_code_pointer_trace.observe(step, vm.bus());
+        self.action_call_trace.observe(step, vm.bus());
+        Ok(())
+    }
+}
+
 fn run_vm(options: CliOptions) -> Result<(), String> {
     let config = options.config.clone();
     config.validate_for_execution()?;
@@ -135,291 +268,115 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
             );
         }
     }
-    let mut deferred_key_codes = options.deferred_key_codes.clone();
-    let mut deferred_scripted_cio_inputs = options.deferred_scripted_cio_inputs.clone();
-    let mut deferred_source_injections = options.deferred_source_injections.clone();
-    let mut editor_line_dump_pcs = options.editor_line_dump_pcs.clone();
-    let mut screen_dump_pcs = options.screen_dump_pcs.clone();
-    let menu_dump_traps = options.menu_dump_traps.clone();
-    let mut symbol_snapshots = Vec::new();
-    let mut action_fixup_trace = ActionFixupTrace::new(options.trace_action_fixups);
-    let mut action_code_pointer_trace =
+    let action_fixup_trace = ActionFixupTrace::new(options.trace_action_fixups);
+    let action_code_pointer_trace =
         ActionCodePointerTrace::new(options.trace_action_code_pointer, vm.bus());
-    let mut action_call_trace = ActionCallTrace::new(
+    let action_call_trace = ActionCallTrace::new(
         options.trace_action_calls,
         load_action_call_listings(&options)?,
         load_action_call_maps(&options)?,
     );
+    let mut hooks = CliRunHooks {
+        options: &options,
+        deferred_key_codes: options.deferred_key_codes.clone(),
+        deferred_scripted_cio_inputs: options.deferred_scripted_cio_inputs.clone(),
+        deferred_source_injections: options.deferred_source_injections.clone(),
+        editor_line_dump_pcs: options.editor_line_dump_pcs.clone(),
+        screen_dump_pcs: options.screen_dump_pcs.clone(),
+        menu_dump_traps: options.menu_dump_traps.clone(),
+        symbol_snapshots: Vec::new(),
+        action_fixup_trace,
+        action_code_pointer_trace,
+        action_call_trace,
+    };
     println!(
         "compiler VM loaded {} image(s); start PC=${:04X}",
         vm.images().len(),
         vm.cpu().registers().pc
     );
 
-    let mut history = StepHistory::new(options.history_len);
-    for step_index in 0..options.max_steps {
-        let pc = vm.cpu().registers().pc;
-        let mut source_index = 0;
-        while source_index < deferred_source_injections.len() {
-            if deferred_source_injections[source_index].pc == pc {
-                let deferred = deferred_source_injections.remove(source_index);
-                let source = fs::read(&deferred.path).map_err(|err| {
-                    format!(
-                        "failed to read source `{}` for injection: {err}",
-                        deferred.path.display()
-                    )
-                })?;
-                let report = vm.bus_mut().inject_action_source(&source)?;
-                print_source_injection_report(&deferred, &report);
-                print_editor_lines(vm.bus())?;
-            } else {
-                source_index += 1;
-            }
-        }
-
-        let mut dump_index = 0;
-        while dump_index < editor_line_dump_pcs.len() {
-            if editor_line_dump_pcs[dump_index] == pc {
-                let dump_pc = editor_line_dump_pcs.remove(dump_index);
-                eprintln!("Action! editor lines at PC=${dump_pc:04X}:");
-                print_editor_lines(vm.bus())?;
-            } else {
-                dump_index += 1;
-            }
-        }
-
-        let mut screen_dump_index = 0;
-        while screen_dump_index < screen_dump_pcs.len() {
-            if screen_dump_pcs[screen_dump_index] == pc {
-                let dump_pc = screen_dump_pcs.remove(screen_dump_index);
-                eprintln!("text screen at PC=${dump_pc:04X}:");
-                print_text_screen(&vm.bus().text_screen_snapshot(40, 24));
-            } else {
-                screen_dump_index += 1;
-            }
-        }
-
-        for trap in &menu_dump_traps {
-            if trap.pc == pc {
-                dump_menu_trap(trap, &vm.cpu().registers(), vm.bus());
-            }
-        }
-
-        for trigger in &options.symbol_snapshot_triggers {
-            if trigger.pc == pc {
-                let snapshot = capture_symbol_snapshot(trigger, vm.bus());
-                if !trigger.skip_empty || snapshot.has_symbols() {
-                    symbol_snapshots.push(snapshot);
-                }
-            }
-        }
-
-        let mut deferred_index = 0;
-        while deferred_index < deferred_scripted_cio_inputs.len() {
-            if deferred_scripted_cio_inputs[deferred_index].after_pc == Some(pc) {
-                deferred_scripted_cio_inputs[deferred_index].after_pc = None;
-            }
-            if deferred_scripted_cio_inputs[deferred_index]
-                .after_pc
-                .is_none()
-                && deferred_scripted_cio_inputs[deferred_index].pc == pc
-            {
-                let deferred = deferred_scripted_cio_inputs.remove(deferred_index);
-                vm.bus_mut().queue_scripted_cio_input_bytes(&deferred.bytes);
-                eprintln!(
-                    "queued {} scripted CIO byte(s) at PC=${:04X}",
-                    deferred.bytes.len(),
-                    deferred.pc
-                );
-            } else {
-                deferred_index += 1;
-            }
-        }
-
-        let mut deferred_index = 0;
-        while deferred_index < deferred_key_codes.len() {
-            if deferred_key_codes[deferred_index].after_pc == Some(pc) {
-                deferred_key_codes[deferred_index].after_pc = None;
-            }
-            if deferred_key_codes[deferred_index].after_pc.is_none()
-                && deferred_key_codes[deferred_index].pc == pc
-            {
-                let deferred = deferred_key_codes.remove(deferred_index);
-                vm.bus_mut().queue_key_code(deferred.key_code);
-                eprintln!(
-                    "queued key ${:02X} at PC=${:04X}",
-                    deferred.key_code, deferred.pc
-                );
-            } else {
-                deferred_index += 1;
-            }
-        }
-        match vm.step_cpu() {
-            Ok(step) => {
-                if options.should_trace(step.pc) {
-                    print_step(&step);
-                }
-                let reached_trace_until = options.trace_until == Some(step.pc);
-                action_fixup_trace.observe(&step, vm.bus());
-                action_code_pointer_trace.observe(&step, vm.bus());
-                action_call_trace.observe(&step, vm.bus());
-                history.push(step);
-                if reached_trace_until {
-                    print_stop_report(
-                        "trace-until reached",
-                        Some(step.registers_after),
-                        Some(&history),
-                        vm.bus().events(),
-                        vm.bus().cio_summary(),
-                        vm.bus().cio_observations(),
-                        vm.bus().cartridge().map(|cart| cart.mapping_info()),
-                        &action_fixup_trace,
-                        &action_code_pointer_trace,
-                    );
-                    print_run_observations(
-                        vm.bus(),
-                        options.dump_screen_on_stop,
-                        &options.memory_dump_ranges,
-                    );
-                    capture_final_symbol_snapshot(
-                        &options,
-                        &mut symbol_snapshots,
-                        vm.cpu().registers().pc,
-                        vm.bus(),
-                    );
-                    write_stop_outputs(&options, vm.bus())?;
-                    write_symbol_snapshots(&options, &symbol_snapshots)?;
-                    return Ok(());
-                }
-            }
-            Err(CpuError::UnsupportedOpcode { pc, opcode }) => {
-                print_stop_report(
-                    &format!("unsupported opcode ${opcode:02X} at ${pc:04X}"),
-                    Some(vm.cpu().registers()),
-                    Some(&history),
-                    vm.bus().events(),
-                    vm.bus().cio_summary(),
-                    vm.bus().cio_observations(),
-                    vm.bus().cartridge().map(|cart| cart.mapping_info()),
-                    &action_fixup_trace,
-                    &action_code_pointer_trace,
-                );
-                print_run_observations(
-                    vm.bus(),
-                    options.dump_screen_on_stop,
-                    &options.memory_dump_ranges,
-                );
-                capture_final_symbol_snapshot(
-                    &options,
-                    &mut symbol_snapshots,
-                    vm.cpu().registers().pc,
-                    vm.bus(),
-                );
-                write_stop_outputs(&options, vm.bus())?;
-                write_symbol_snapshots(&options, &symbol_snapshots)?;
-                return Err(format!("unsupported opcode ${opcode:02X} at ${pc:04X}"));
-            }
-            Err(CpuError::ProtectedCodeWrite {
-                pc,
-                address,
-                old_value,
-                new_value,
-                region,
-            }) => {
-                print_stop_report(
-                    &format!(
-                        "protected code write at ${address:04X}: ${old_value:02X} -> ${new_value:02X} ({region:?}), instruction PC=${pc:04X}"
-                    ),
-                    Some(vm.cpu().registers()),
-                    Some(&history),
-                    vm.bus().events(),
-                    vm.bus().cio_summary(),
-                    vm.bus().cio_observations(),
-                    vm.bus().cartridge().map(|cart| cart.mapping_info()),
-                    &action_fixup_trace,
-                    &action_code_pointer_trace,
-                );
-                print_run_observations(
-                    vm.bus(),
-                    options.dump_screen_on_stop,
-                    &options.memory_dump_ranges,
-                );
-                capture_final_symbol_snapshot(
-                    &options,
-                    &mut symbol_snapshots,
-                    vm.cpu().registers().pc,
-                    vm.bus(),
-                );
-                write_stop_outputs(&options, vm.bus())?;
-                write_symbol_snapshots(&options, &symbol_snapshots)?;
-                return Err(format!(
-                    "protected code write at ${address:04X}: ${old_value:02X} -> ${new_value:02X}"
-                ));
-            }
-            Err(CpuError::Halted) => {
-                print_stop_report(
-                    "CPU halted",
-                    Some(vm.cpu().registers()),
-                    Some(&history),
-                    vm.bus().events(),
-                    vm.bus().cio_summary(),
-                    vm.bus().cio_observations(),
-                    vm.bus().cartridge().map(|cart| cart.mapping_info()),
-                    &action_fixup_trace,
-                    &action_code_pointer_trace,
-                );
-                print_run_observations(
-                    vm.bus(),
-                    options.dump_screen_on_stop,
-                    &options.memory_dump_ranges,
-                );
-                capture_final_symbol_snapshot(
-                    &options,
-                    &mut symbol_snapshots,
-                    vm.cpu().registers().pc,
-                    vm.bus(),
-                );
-                write_stop_outputs(&options, vm.bus())?;
-                write_symbol_snapshots(&options, &symbol_snapshots)?;
-                return Err("CPU halted".to_string());
-            }
-        }
-
-        if step_index + 1 == options.max_steps {
-            print_stop_report(
-                "max steps reached",
-                Some(vm.cpu().registers()),
-                Some(&history),
-                vm.bus().events(),
-                vm.bus().cio_summary(),
-                vm.bus().cio_observations(),
-                vm.bus().cartridge().map(|cart| cart.mapping_info()),
-                &action_fixup_trace,
-                &action_code_pointer_trace,
-            );
-            print_run_observations(
-                vm.bus(),
-                options.dump_screen_on_stop,
-                &options.memory_dump_ranges,
-            );
-            capture_final_symbol_snapshot(
-                &options,
-                &mut symbol_snapshots,
-                vm.cpu().registers().pc,
-                vm.bus(),
-            );
-            write_stop_outputs(&options, vm.bus())?;
-            write_symbol_snapshots(&options, &symbol_snapshots)?;
-        }
+    if options.max_steps == 0 {
+        println!(
+            "stopped after 0 step(s), cycles={}, PC=${:04X}",
+            vm.cpu().cycles(),
+            vm.cpu().registers().pc
+        );
+        return Ok(());
     }
 
-    println!(
-        "stopped after {} step(s), cycles={}, PC=${:04X}",
-        options.max_steps,
-        vm.cpu().cycles(),
-        vm.cpu().registers().pc
+    let outcome = VmRunner::new(vm).run_with_hooks(
+        RunRequest {
+            max_steps: options.max_steps,
+            stop_after_pc: options.trace_until,
+            history_len: options.history_len,
+        },
+        &mut hooks,
+    )?;
+    let report = &outcome.report;
+    let vm = &outcome.vm;
+    let (reason, return_error) = describe_stop(report.stop);
+
+    print_stop_report(
+        &reason,
+        Some(report.registers),
+        Some(&report.history),
+        vm.bus().events(),
+        vm.bus().cio_summary(),
+        vm.bus().cio_observations(),
+        vm.bus().cartridge().map(|cart| cart.mapping_info()),
+        &hooks.action_fixup_trace,
+        &hooks.action_code_pointer_trace,
     );
+    print_run_observations(
+        vm.bus(),
+        options.dump_screen_on_stop,
+        &options.memory_dump_ranges,
+    );
+    capture_final_symbol_snapshot(
+        &options,
+        &mut hooks.symbol_snapshots,
+        vm.cpu().registers().pc,
+        vm.bus(),
+    );
+    write_stop_outputs(&options, vm.bus())?;
+    write_symbol_snapshots(&options, &hooks.symbol_snapshots)?;
+
+    if let Some(error) = return_error {
+        return Err(error);
+    }
+    if matches!(report.stop, StopReason::StepLimit { .. }) {
+        println!(
+            "stopped after {} step(s), cycles={}, PC=${:04X}",
+            options.max_steps, report.cycles, report.registers.pc
+        );
+    }
     Ok(())
+}
+
+fn describe_stop(stop: StopReason) -> (String, Option<String>) {
+    match stop {
+        StopReason::StepLimit { .. } => ("max steps reached".to_string(), None),
+        StopReason::PcReached { .. } => ("trace-until reached".to_string(), None),
+        StopReason::UnsupportedOpcode { pc, opcode } => {
+            let reason = format!("unsupported opcode ${opcode:02X} at ${pc:04X}");
+            (reason.clone(), Some(reason))
+        }
+        StopReason::ProtectedCodeWrite {
+            pc,
+            address,
+            old_value,
+            new_value,
+            region,
+        } => (
+            format!(
+                "protected code write at ${address:04X}: ${old_value:02X} -> ${new_value:02X} ({region:?}), instruction PC=${pc:04X}"
+            ),
+            Some(format!(
+                "protected code write at ${address:04X}: ${old_value:02X} -> ${new_value:02X}"
+            )),
+        ),
+        StopReason::Halted => ("CPU halted".to_string(), Some("CPU halted".to_string())),
+    }
 }
 
 fn print_load_object_report(path: &std::path::Path, report: &AtariLoadReport) {
@@ -1437,35 +1394,6 @@ fn parse_listing_proc_code_range(line: &str) -> Result<Option<AddressRange>, Str
     Ok(Some(AddressRange { start, end }))
 }
 
-#[derive(Debug)]
-struct StepHistory {
-    limit: usize,
-    steps: VecDeque<CpuStep>,
-}
-
-impl StepHistory {
-    fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            steps: VecDeque::new(),
-        }
-    }
-
-    fn push(&mut self, step: CpuStep) {
-        if self.limit == 0 {
-            return;
-        }
-        if self.steps.len() == self.limit {
-            self.steps.pop_front();
-        }
-        self.steps.push_back(step);
-    }
-
-    fn steps(&self) -> impl Iterator<Item = &CpuStep> {
-        self.steps.iter()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActionMapRoutineSignature {
     address: u16,
@@ -2378,7 +2306,7 @@ fn crossed_boundary(previous: u16, current: u16, boundary: u16) -> bool {
 fn print_stop_report(
     reason: &str,
     registers: Option<CpuRegisters>,
-    history: Option<&StepHistory>,
+    history: Option<&[CpuStep]>,
     events: &[BusEvent],
     cio_summary: &CioSummary,
     cio_observations: &VecDeque<CioObservation>,
@@ -2405,7 +2333,7 @@ fn print_stop_report(
     }
     if let Some(history) = history {
         eprintln!("recent instructions:");
-        for step in history.steps() {
+        for step in history {
             eprint!("  ");
             print_step_stderr(step);
         }
@@ -3106,5 +3034,48 @@ mod tests {
         let err = parse_options(vec!["--key-at-pc".to_string(), "$A2E0".to_string()]).unwrap_err();
 
         assert!(err.contains("must be pc:key"));
+    }
+
+    #[test]
+    fn characterizes_successful_cli_stop_descriptions() {
+        assert_eq!(
+            describe_stop(StopReason::StepLimit { max_steps: 10 }),
+            ("max steps reached".to_string(), None)
+        );
+        assert_eq!(
+            describe_stop(StopReason::PcReached { pc: 0x3456 }),
+            ("trace-until reached".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn characterizes_failed_cli_stop_descriptions() {
+        assert_eq!(
+            describe_stop(StopReason::UnsupportedOpcode {
+                pc: 0x3456,
+                opcode: 0x02,
+            }),
+            (
+                "unsupported opcode $02 at $3456".to_string(),
+                Some("unsupported opcode $02 at $3456".to_string())
+            )
+        );
+        assert_eq!(
+            describe_stop(StopReason::ProtectedCodeWrite {
+                pc: 0x3456,
+                address: 0x3005,
+                old_value: 0xEA,
+                new_value: 0x42,
+                region: BusRegion::Ram,
+            }),
+            (
+                "protected code write at $3005: $EA -> $42 (Ram), instruction PC=$3456".to_string(),
+                Some("protected code write at $3005: $EA -> $42".to_string())
+            )
+        );
+        assert_eq!(
+            describe_stop(StopReason::Halted),
+            ("CPU halted".to_string(), Some("CPU halted".to_string()))
+        );
     }
 }
