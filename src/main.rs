@@ -7,9 +7,9 @@ use action_compiler_vm::{
     ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ACTION_SEGMENT_END_VECTOR, ATARI_KEY_C, ATARI_KEY_E,
     ATARI_KEY_RETURN, ActionEditorLine, ActionSourceInjectionReport, ActionSymbolEntry,
     AddressRange, AtariLoadReport, BusAccess, BusEvent, BusRegion, CioObservation, CioSummary,
-    CpuRegisters, CpuStep, Hotpatch, ImageKind, PcTrigger, RunRequest, ScheduledAction,
-    ScheduledActionObservation, ScheduledActions, StopReason, TextScreenSnapshot, VmConfig,
-    VmRunHooks, VmRunner, action_current_proc_name, decode_action_symbol_tables,
+    CpuRegisters, CpuStep, ExecutionProfile, Hotpatch, ImageKind, PcTrigger, RunRequest,
+    ScheduledAction, ScheduledActionObservation, ScheduledActions, StopReason, TextScreenSnapshot,
+    VmConfig, VmRunHooks, VmRunner, action_current_proc_name, decode_action_symbol_tables,
     format_action_symbol_dump_json,
 };
 
@@ -181,9 +181,32 @@ impl VmRunHooks for CliRunHooks<'_> {
     }
 }
 
+fn validate_cli_execution(options: &CliOptions) -> Result<(), String> {
+    match options.execution_profile {
+        ExecutionProfile::SyntheticTest => {
+            return Err(
+                "synthetic-test is a library-only profile; use VmRunner with caller-installed memory"
+                    .to_string(),
+            );
+        }
+        ExecutionProfile::CartridgeObject | ExecutionProfile::StandaloneObject
+            if options.load_objects.is_empty() =>
+        {
+            return Err(format!(
+                "{:?} requires at least one --load-object",
+                options.execution_profile
+            ));
+        }
+        _ => {}
+    }
+    options
+        .config
+        .validate_for_profile(options.execution_profile)
+}
+
 fn run_vm(options: CliOptions) -> Result<(), String> {
     let config = options.config.clone();
-    config.validate_for_execution()?;
+    validate_cli_execution(&options)?;
     let mut vm = config.load()?;
     for watchpoint in &options.watchpoints {
         vm.bus_mut().add_watchpoint(*watchpoint);
@@ -518,6 +541,7 @@ fn write_symbol_dump(path: &PathBuf, bus: &action_compiler_vm::Bus) -> Result<()
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliOptions {
     config: VmConfig,
+    execution_profile: ExecutionProfile,
     max_steps: u64,
     trace_pc: bool,
     trace_ranges: Vec<AddressRange>,
@@ -615,6 +639,7 @@ impl Default for CliOptions {
     fn default() -> Self {
         Self {
             config: VmConfig::default(),
+            execution_profile: ExecutionProfile::OriginalCompiler,
             max_steps: 1_000,
             trace_pc: false,
             trace_ranges: Vec::new(),
@@ -658,6 +683,7 @@ impl CliOptions {
 
 fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut config = VmConfig::default();
+    let mut execution_profile = ExecutionProfile::OriginalCompiler;
     let mut max_steps = 1_000;
     let mut trace_pc = false;
     let mut trace_ranges = Vec::new();
@@ -693,6 +719,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
 
     while index < args.len() {
         match args[index].as_str() {
+            "--profile" => {
+                index += 1;
+                let value = required_value(&args, index, "--profile")?;
+                execution_profile = parse_execution_profile(value)?;
+            }
             "--max-cycles" | "--max-steps" => {
                 index += 1;
                 let value = required_value(&args, index, "--max-cycles")?;
@@ -946,6 +977,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
 
     Ok(CliOptions {
         config,
+        execution_profile,
         max_steps,
         trace_pc,
         trace_ranges,
@@ -987,6 +1019,18 @@ fn apply_preset(config: &mut VmConfig, value: &str) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!("unknown preset `{other}`")),
+    }
+}
+
+fn parse_execution_profile(value: &str) -> Result<ExecutionProfile, String> {
+    match value {
+        "original-compiler" => Ok(ExecutionProfile::OriginalCompiler),
+        "cartridge-object" => Ok(ExecutionProfile::CartridgeObject),
+        "standalone-object" => Ok(ExecutionProfile::StandaloneObject),
+        "synthetic-test" => Ok(ExecutionProfile::SyntheticTest),
+        other => Err(format!(
+            "unknown execution profile `{other}`; expected original-compiler, cartridge-object, standalone-object, or synthetic-test"
+        )),
     }
 }
 
@@ -2505,6 +2549,8 @@ fn print_help() {
          action-compiler-vm run [options]\n\n\
          Options:\n  \
          --preset <name>      Mapping preset, currently action-os\n  \
+         --profile <name>     Execution profile: original-compiler (default),\n  \
+                              cartridge-object, or standalone-object\n  \
          --cart <path>        Load an Action! cartridge image\n  \
          --cart-base <addr>   Cartridge base address, default $A000\n  \
          --os <path>          Load an Atari OS ROM image at $C000\n  \
@@ -3036,6 +3082,51 @@ mod tests {
             describe_stop(StopReason::PcReached { pc: 0x3456 }),
             ("trace-until reached".to_string(), None)
         );
+    }
+
+    #[test]
+    fn parses_execution_profiles_and_defaults_to_original_compiler() {
+        assert_eq!(
+            parse_options(Vec::new()).unwrap().execution_profile,
+            ExecutionProfile::OriginalCompiler
+        );
+        let options = parse_options(vec![
+            "--profile".to_string(),
+            "standalone-object".to_string(),
+            "--load-object".to_string(),
+            "program.com".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options.execution_profile,
+            ExecutionProfile::StandaloneObject
+        );
+        validate_cli_execution(&options).unwrap();
+    }
+
+    #[test]
+    fn validates_cli_profile_specific_requirements() {
+        let mut options = CliOptions {
+            execution_profile: ExecutionProfile::CartridgeObject,
+            ..CliOptions::default()
+        };
+        assert!(
+            validate_cli_execution(&options)
+                .unwrap_err()
+                .contains("--load-object")
+        );
+
+        options.execution_profile = ExecutionProfile::SyntheticTest;
+        assert!(
+            validate_cli_execution(&options)
+                .unwrap_err()
+                .contains("library-only")
+        );
+
+        let error =
+            parse_options(vec!["--profile".to_string(), "unknown".to_string()]).unwrap_err();
+        assert!(error.contains("unknown execution profile"));
     }
 
     #[test]

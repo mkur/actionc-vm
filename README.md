@@ -39,6 +39,7 @@ implemented yet.
 cargo test
 cargo run -- inspect --cart path/to/action.rom
 cargo run -- run --cart path/to/action.rom --os path/to/atari-os.rom --max-cycles 1000 --trace-pc
+cargo run -- run --profile standalone-object --load-object path/to/program.com --max-steps 1000
 scripts/run-probe functions
 scripts/run-probe all
 ```
