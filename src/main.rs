@@ -179,6 +179,14 @@ impl VmRunHooks for CliRunHooks<'_> {
         self.action_call_trace.observe(step, vm.bus());
         Ok(())
     }
+
+    fn stop_reason(&self, vm: &actionc_vm::CompilerVm, step: &CpuStep) -> Option<StopReason> {
+        (self.options.stop_on_input_idle
+            && self.scheduled_actions.pending().is_empty()
+            && self.deferred_source_injections.is_empty()
+            && vm.bus().scripted_cio_input_is_idle())
+        .then_some(StopReason::ScriptedInputIdle { pc: step.pc })
+    }
 }
 
 fn validate_cli_execution(options: &CliOptions) -> Result<(), String> {
@@ -370,6 +378,10 @@ fn describe_stop(stop: StopReason) -> (String, Option<String>) {
     match stop {
         StopReason::StepLimit { .. } => ("max steps reached".to_string(), None),
         StopReason::PcReached { .. } => ("trace-until reached".to_string(), None),
+        StopReason::ScriptedInputIdle { .. } => (
+            "scripted input consumed; VM is waiting for input".to_string(),
+            None,
+        ),
         StopReason::UnsupportedOpcode { pc, opcode } => {
             let reason = format!("unsupported opcode ${opcode:02X} at ${pc:04X}");
             (reason.clone(), Some(reason))
@@ -543,6 +555,7 @@ struct CliOptions {
     config: VmConfig,
     execution_profile: ExecutionProfile,
     max_steps: u64,
+    stop_on_input_idle: bool,
     trace_pc: bool,
     trace_ranges: Vec<AddressRange>,
     trace_until: Option<u16>,
@@ -641,6 +654,7 @@ impl Default for CliOptions {
             config: VmConfig::default(),
             execution_profile: ExecutionProfile::OriginalCompiler,
             max_steps: 1_000,
+            stop_on_input_idle: false,
             trace_pc: false,
             trace_ranges: Vec::new(),
             trace_until: None,
@@ -685,6 +699,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut config = VmConfig::default();
     let mut execution_profile = ExecutionProfile::OriginalCompiler;
     let mut max_steps = 1_000;
+    let mut stop_on_input_idle = false;
     let mut trace_pc = false;
     let mut trace_ranges = Vec::new();
     let mut trace_until = None;
@@ -730,6 +745,9 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 max_steps = value
                     .parse()
                     .map_err(|_| format!("invalid max step count `{value}`"))?;
+            }
+            "--stop-on-input-idle" => {
+                stop_on_input_idle = true;
             }
             "--trace-pc" => {
                 trace_pc = true;
@@ -979,6 +997,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         config,
         execution_profile,
         max_steps,
+        stop_on_input_idle,
         trace_pc,
         trace_ranges,
         trace_until,
@@ -2549,6 +2568,7 @@ fn print_help() {
          --os <path>          Override bundled AltirraOS with an OS ROM image\n  \
          --os-base <addr>     OS ROM base address, default $C000\n  \
          --max-cycles <n>     Run at most n CPU steps, default 1000\n  \
+         --stop-on-input-idle Stop after scripted input is consumed and Action! waits for more\n  \
          --trace-pc           Print one line per executed instruction\n  \
          --trace-range <a:b>  Print instructions with PC inside the range\n  \
          --trace-until <addr> Stop after executing an instruction at addr\n  \
@@ -2636,6 +2656,13 @@ mod tests {
         let options = parse_options(vec!["--q-input".to_string(), "C\\n".to_string()]).unwrap();
 
         assert_eq!(options.scripted_cio_inputs, vec![vec![b'C', 0x9B]]);
+    }
+
+    #[test]
+    fn parses_stop_on_input_idle_option() {
+        let options = parse_options(vec!["--stop-on-input-idle".to_string()]).unwrap();
+
+        assert!(options.stop_on_input_idle);
     }
 
     #[test]
@@ -3071,6 +3098,13 @@ mod tests {
         assert_eq!(
             describe_stop(StopReason::PcReached { pc: 0x3456 }),
             ("trace-until reached".to_string(), None)
+        );
+        assert_eq!(
+            describe_stop(StopReason::ScriptedInputIdle { pc: 0xE456 }),
+            (
+                "scripted input consumed; VM is waiting for input".to_string(),
+                None
+            )
         );
     }
 

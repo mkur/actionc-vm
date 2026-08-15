@@ -2107,11 +2107,13 @@ impl Cpu {
                 }
                 let raw_key = bus.ram().read(CH_KEY_CODE);
                 let Some(character) = atari_key_code_to_character(raw_key) else {
+                    bus.keyboard_read_waiting = true;
                     observation.detail = "keyboard read waiting".to_string();
                     bus.finish_cio_observation(observation);
                     return false;
                 };
 
+                bus.keyboard_read_waiting = false;
                 bus.write(CH_KEY_CODE, 0xFF);
                 observation.handled = true;
                 observation.detail = format!("keyboard read ${character:02X}");
@@ -2350,6 +2352,8 @@ pub struct Bus {
     vcount: u8,
     pending_key_codes: VecDeque<u8>,
     scripted_cio_input: VecDeque<u8>,
+    scripted_cio_input_was_queued: bool,
+    keyboard_read_waiting: bool,
     cio_channel0_output: Vec<u8>,
     cio_harness_devices: [Option<CioHarnessDevice>; 8],
     host_files: Vec<HostFile>,
@@ -2378,6 +2382,8 @@ impl Default for Bus {
             vcount: 0,
             pending_key_codes: VecDeque::new(),
             scripted_cio_input: VecDeque::new(),
+            scripted_cio_input_was_queued: false,
+            keyboard_read_waiting: false,
             cio_channel0_output: Vec::new(),
             cio_harness_devices: [None; 8],
             host_files: Vec::new(),
@@ -2479,6 +2485,7 @@ impl Bus {
     }
 
     pub fn queue_key_code(&mut self, key_code: u8) {
+        self.keyboard_read_waiting = false;
         if self.ram.read(CH_KEY_CODE) == 0xFF {
             self.deliver_key_code(key_code);
         } else {
@@ -2487,11 +2494,28 @@ impl Bus {
     }
 
     pub fn queue_scripted_cio_input_byte(&mut self, byte: u8) {
+        self.scripted_cio_input_was_queued = true;
+        self.keyboard_read_waiting = false;
         self.scripted_cio_input.push_back(byte);
     }
 
     pub fn queue_scripted_cio_input_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.scripted_cio_input_was_queued = true;
+        self.keyboard_read_waiting = false;
         self.scripted_cio_input.extend(bytes);
+    }
+
+    /// True after scripted CIO input has been consumed and the VM has observed
+    /// the program waiting for another channel-7 keyboard character.
+    pub fn scripted_cio_input_is_idle(&self) -> bool {
+        self.scripted_cio_input_was_queued
+            && self.scripted_cio_input.is_empty()
+            && self.pending_key_codes.is_empty()
+            && self.ram.read(CH_KEY_CODE) == 0xFF
+            && self.keyboard_read_waiting
     }
 
     pub fn add_host_file(&mut self, name: impl AsRef<str>, bytes: Vec<u8>) {
@@ -2997,7 +3021,11 @@ impl Bus {
     }
 
     fn pop_scripted_cio_input_byte(&mut self) -> Option<u8> {
-        self.scripted_cio_input.pop_front()
+        let byte = self.scripted_cio_input.pop_front();
+        if byte.is_some() {
+            self.keyboard_read_waiting = false;
+        }
+        byte
     }
 
     fn try_open_harness_cio_device(&mut self, x: u8) -> bool {
@@ -6220,6 +6248,20 @@ mod tests {
         assert_eq!(cpu.registers().pc, 0x2000);
         assert_eq!(cpu.registers().a, b'Q');
         assert_eq!(bus.ram().read(CH_KEY_CODE), ATARI_KEY_C);
+        assert!(!bus.scripted_cio_input_is_idle());
+
+        bus.ram_mut().write(CH_KEY_CODE, 0xFF);
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x70;
+        cpu.registers.sp = 0xFB;
+
+        assert!(!cpu.try_emulate_ciov(&mut bus));
+        assert!(bus.scripted_cio_input_is_idle());
+
+        bus.queue_scripted_cio_input_byte(b'R');
+        assert!(!bus.scripted_cio_input_is_idle());
     }
 
     #[test]

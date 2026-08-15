@@ -110,6 +110,12 @@ paths beep; errors additionally print an `Error:` line with a numeric code. The
 VM therefore records speaker writes and can dump/decode the Atari text screen
 with `--dump-screen-at-pc <pc>` or `--dump-screen-on-stop`.
 
+For multi-command automation, such as compile followed by write, a beep is not
+the terminal signal because queued monitor commands may remain. Use
+`--stop-on-input-idle` to stop after all scheduled `Q:` input has been delivered
+and consumed and Action! attempts its next keyboard read. Keep `--max-steps` as
+the failure ceiling.
+
 ## CIO Harness Devices
 
 The VM reserves two synthetic CIO-device roles for compiler automation:

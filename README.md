@@ -184,6 +184,10 @@ Set `ACTION_VM_CART` or `ACTION_VM_OS` only when comparing against different
 images; the probe runner otherwise uses the VM's bundled Action! cartridge and
 AltirraOS.
 
+The runner stops normally after its scripted `Q:` input has been consumed and
+Action! returns to an idle keyboard read. `ACTION_VM_MAX_STEPS` remains a safety
+limit for cartridge or harness failures.
+
 VM-generated objects and symbol JSON files are written below the probe output
 directory and compared with matching original-compiler captures when present.
 The output paths and step limit can be overridden with

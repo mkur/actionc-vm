@@ -302,6 +302,7 @@ run_probe() {
       --action-symbol-hooks
       --monitor-key-at-pc '$A2E0'
       --q-input-at-pc-after '$A2E0:$B2F5:'"$monitor_input"
+      --stop-on-input-idle
       --max-steps "$max_steps"
       --history 20
     )

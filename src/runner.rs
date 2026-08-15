@@ -162,6 +162,11 @@ pub trait VmRunHooks {
     fn after_step(&mut self, _vm: &CompilerVm, _step: &CpuStep) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    /// Optionally request a structured stop after a completed instruction.
+    fn stop_reason(&self, _vm: &CompilerVm, _step: &CpuStep) -> Option<StopReason> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -199,6 +204,9 @@ pub enum StopReason {
         max_steps: u64,
     },
     PcReached {
+        pc: u16,
+    },
+    ScriptedInputIdle {
         pc: u16,
     },
     Halted,
@@ -328,6 +336,9 @@ impl VmRunner {
                     completed_steps += 1;
                     hooks.after_step(&self.vm, &step)?;
                     push_history(&mut history, request.history_len, step);
+                    if let Some(reason) = hooks.stop_reason(&self.vm, &step) {
+                        break reason;
+                    }
                     if request.stop_after_pc == Some(step.pc) {
                         break StopReason::PcReached { pc: step.pc };
                     }
@@ -393,6 +404,16 @@ mod tests {
         }
     }
 
+    struct StopAfterFirstStep;
+
+    impl VmRunHooks for StopAfterFirstStep {
+        type Error = Infallible;
+
+        fn stop_reason(&self, _vm: &CompilerVm, step: &CpuStep) -> Option<StopReason> {
+            Some(StopReason::ScriptedInputIdle { pc: step.pc })
+        }
+    }
+
     fn vm_with_program(program: &[u8]) -> CompilerVm {
         let mut vm = CompilerVm::default();
         vm.bus_mut().ram_mut().map(0x0200, program).unwrap();
@@ -440,6 +461,29 @@ mod tests {
         assert_eq!(outcome.report.attempted_steps, 2);
         assert_eq!(outcome.report.completed_steps, 2);
         assert_eq!(outcome.report.registers.pc, 0x0202);
+    }
+
+    #[test]
+    fn hooks_can_request_a_structured_stop_after_a_completed_step() {
+        let vm = vm_with_program(&[0xEA, 0xEA]);
+        let mut hooks = StopAfterFirstStep;
+        let outcome = VmRunner::new(vm)
+            .run_with_hooks(
+                RunRequest {
+                    max_steps: 2,
+                    ..RunRequest::default()
+                },
+                &mut hooks,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome.stop_reason(),
+            StopReason::ScriptedInputIdle { pc: 0x0200 }
+        );
+        assert_eq!(outcome.report.attempted_steps, 1);
+        assert_eq!(outcome.report.completed_steps, 1);
+        assert_eq!(outcome.report.history.len(), 1);
     }
 
     #[test]
