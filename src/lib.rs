@@ -171,21 +171,20 @@ impl VmConfig {
         }
 
         if let Some(path) = &self.source {
-            vm.source = Some(
-                fs::read(path)
-                    .map_err(|err| format!("failed to read source `{}`: {err}", path.display()))?,
-            );
+            let source = fs::read(path)
+                .map_err(|err| format!("failed to read source `{}`: {err}", path.display()))?;
+            vm.set_source_bytes(source);
         }
 
         for (name, path) in &self.host_files {
             let bytes = fs::read(path)
                 .map_err(|err| format!("failed to read host file `{}`: {err}", path.display()))?;
-            vm.bus_mut().add_host_file(name, bytes);
+            vm.add_host_file_bytes(name, bytes);
         }
         for (name, _) in &self.host_outputs {
-            vm.bus_mut().add_host_output(name);
+            vm.add_host_output(name);
         }
-        vm.bus_mut().set_trace_cio(self.trace_cio);
+        vm.set_trace_cio(self.trace_cio);
 
         Ok(vm)
     }
@@ -304,6 +303,14 @@ impl CompilerVm {
         self.source.as_deref()
     }
 
+    pub fn set_source_bytes(&mut self, source: impl Into<Vec<u8>>) {
+        self.source = Some(source.into());
+    }
+
+    pub fn clear_source(&mut self) {
+        self.source = None;
+    }
+
     pub fn cpu(&self) -> &Cpu {
         &self.cpu
     }
@@ -326,6 +333,45 @@ impl CompilerVm {
 
     pub fn load_atari_object(&mut self, bytes: &[u8]) -> Result<AtariLoadReport, String> {
         load_atari_object_into_memory(self.bus.ram_mut(), bytes)
+    }
+
+    /// Loads an image supplied by a library caller without performing file I/O.
+    ///
+    /// `label` is retained only for diagnostics and image metadata; it need not
+    /// identify a real filesystem path.
+    pub fn load_image_bytes(
+        &mut self,
+        kind: ImageKind,
+        label: impl Into<PathBuf>,
+        base: u16,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        let image = LoadedImage::prepare(kind, label.into(), base, bytes)?;
+        match image.kind {
+            ImageKind::Ram => self.bus.ram_mut().map(base, &image.bytes)?,
+            ImageKind::Rom => self.bus.map_os_rom(base, image.bytes.clone())?,
+            ImageKind::Cartridge => self
+                .bus
+                .install_cartridge(Cartridge::from_loaded_image(&image)?),
+        }
+        self.images.push(image);
+        Ok(())
+    }
+
+    pub fn add_host_file_bytes(&mut self, name: impl AsRef<str>, bytes: impl Into<Vec<u8>>) {
+        self.bus.add_host_file(name, bytes.into());
+    }
+
+    pub fn add_host_output(&mut self, name: impl AsRef<str>) {
+        self.bus.add_host_output(name);
+    }
+
+    pub fn host_file_bytes(&self, name: impl AsRef<str>) -> Option<&[u8]> {
+        self.bus.host_file_bytes(name)
+    }
+
+    pub fn set_trace_cio(&mut self, trace_cio: bool) {
+        self.bus.set_trace_cio(trace_cio);
     }
 
     pub fn protect_code_ranges(&mut self, ranges: &[AddressRange]) {
@@ -379,16 +425,7 @@ impl CompilerVm {
     fn load_image(&mut self, kind: ImageKind, path: PathBuf, base: u16) -> Result<(), String> {
         let bytes = fs::read(&path)
             .map_err(|err| format!("failed to read image `{}`: {err}", path.display()))?;
-        let image = LoadedImage::prepare(kind, path, base, bytes)?;
-        match image.kind {
-            ImageKind::Ram => self.bus.ram_mut().map(base, &image.bytes)?,
-            ImageKind::Rom => self.bus.map_os_rom(base, image.bytes.clone())?,
-            ImageKind::Cartridge => self
-                .bus
-                .install_cartridge(Cartridge::from_loaded_image(&image)?),
-        }
-        self.images.push(image);
-        Ok(())
+        self.load_image_bytes(kind, path, base, bytes)
     }
 }
 
@@ -4376,6 +4413,46 @@ mod tests {
         assert_eq!(metadata.end, 0xA002);
         assert_eq!(metadata.checksum16, 0x66);
         assert_eq!(metadata.crc32, 0xFAC7_3763);
+    }
+
+    #[test]
+    fn constructs_vm_inputs_from_caller_owned_bytes() {
+        let mut vm = CompilerVm::default();
+        vm.load_image_bytes(
+            ImageKind::Ram,
+            "embedded:test-program",
+            0x2000,
+            vec![0xA9, 0x42],
+        )
+        .unwrap();
+        vm.set_source_bytes(b"BYTE value".to_vec());
+        vm.add_host_file_bytes("D:LIB.ACT", b"BYTE helper".to_vec());
+        vm.add_host_output("D:OUT.COM");
+        vm.set_trace_cio(true);
+
+        assert_eq!(vm.memory().read(0x2000), 0xA9);
+        assert_eq!(vm.source(), Some(b"BYTE value".as_slice()));
+        assert_eq!(
+            vm.host_file_bytes("lib.act"),
+            Some(b"BYTE helper".as_slice())
+        );
+        assert_eq!(vm.host_file_bytes("out.com"), Some([].as_slice()));
+        assert_eq!(vm.images().len(), 1);
+        assert_eq!(vm.images()[0].path, PathBuf::from("embedded:test-program"));
+
+        vm.clear_source();
+        assert_eq!(vm.source(), None);
+    }
+
+    #[test]
+    fn byte_image_diagnostics_retain_the_caller_label() {
+        let mut vm = CompilerVm::default();
+        let error = vm
+            .load_image_bytes(ImageKind::Ram, "generated-object", 0xFFFF, vec![0x11, 0x22])
+            .unwrap_err();
+
+        assert!(error.contains("generated-object"));
+        assert!(error.contains("exceeds 64K"));
     }
 
     #[test]

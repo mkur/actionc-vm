@@ -46,6 +46,32 @@ scripts/run-probe all
 `run` currently resets and steps the bootstrap CPU through the mapped bus.
 For phase 1, `run` requires both the Action! cartridge ROM and an Atari OS ROM.
 
+## Library use
+
+The CPU loop and stop policy are also available without spawning the CLI. Image,
+source, object, and host-file data can be supplied as bytes, so an embedding
+test harness does not need temporary files:
+
+```rust
+use action_compiler_vm::{CompilerVm, RunRequest, VmRunner};
+
+let mut vm = CompilerVm::default();
+vm.prepare_headless_program_environment();
+let load = vm.load_atari_object(&object_bytes)?;
+vm.set_pc(load.run_address.ok_or("object has no RUNAD")?);
+
+let outcome = VmRunner::new(vm).run(RunRequest {
+    max_steps: 10_000,
+    ..RunRequest::default()
+});
+let result = outcome.memory().read(0x0600);
+```
+
+ROM and cartridge callers can use `CompilerVm::load_image_bytes`; host inputs
+and captured outputs use `add_host_file_bytes`, `add_host_output`, and
+`host_file_bytes`. The path-based `VmConfig` remains available for CLI-style
+callers.
+
 `scripts/run-probe` runs the original Action! compiler in the VM against probe
 sources from `../actionc/experiments/original-compiler-probes`. It feeds monitor
 commands equivalent to:
