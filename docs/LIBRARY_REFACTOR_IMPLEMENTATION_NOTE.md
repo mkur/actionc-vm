@@ -226,9 +226,9 @@ Migrate the `initialized_arrays` runtime gate first:
 The first direct consumer is implemented as a separate, non-workspace Cargo
 crate under `actionc/tools/vm-runtime-tests`. It pins this repository by exact
 Git revision. This leaves `actionc`'s root `Cargo.toml` and `Cargo.lock`
-unchanged, so normal builds and tests neither resolve nor fetch the private VM
-repository. The isolated crate enables Cargo's Git CLI fetching so existing
-private-repository credentials can be reused. Do not replace this boundary
+unchanged, so normal builds and tests neither resolve nor fetch the `actionc-vm`
+repository. The isolated crate enables Cargo's Git CLI fetching so it uses the
+developer's existing Git transport configuration. Do not replace this boundary
 with a permanent sibling path dependency.
 
 ### Slice 8: gradual runtime-gate migration

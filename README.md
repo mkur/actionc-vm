@@ -110,8 +110,8 @@ For local development, add a path dependency:
 actionc-vm = { path = "../actionc-vm" }
 ```
 
-Repository consumers should pin the private Git dependency to an exact
-revision. This keeps VM changes intentional and reproducible.
+Repository consumers should pin the Git dependency to an exact revision. This
+keeps VM changes intentional and reproducible.
 
 A standalone object can be loaded, executed, and inspected entirely in memory:
 
@@ -147,7 +147,7 @@ test harnesses should prefer the byte-oriented API.
 The `actionc` repository keeps its VM runtime gates in the isolated
 `tools/vm-runtime-tests` crate. That crate pins `actionc-vm` by exact Git
 revision and is deliberately outside the main workspace dependency graph, so a
-normal compiler build does not fetch or build this private repository.
+normal compiler build does not fetch or build the VM.
 
 The current runtime suite executes seven self-contained fixtures with
 `StandaloneObject` and twelve fixtures that need runtime services with
@@ -172,11 +172,11 @@ scripts/run-probe functions
 scripts/run-probe all
 ```
 
-The script's default paths target the original sibling `actionc` checkout
-layout. For the current public checkout layout, set the paths explicitly:
+The script's default path targets the current sibling `actionc-public-release`
+checkout layout. Override it when the compiler repository lives elsewhere:
 
 ```sh
-ACTION_PROBES_DIR=../actionc-public-release/surveys/probes/original-compiler \
+ACTION_PROBES_DIR=/path/to/actionc/surveys/probes/original-compiler \
 scripts/run-probe functions
 ```
 

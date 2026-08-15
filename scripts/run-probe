@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 
-probe_dir="${ACTION_PROBES_DIR:-$repo_root/../actionc/experiments/original-compiler-probes}"
+probe_dir="${ACTION_PROBES_DIR:-$repo_root/../actionc-public-release/surveys/probes/original-compiler}"
 output_dir="${ACTION_VM_OUTPUT_DIR:-$probe_dir/outputs/vm}"
 symbol_output_dir="${ACTION_VM_SYMBOL_OUTPUT_DIR:-$output_dir}"
 original_dir="${ACTION_ORIGINAL_OUTPUT_DIR:-$probe_dir/outputs/original}"

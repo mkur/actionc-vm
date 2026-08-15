@@ -128,7 +128,7 @@ actionc-vm compile \
 ```toml
 [[probe]]
 name = "abi_calls"
-source = "../actionc/experiments/original-compiler-probes/abi_calls.act"
+source = "../actionc-public-release/surveys/probes/original-compiler/abi_calls.act"
 origin = "3000"
 ```
 
