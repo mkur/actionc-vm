@@ -40,7 +40,8 @@ Implemented and committed:
 - structured scheduled key, CIO, and source-injection actions with direct and
   gated PC triggers;
 - CLI adoption of the scheduled key/CIO queue;
-- the first source split, moving Atari object parsing into `src/object.rs`;
+- the first source splits, moving Atari object parsing into `src/object.rs` and
+  address-range/RAM primitives into `src/memory.rs`;
 - all 19 `actionc` memory-result gates in an isolated
   `tools/vm-runtime-tests` Cargo consumer. Seven self-contained gates use the
   ROM-free standalone-object profile; twelve runtime-service gates load ROM
@@ -196,6 +197,7 @@ After behavior is library-backed, split the monolithic sources mechanically:
 ```text
 src/cpu.rs
 src/bus.rs
+src/memory.rs
 src/images.rs
 src/object.rs
 src/cio.rs
