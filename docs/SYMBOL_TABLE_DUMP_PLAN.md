@@ -23,7 +23,7 @@ raw byte offset.
 
 ## 2. Add A VM-Side Decoder
 
-Add a reusable decoder to `action-compiler-vm` that reads the live VM memory and
+Add a reusable decoder to `actionc-vm` that reads the live VM memory and
 returns:
 
 - global index root

@@ -1,4 +1,4 @@
-# action-compiler-vm
+# actionc-vm
 
 Headless experiment for running the original Action! compiler without driving a
 full emulator UI.
@@ -54,7 +54,7 @@ source, object, and host-file data can be supplied as bytes, so an embedding
 test harness does not need temporary files:
 
 ```rust
-use action_compiler_vm::{CompilerVm, ExecutionProfile, RunRequest, VmRunner};
+use actionc_vm::{CompilerVm, ExecutionProfile, RunRequest, VmRunner};
 
 let mut vm = CompilerVm::default();
 vm.load_atari_object_for_execution(ExecutionProfile::StandaloneObject, &object_bytes)?;

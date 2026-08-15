@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`action-compiler-vm` already exposes its CPU, bus, object loader, CIO harness,
+`actionc-vm` already exposes its CPU, bus, object loader, CIO harness,
 and Action!-specific memory decoders from `src/lib.rs`.  The reusable boundary
 is incomplete, however: the execution loop, stop policy, scheduled actions,
 tracing, and result collection still live in the CLI's `src/main.rs`.

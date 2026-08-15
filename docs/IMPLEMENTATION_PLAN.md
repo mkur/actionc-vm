@@ -107,7 +107,7 @@ surface.
     - Add a command shaped like:
 
 ```sh
-action-compiler-vm compile \
+actionc-vm compile \
   --cart ACTION.ROM \
   --os ATARIOS.ROM \
   --source probe.act \

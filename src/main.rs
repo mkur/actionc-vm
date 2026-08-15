@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use action_compiler_vm::{
+use actionc_vm::{
     ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ACTION_SEGMENT_END_VECTOR, ATARI_KEY_C, ATARI_KEY_E,
     ATARI_KEY_RETURN, ActionEditorLine, ActionSourceInjectionReport, ActionSymbolEntry,
     AddressRange, AtariLoadReport, BusAccess, BusEvent, BusRegion, CioObservation, CioSummary,
@@ -95,7 +95,7 @@ struct CliRunHooks<'a> {
 impl VmRunHooks for CliRunHooks<'_> {
     type Error = String;
 
-    fn before_step(&mut self, vm: &mut action_compiler_vm::CompilerVm) -> Result<(), Self::Error> {
+    fn before_step(&mut self, vm: &mut actionc_vm::CompilerVm) -> Result<(), Self::Error> {
         let pc = vm.cpu().registers().pc;
         let mut source_index = 0;
         while source_index < self.deferred_source_injections.len() {
@@ -168,7 +168,7 @@ impl VmRunHooks for CliRunHooks<'_> {
 
     fn after_step(
         &mut self,
-        vm: &action_compiler_vm::CompilerVm,
+        vm: &actionc_vm::CompilerVm,
         step: &CpuStep,
     ) -> Result<(), Self::Error> {
         if self.options.should_trace(step.pc) {
@@ -409,7 +409,7 @@ fn print_load_object_report(path: &std::path::Path, report: &AtariLoadReport) {
 
 fn capture_symbol_snapshot(
     trigger: &SymbolSnapshotTrigger,
-    bus: &action_compiler_vm::Bus,
+    bus: &actionc_vm::Bus,
 ) -> SymbolSnapshot {
     let dump = decode_action_symbol_tables(bus);
     let proc_name = action_current_proc_name(bus);
@@ -433,7 +433,7 @@ fn capture_final_symbol_snapshot(
     options: &CliOptions,
     snapshots: &mut Vec<SymbolSnapshot>,
     pc: u16,
-    bus: &action_compiler_vm::Bus,
+    bus: &actionc_vm::Bus,
 ) {
     if !options.capture_final_symbol_snapshot {
         return;
@@ -478,7 +478,7 @@ fn write_symbol_snapshots(
     Ok(())
 }
 
-fn write_stop_outputs(options: &CliOptions, bus: &action_compiler_vm::Bus) -> Result<(), String> {
+fn write_stop_outputs(options: &CliOptions, bus: &actionc_vm::Bus) -> Result<(), String> {
     write_host_outputs(&options.config, bus)?;
     if let Some(path) = &options.raw_memory_dump_path {
         write_raw_memory_dump(path, bus)?;
@@ -489,7 +489,7 @@ fn write_stop_outputs(options: &CliOptions, bus: &action_compiler_vm::Bus) -> Re
     Ok(())
 }
 
-fn write_host_outputs(config: &VmConfig, bus: &action_compiler_vm::Bus) -> Result<(), String> {
+fn write_host_outputs(config: &VmConfig, bus: &actionc_vm::Bus) -> Result<(), String> {
     for (name, path) in &config.host_outputs {
         let bytes = bus
             .host_file_bytes(name)
@@ -505,7 +505,7 @@ fn write_host_outputs(config: &VmConfig, bus: &action_compiler_vm::Bus) -> Resul
     Ok(())
 }
 
-fn write_raw_memory_dump(path: &PathBuf, bus: &action_compiler_vm::Bus) -> Result<(), String> {
+fn write_raw_memory_dump(path: &PathBuf, bus: &actionc_vm::Bus) -> Result<(), String> {
     let mut bytes = Vec::with_capacity(0x10000);
     for address in 0..=u16::MAX {
         bytes.push(bus.ram().read(address));
@@ -524,7 +524,7 @@ fn write_raw_memory_dump(path: &PathBuf, bus: &action_compiler_vm::Bus) -> Resul
     Ok(())
 }
 
-fn write_symbol_dump(path: &PathBuf, bus: &action_compiler_vm::Bus) -> Result<(), String> {
+fn write_symbol_dump(path: &PathBuf, bus: &actionc_vm::Bus) -> Result<(), String> {
     let dump = decode_action_symbol_tables(bus);
     let json = format_action_symbol_dump_json(&dump);
     fs::write(path, json.as_bytes())
@@ -1479,7 +1479,7 @@ impl ActionCallTrace {
         }
     }
 
-    fn observe(&mut self, step: &CpuStep, bus: &action_compiler_vm::Bus) {
+    fn observe(&mut self, step: &CpuStep, bus: &actionc_vm::Bus) {
         if !self.enabled {
             return;
         }
@@ -1494,7 +1494,7 @@ impl ActionCallTrace {
         }
     }
 
-    fn observe_jsr(&mut self, step: &CpuStep, bus: &action_compiler_vm::Bus) {
+    fn observe_jsr(&mut self, step: &CpuStep, bus: &actionc_vm::Bus) {
         let target = bus.ram().read_word(step.pc.wrapping_add(1));
         let Some(info) = self.resolve_target(target, bus) else {
             return;
@@ -1563,11 +1563,7 @@ impl ActionCallTrace {
         );
     }
 
-    fn resolve_target(
-        &self,
-        target: u16,
-        bus: &action_compiler_vm::Bus,
-    ) -> Option<ActionRoutineTraceInfo> {
+    fn resolve_target(&self, target: u16, bus: &actionc_vm::Bus) -> Option<ActionRoutineTraceInfo> {
         let symbol = find_action_routine_symbol(target, bus);
         if let Some(signature) = self.map_entries.get(&target) {
             return Some(ActionRoutineTraceInfo {
@@ -1671,7 +1667,7 @@ fn parse_action_map_params(value: &str) -> Result<Vec<ActionMapParam>, String> {
 fn format_action_call_args(
     params: &[ActionMapParam],
     regs: CpuRegisters,
-    bus: &action_compiler_vm::Bus,
+    bus: &actionc_vm::Bus,
 ) -> String {
     if params.is_empty() {
         return "args=[]".to_string();
@@ -1710,7 +1706,7 @@ fn format_action_call_args(
 fn action_abi_arg_byte(
     offset: u16,
     regs: CpuRegisters,
-    bus: &action_compiler_vm::Bus,
+    bus: &actionc_vm::Bus,
 ) -> (&'static str, u8) {
     match offset {
         0 => ("A", regs.a),
@@ -1742,10 +1738,7 @@ fn action_abi_fixed_zp_home(offset: u16) -> &'static str {
     }
 }
 
-fn find_action_routine_symbol(
-    target: u16,
-    bus: &action_compiler_vm::Bus,
-) -> Option<ActionSymbolEntry> {
+fn find_action_routine_symbol(target: u16, bus: &actionc_vm::Bus) -> Option<ActionSymbolEntry> {
     let dump = decode_action_symbol_tables(bus);
     dump.locals
         .into_iter()
@@ -1759,8 +1752,8 @@ fn is_named_routine(entry: &ActionSymbolEntry, target: u16) -> bool {
 
 fn scoped_symbol_name(entry: &ActionSymbolEntry) -> String {
     let scope = match entry.scope {
-        action_compiler_vm::ActionSymbolScope::Global => "global",
-        action_compiler_vm::ActionSymbolScope::Local => "local",
+        actionc_vm::ActionSymbolScope::Global => "global",
+        actionc_vm::ActionSymbolScope::Local => "local",
     };
     format!("{scope}::{}", entry.name)
 }
@@ -1808,7 +1801,7 @@ fn print_source_injection_report(
     );
 }
 
-fn print_editor_lines(bus: &action_compiler_vm::Bus) -> Result<(), String> {
+fn print_editor_lines(bus: &actionc_vm::Bus) -> Result<(), String> {
     let lines = bus.action_editor_lines()?;
     if lines.is_empty() {
         eprintln!("  <empty>");
@@ -1834,7 +1827,7 @@ fn print_editor_line(index: usize, line: &ActionEditorLine) {
 }
 
 fn print_run_observations(
-    bus: &action_compiler_vm::Bus,
+    bus: &actionc_vm::Bus,
     dump_screen: bool,
     memory_dump_ranges: &[AddressRange],
 ) {
@@ -1860,7 +1853,7 @@ fn print_run_observations(
     print_memory_dumps(bus, memory_dump_ranges);
 }
 
-fn print_memory_dumps(bus: &action_compiler_vm::Bus, ranges: &[AddressRange]) {
+fn print_memory_dumps(bus: &actionc_vm::Bus, ranges: &[AddressRange]) {
     for range in ranges {
         eprintln!("memory ${:04X}-${:04X}:", range.start, range.end);
         let mut line_start = range.start;
@@ -1887,7 +1880,7 @@ fn print_memory_dumps(bus: &action_compiler_vm::Bus, ranges: &[AddressRange]) {
     }
 }
 
-fn dump_menu_trap(trap: &MenuDumpTrap, regs: &CpuRegisters, bus: &action_compiler_vm::Bus) {
+fn dump_menu_trap(trap: &MenuDumpTrap, regs: &CpuRegisters, bus: &actionc_vm::Bus) {
     let pointer = u16::from_le_bytes([regs.a, regs.x]);
     eprintln!(
         "menu dump `{}` at PC=${:04X}: input A/X=${:02X}/${:02X} ptr=${:04X} Y=${:02X} A3=${:02X}",
@@ -1918,7 +1911,7 @@ fn dump_menu_trap(trap: &MenuDumpTrap, regs: &CpuRegisters, bus: &action_compile
     }
 }
 
-fn dump_menu_entries(start: u16, bus: &action_compiler_vm::Bus, max_entries: usize) -> bool {
+fn dump_menu_entries(start: u16, bus: &actionc_vm::Bus, max_entries: usize) -> bool {
     let mut address = start;
     let mut valid = true;
     for index in 0..max_entries {
@@ -1968,12 +1961,12 @@ fn dump_menu_entries(start: u16, bus: &action_compiler_vm::Bus, max_entries: usi
     false
 }
 
-fn format_menu_raw_entry(bus: &action_compiler_vm::Bus, address: u16, len: u8) -> String {
+fn format_menu_raw_entry(bus: &actionc_vm::Bus, address: u16, len: u8) -> String {
     let total = u16::from(len).saturating_add(5);
     format_menu_raw_bytes(bus, address, total)
 }
 
-fn format_menu_raw_bytes(bus: &action_compiler_vm::Bus, address: u16, total: u16) -> String {
+fn format_menu_raw_bytes(bus: &actionc_vm::Bus, address: u16, total: u16) -> String {
     let mut out = String::new();
     for offset in 0..total {
         if offset != 0 {
@@ -2107,7 +2100,7 @@ fn escape_json(value: &str) -> String {
     escaped
 }
 
-fn cart_word(cartridge: &action_compiler_vm::Cartridge, address: u16) -> u16 {
+fn cart_word(cartridge: &actionc_vm::Cartridge, address: u16) -> u16 {
     let lo = cartridge.read(address).unwrap_or(0xFF);
     let hi = cartridge.read(address.wrapping_add(1)).unwrap_or(0xFF);
     u16::from_le_bytes([lo, hi])
@@ -2148,7 +2141,7 @@ impl ActionFixupTrace {
         }
     }
 
-    fn observe(&mut self, step: &CpuStep, bus: &action_compiler_vm::Bus) {
+    fn observe(&mut self, step: &CpuStep, bus: &actionc_vm::Bus) {
         if !self.enabled {
             return;
         }
@@ -2215,13 +2208,13 @@ fn action_fixup_pc_label(pc: u16) -> Option<&'static str> {
     }
 }
 
-fn read_ram_word(bus: &action_compiler_vm::Bus, address: u16) -> u16 {
+fn read_ram_word(bus: &actionc_vm::Bus, address: u16) -> u16 {
     let lo = bus.ram().read(address);
     let hi = bus.ram().read(address.wrapping_add(1));
     u16::from_le_bytes([lo, hi])
 }
 
-fn read_ram_window(bus: &action_compiler_vm::Bus, start: u16) -> [u8; 5] {
+fn read_ram_window(bus: &actionc_vm::Bus, start: u16) -> [u8; 5] {
     [
         bus.ram().read(start),
         bus.ram().read(start.wrapping_add(1)),
@@ -2252,7 +2245,7 @@ struct ActionCodePointerObservation {
 }
 
 impl ActionCodePointerTrace {
-    fn new(enabled: bool, bus: &action_compiler_vm::Bus) -> Self {
+    fn new(enabled: bool, bus: &actionc_vm::Bus) -> Self {
         let pointer = action_code_pointer(bus);
         let region = bus.visible_region(pointer);
         let mut trace = Self {
@@ -2268,7 +2261,7 @@ impl ActionCodePointerTrace {
         trace
     }
 
-    fn observe(&mut self, step: &CpuStep, bus: &action_compiler_vm::Bus) {
+    fn observe(&mut self, step: &CpuStep, bus: &actionc_vm::Bus) {
         if !self.enabled {
             return;
         }
@@ -2297,7 +2290,7 @@ impl ActionCodePointerTrace {
         }
     }
 
-    fn push(&mut self, cycle: u64, pc: u16, bus: &action_compiler_vm::Bus, reason: &'static str) {
+    fn push(&mut self, cycle: u64, pc: u16, bus: &actionc_vm::Bus, reason: &'static str) {
         self.observations.push_back(ActionCodePointerObservation {
             cycle,
             pc,
@@ -2325,11 +2318,11 @@ impl ActionCodePointerTrace {
     }
 }
 
-fn action_code_pointer(bus: &action_compiler_vm::Bus) -> u16 {
+fn action_code_pointer(bus: &actionc_vm::Bus) -> u16 {
     read_ram_word(bus, 0x000E)
 }
 
-fn action_codebase(bus: &action_compiler_vm::Bus) -> u16 {
+fn action_codebase(bus: &actionc_vm::Bus) -> u16 {
     read_ram_word(bus, 0x0491)
 }
 
@@ -2344,7 +2337,7 @@ fn print_stop_report(
     events: &[BusEvent],
     cio_summary: &CioSummary,
     cio_observations: &VecDeque<CioObservation>,
-    cartridge: Option<action_compiler_vm::CartridgeMappingInfo>,
+    cartridge: Option<actionc_vm::CartridgeMappingInfo>,
     action_fixup_trace: &ActionFixupTrace,
     action_code_pointer_trace: &ActionCodePointerTrace,
 ) {
@@ -2543,10 +2536,10 @@ fn print_step_stderr(step: &CpuStep) {
 
 fn print_help() {
     println!(
-        "action-compiler-vm\n\n\
+        "actionc-vm\n\n\
          Usage:\n  \
-         action-compiler-vm inspect [options]\n  \
-         action-compiler-vm run [options]\n\n\
+         actionc-vm inspect [options]\n  \
+         actionc-vm run [options]\n\n\
          Options:\n  \
          --preset <name>      Mapping preset, currently action-os\n  \
          --profile <name>     Execution profile: original-compiler (default),\n  \
@@ -2823,10 +2816,7 @@ mod tests {
 
     #[test]
     fn parses_menu_dump_trap_from_listing_proc() {
-        let path = env::temp_dir().join(format!(
-            "action-compiler-vm-menu-trap-{}.lst",
-            std::process::id()
-        ));
+        let path = env::temp_dir().join(format!("actionc-vm-menu-trap-{}.lst", std::process::id()));
         fs::write(&path, "; ===== PROC Items $35A7..$35EA entry $35AA =====\n").unwrap();
 
         let options = parse_options(vec![

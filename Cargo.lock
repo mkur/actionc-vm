@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "action-compiler-vm"
+name = "actionc-vm"
 version = "0.1.0"
