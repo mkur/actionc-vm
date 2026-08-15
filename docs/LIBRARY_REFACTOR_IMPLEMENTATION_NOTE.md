@@ -41,10 +41,12 @@ Implemented and committed:
   gated PC triggers;
 - CLI adoption of the scheduled key/CIO queue;
 - the first source split, moving Atari object parsing into `src/object.rs`;
-- ROM-free classic and MIR6502 execution in an isolated `actionc`
-  `tools/vm-runtime-tests` Cargo consumer. The compatibility shell gate now
-  delegates to that crate, which invokes both libraries directly and inspects
-  VM memory without temporary dumps or a ROM.
+- all 19 `actionc` memory-result gates in an isolated
+  `tools/vm-runtime-tests` Cargo consumer. Seven self-contained gates use the
+  ROM-free standalone-object profile; twelve runtime-service gates load ROM
+  bytes through the cartridge-object library profile. Their compatibility
+  scripts invoke the library tests without VM subprocesses, memory dumps, or
+  `od` parsing, while retaining compiler-selection preflights where relevant.
 
 Still incomplete:
 
@@ -52,7 +54,8 @@ Still incomplete:
   types rather than structured library observations;
 - the remaining monolithic CPU, bus, image, CIO, and Action-specific code has
   not yet been split mechanically;
-- the remaining runtime gates have not migrated.
+- CIO/host-file gates and original-compiler or toolkit capture workflows still
+  use the CLI where a process boundary remains appropriate.
 
 ## Ownership Boundary
 
@@ -223,10 +226,10 @@ with a permanent sibling path dependency.
 
 ### Slice 8: gradual runtime-gate migration
 
-Migrate remaining gates in this order:
+Migration order:
 
-1. pure memory-result fixtures;
-2. ABI and runtime-helper fixtures;
+1. pure memory-result fixtures — complete;
+2. ABI and runtime-helper fixtures — complete for the current runtime suite;
 3. CIO and host-file fixtures;
 4. TN and toolkit diagnostics.
 
