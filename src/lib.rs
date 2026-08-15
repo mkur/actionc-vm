@@ -2,6 +2,10 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 
+mod runner;
+
+pub use runner::{RunOutcome, RunReport, RunRequest, StopReason, VmRunner};
+
 pub const RAM_SIZE: usize = 0x10000;
 pub const DEFAULT_CART_BASE: u16 = 0xA000;
 pub const OS_ROM_BASE: u16 = 0xC000;
