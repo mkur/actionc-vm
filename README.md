@@ -1,104 +1,199 @@
 # actionc-vm
 
-Headless experiment for running the original Action! compiler without driving a
-full emulator UI.
+`actionc-vm` is a deterministic, headless 6502 VM for Action! compiler work.
+It is used both as a Rust library and as a command-line diagnostic harness.
 
-The goal is a small "compiler VM", not a general Atari emulator. The useful
-finish line is:
+The VM has two main jobs:
 
-1. load the Action! cartridge and any required OS/runtime images,
-2. place an `.ACT` source program into the compiler's expected memory state,
-3. run just enough 6502/OS/CIO behavior to invoke compilation,
-4. extract the generated object bytes for comparison with `actionc`.
+- execute Atari load-format objects produced by `actionc` and let tests inspect
+  their final memory state;
+- boot and drive the original Action! cartridge compiler for compatibility
+  probes, object capture, symbol inspection, and Action/TN diagnostics.
 
-If this grows into ANTIC/GTIA/POKEY/display-list or timing emulation, the spike
-should stop and fall back to Atari800 automation.
+It is intentionally not a general Atari emulator. Display-list rendering,
+graphics, sound, and cycle-accurate hardware emulation belong in Atari800,
+Altirra, or another full emulator.
 
-## Current Status
+## Capabilities
 
-This repo currently contains a no-dependency Rust scaffold:
+- all legal NMOS 6502 opcodes, instruction stepping, cycle accounting, and
+  bounded execution history;
+- 64 KiB RAM, Atari OS ROM mapping, Action! cartridge mapping and banking, and
+  extra RAM/ROM/cartridge images;
+- Atari load-format object parsing, segment loading, `RUNAD` startup, and a
+  headless program environment;
+- the OS and CIO behavior needed by the current Action! workflows, including
+  in-memory `H:`/`D:` host files and captured outputs;
+- scheduled keyboard input, CIO input, and Action! source injection at direct
+  or gated PC triggers;
+- watchpoints, protected code ranges, traces, memory dumps, and structured stop
+  reports;
+- Action!-specific editor, screen, menu, call, and symbol-table diagnostics;
+- a no-dependency Rust library API for running programs without spawning the
+  CLI or exchanging 64 KiB memory-dump files.
 
-- a 64K memory image,
-- a bus with writable RAM, read-only OS ROM, cartridge mapping, and watchpoints,
-- `.CAR` container detection for cartridge images,
-- ROM metadata reporting with mapped range, checksum, and CRC32,
-- an `action-os` mapping preset for cartridge at `$A000` and OS ROM at `$C000`,
-- a bootstrap 6502 CPU core with reset, stepping, tracing, and a growing opcode
-  subset,
-- execution recorder support: PC trace ranges, trace-until, watchpoints, and
-  recent-instruction stop reports,
-- a CLI that can load and inspect cartridge/ROM/source files,
-- tests around basic memory mapping.
+## Execution profiles
 
-CPU execution and Action! entry-point discovery are intentionally not
-implemented yet.
+Choose the narrowest profile that supplies the services used by the program:
 
-## Commands
+| Profile | Cartridge and OS | Entry path | Intended use |
+| --- | --- | --- | --- |
+| `OriginalCompiler` | Required | Cartridge boot | Drive and inspect the original Action! compiler |
+| `CartridgeObject` | Required | Object `RUNAD` | Run generated code that calls Action! or OS services |
+| `StandaloneObject` | Not required | Object `RUNAD` | Run self-contained generated code |
+| `SyntheticTest` | Not required | Caller-defined state | Small library-only CPU and bus tests |
+
+The CLI spells the first three profiles as `original-compiler`,
+`cartridge-object`, and `standalone-object`. `original-compiler` is the CLI
+default; `synthetic-test` is library-only.
+
+## Quick start
+
+Build and run the test suite:
 
 ```sh
 cargo test
-cargo run -- inspect --cart path/to/action.rom
-cargo run -- run --cart path/to/action.rom --os path/to/atari-os.rom --max-cycles 1000 --trace-pc
-cargo run -- run --profile standalone-object --load-object path/to/program.com --max-steps 1000
-scripts/run-probe functions
-scripts/run-probe all
+cargo run -- --help
 ```
 
-`run` currently resets and steps the bootstrap CPU through the mapped bus.
-For phase 1, `run` requires both the Action! cartridge ROM and an Atari OS ROM.
+Inspect a cartridge without running it:
+
+```sh
+cargo run -- inspect --cart path/to/action.rom
+```
+
+Run a self-contained Atari object without ROM images:
+
+```sh
+cargo run -- run \
+  --profile standalone-object \
+  --load-object path/to/program.com \
+  --max-steps 100000 \
+  --dump-range-on-stop '$0600:$060F'
+```
+
+Run an object that uses Action! cartridge or Atari OS services:
+
+```sh
+cargo run -- run \
+  --profile cartridge-object \
+  --cart path/to/action.rom \
+  --os path/to/atari-os.rom \
+  --load-object path/to/program.com \
+  --max-steps 100000
+```
+
+Boot the original compiler with instruction tracing:
+
+```sh
+cargo run -- run \
+  --cart path/to/action.rom \
+  --os path/to/atari-os.rom \
+  --max-steps 1000 \
+  --trace-pc
+```
+
+Addresses accept decimal, `0x` hexadecimal, or `$` hexadecimal notation.
+`--max-cycles` remains accepted as a compatibility alias for `--max-steps`;
+the limit counts CPU steps, not hardware cycles.
 
 ## Library use
 
-The CPU loop and stop policy are also available without spawning the CLI. Image,
-source, object, and host-file data can be supplied as bytes, so an embedding
-test harness does not need temporary files:
+For local development, add a path dependency:
+
+```toml
+[dependencies]
+actionc-vm = { path = "../actionc-vm" }
+```
+
+Repository consumers should pin the private Git dependency to an exact
+revision. This keeps VM changes intentional and reproducible.
+
+A standalone object can be loaded, executed, and inspected entirely in memory:
 
 ```rust
 use actionc_vm::{CompilerVm, ExecutionProfile, RunRequest, VmRunner};
 
-let mut vm = CompilerVm::default();
-vm.load_atari_object_for_execution(ExecutionProfile::StandaloneObject, &object_bytes)?;
+fn run_object(object: &[u8]) -> Result<u8, String> {
+    let mut vm = CompilerVm::default();
+    vm.load_atari_object_for_execution(ExecutionProfile::StandaloneObject, object)?;
 
-let outcome = VmRunner::new(vm).run(RunRequest {
-    max_steps: 10_000,
-    ..RunRequest::default()
-});
-let result = outcome.memory().read(0x0600);
+    let outcome = VmRunner::new(vm).run(RunRequest {
+        max_steps: 10_000,
+        ..RunRequest::default()
+    });
+
+    Ok(outcome.memory().read(0x0600))
+}
 ```
 
-ROM and cartridge callers can use `CompilerVm::load_image_bytes`; host inputs
-and captured outputs use `add_host_file_bytes`, `add_host_output`, and
-`host_file_bytes`. The path-based `VmConfig` remains available for CLI-style
-callers. `OriginalCompiler` and `CartridgeObject` profiles validate that the
-cartridge and OS are present; `StandaloneObject` and `SyntheticTest` support
-ROM-free execution.
+Use `CompilerVm::load_image_bytes` for cartridge, OS, and other images.
+`add_host_file_bytes`, `add_host_output`, and `host_file_bytes` provide
+in-memory host I/O. `ScheduledActions` supplies PC-triggered keys, CIO data,
+and source injection. `RunOutcome` retains the final VM together with a typed
+stop reason, step and cycle counts, registers, and recent instructions.
 
-PC-triggered key codes, scripted CIO input, and in-memory Action! source
-injection can be supplied through `ScheduledActions`. Direct and gated
-`PcTrigger` values make the same scheduling behavior available to library
-clients and the CLI, while `ScheduledActionObservation` records what was
-delivered.
+Path-oriented `VmConfig` remains available for CLI-style callers, but reusable
+test harnesses should prefer the byte-oriented API.
 
-`scripts/run-probe` runs the original Action! compiler in the VM against probe
-sources from `../actionc/experiments/original-compiler-probes`. It feeds monitor
-commands equivalent to:
+## ActionC integration
+
+The `actionc` repository keeps its VM runtime gates in the isolated
+`tools/vm-runtime-tests` crate. That crate pins `actionc-vm` by exact Git
+revision and is deliberately outside the main workspace dependency graph, so a
+normal compiler build does not fetch or build this private repository.
+
+The current runtime suite executes seven self-contained fixtures with
+`StandaloneObject` and twelve fixtures that need runtime services with
+`CartridgeObject`. The tests inspect VM memory directly rather than invoking
+the CLI, writing a full memory dump, and parsing it in shell.
+
+## Original compiler probes
+
+`scripts/run-probe` drives the original Action! cartridge compiler against a
+named set of probe sources. It supplies monitor input equivalent to:
 
 ```text
 C "H:FUNCTIONS.ACT"
 W "H:FUNC.COM"
 ```
 
-By default it writes VM-generated load files to
-`../actionc/experiments/original-compiler-probes/outputs/vm` and compares them
-with matching files in `outputs/original` when present. Override paths with
-`ACTION_PROBES_DIR`, `ACTION_VM_OUTPUT_DIR`, `ACTION_ORIGINAL_OUTPUT_DIR`,
-`ACTION_VM_CART`, `ACTION_VM_OS`, or `ACTION_VM_MAX_STEPS`.
+List or run probes with:
 
-## Design Constraint
+```sh
+scripts/run-probe --list
+scripts/run-probe functions
+scripts/run-probe all
+```
 
-Prefer fake OS/compiler services over device emulation. The intended order is:
+The script's default paths target the original sibling `actionc` checkout
+layout. For the current public checkout layout, set the paths explicitly:
 
-1. identify Action! compiler entry points and memory contracts,
-2. load source directly into the expected buffer if possible,
-3. implement or intercept only the OS/CIO calls the compiler actually uses,
-4. extract object code directly from memory.
+```sh
+ACTION_PROBES_DIR=../actionc-public-release/surveys/probes/original-compiler \
+ACTION_VM_CART=../actionc-public-release/roms/action.rom \
+ACTION_VM_OS=../actionc-public-release/roms/altirraos-xl.rom \
+scripts/run-probe functions
+```
+
+VM-generated objects and symbol JSON files are written below the probe output
+directory and compared with matching original-compiler captures when present.
+The output paths and step limit can be overridden with
+`ACTION_VM_OUTPUT_DIR`, `ACTION_VM_SYMBOL_OUTPUT_DIR`,
+`ACTION_ORIGINAL_OUTPUT_DIR`, and `ACTION_VM_MAX_STEPS`.
+
+## Design boundary
+
+Prefer a small, explicit host-side model of the services exercised by the
+compiler over broader device emulation. The reusable library owns CPU, memory,
+bus, object loading, execution policy, and structured results. The CLI owns
+argument parsing, filesystem I/O, human-readable traces, and capture-file
+formatting.
+
+The VM core must not depend on `actionc`, bundle proprietary ROM images, or
+grow into ANTIC, GTIA, POKEY, display-list, audio, or cycle-accurate video
+emulation.
+
+See [the library refactor implementation note](docs/LIBRARY_REFACTOR_IMPLEMENTATION_NOTE.md)
+for the ownership boundary, migration status, and remaining decomposition
+work.
