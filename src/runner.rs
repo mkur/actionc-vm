@@ -1,6 +1,31 @@
 use std::collections::VecDeque;
+use std::convert::Infallible;
 
 use crate::{BusRegion, CompilerVm, CpuError, CpuRegisters, CpuStep};
+
+/// Lifecycle hooks around each CPU instruction executed by [`VmRunner`].
+///
+/// Pre-step hooks may mutate the VM to deliver scheduled input or perform other
+/// host-side actions. Post-step hooks observe only successfully completed
+/// instructions and run before history retention and stop-condition evaluation.
+pub trait VmRunHooks {
+    type Error;
+
+    fn before_step(&mut self, _vm: &mut CompilerVm) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn after_step(&mut self, _vm: &CompilerVm, _step: &CpuStep) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct NoopHooks;
+
+impl VmRunHooks for NoopHooks {
+    type Error = Infallible;
+}
 
 /// Execution policy for the library-owned VM step loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +150,22 @@ impl VmRunner {
         self.vm
     }
 
-    pub fn run(mut self, request: RunRequest) -> RunOutcome {
+    pub fn run(self, request: RunRequest) -> RunOutcome {
+        let result = self.run_with_hooks(request, &mut NoopHooks);
+        match result {
+            Ok(outcome) => outcome,
+            Err(error) => match error {},
+        }
+    }
+
+    pub fn run_with_hooks<H>(
+        mut self,
+        request: RunRequest,
+        hooks: &mut H,
+    ) -> Result<RunOutcome, H::Error>
+    where
+        H: VmRunHooks,
+    {
         let mut history = VecDeque::with_capacity(request.history_len);
         let mut attempted_steps = 0;
         let mut completed_steps = 0;
@@ -137,10 +177,12 @@ impl VmRunner {
                 };
             }
 
+            hooks.before_step(&mut self.vm)?;
             attempted_steps += 1;
             match self.vm.step_cpu() {
                 Ok(step) => {
                     completed_steps += 1;
+                    hooks.after_step(&self.vm, &step)?;
                     push_history(&mut history, request.history_len, step);
                     if request.stop_after_pc == Some(step.pc) {
                         break StopReason::PcReached { pc: step.pc };
@@ -158,10 +200,10 @@ impl VmRunner {
             registers: self.vm.cpu().registers(),
             history: history.into_iter().collect(),
         };
-        RunOutcome {
+        Ok(RunOutcome {
             report,
             vm: self.vm,
-        }
+        })
     }
 }
 
@@ -179,6 +221,33 @@ fn push_history(history: &mut VecDeque<CpuStep>, history_len: usize, step: CpuSt
 mod tests {
     use super::*;
     use crate::AddressRange;
+
+    #[derive(Default)]
+    struct RecordingHooks {
+        events: Vec<String>,
+    }
+
+    impl VmRunHooks for RecordingHooks {
+        type Error = String;
+
+        fn before_step(&mut self, vm: &mut CompilerVm) -> Result<(), Self::Error> {
+            let pc = vm.cpu().registers().pc;
+            self.events.push(format!("before:{pc:04X}"));
+            if pc == 0x0200 {
+                vm.bus_mut().ram_mut().write(0x0040, 0x42);
+            }
+            Ok(())
+        }
+
+        fn after_step(&mut self, vm: &CompilerVm, step: &CpuStep) -> Result<(), Self::Error> {
+            self.events.push(format!(
+                "after:{:04X}:{:02X}",
+                step.pc,
+                vm.cpu().registers().a
+            ));
+            Ok(())
+        }
+    }
 
     fn vm_with_program(program: &[u8]) -> CompilerVm {
         let mut vm = CompilerVm::default();
@@ -316,5 +385,56 @@ mod tests {
         assert_eq!(outcome.report.completed_steps, 0);
         assert!(outcome.report.history.is_empty());
         assert_eq!(outcome.report.registers.pc, 0x0200);
+    }
+
+    #[test]
+    fn hooks_run_in_instruction_order_and_can_prepare_vm_state() {
+        let vm = vm_with_program(&[
+            0xA5, 0x40, // LDA $40
+            0xEA, // NOP
+        ]);
+        let mut hooks = RecordingHooks::default();
+        let outcome = VmRunner::new(vm)
+            .run_with_hooks(
+                RunRequest {
+                    max_steps: 2,
+                    ..RunRequest::default()
+                },
+                &mut hooks,
+            )
+            .unwrap();
+
+        assert_eq!(
+            hooks.events,
+            [
+                "before:0200",
+                "after:0200:42",
+                "before:0202",
+                "after:0202:42",
+            ]
+        );
+        assert_eq!(outcome.report.completed_steps, 2);
+        assert_eq!(outcome.report.history.len(), 2);
+    }
+
+    #[test]
+    fn post_step_hook_is_not_called_when_the_cpu_step_fails() {
+        let vm = vm_with_program(&[0x02]);
+        let mut hooks = RecordingHooks::default();
+        let outcome = VmRunner::new(vm)
+            .run_with_hooks(
+                RunRequest {
+                    max_steps: 1,
+                    ..RunRequest::default()
+                },
+                &mut hooks,
+            )
+            .unwrap();
+
+        assert_eq!(hooks.events, ["before:0200"]);
+        assert!(matches!(
+            outcome.stop_reason(),
+            StopReason::UnsupportedOpcode { .. }
+        ));
     }
 }
