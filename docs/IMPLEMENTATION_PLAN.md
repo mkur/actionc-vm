@@ -1,22 +1,22 @@
 # Implementation Plan
 
 The first practical target used both the Action! cartridge ROM and an Atari OS
-ROM. Cartridge-backed profiles now default to the bundled AltirraOS image;
-cartridge-only execution through fake OS services remains a possible later
-optimization.
+ROM. Cartridge-backed profiles now default to bundled Action! 3.6 and
+AltirraOS images; cartridge-only execution through fake OS services remains a
+possible later optimization.
 
 ## Steps
 
 1. ROM/image groundwork.
-   - Keep the Action! cartridge ROM required.
-   - Treat the Atari OS ROM as required for early execution.
+   - Initially require a caller-supplied Action! cartridge ROM.
+   - Initially require a caller-supplied Atari OS ROM.
    - Add ROM metadata checks: size, mapped address range, checksum/hash display.
    - Add config presets for common mappings: Action! cartridge at `$A000`, OS
      ROM at `$C000`.
-   - Status: implemented. `run` requires `--cart` for cartridge-backed
-     profiles and uses bundled AltirraOS unless `--os` overrides it. Images
-     report mapped range, checksum16, and CRC32, and the `action-os` preset
-     captures the common `$A000`/`$C000` mapping.
+   - Status: implemented. Cartridge-backed `run` profiles use bundled Action!
+     3.6 and AltirraOS unless `--cart` or `--os` overrides them. Images report
+     mapped range, checksum16, and CRC32, and the `action-os` preset captures
+     the common `$A000`/`$C000` mapping.
 
 2. CPU core decision.
    - Evaluate using an existing Rust 6502 core first.

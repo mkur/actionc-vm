@@ -37,8 +37,8 @@ Implemented and committed:
 - CLI execution through the library-owned loop with characterized stop text;
 - byte-oriented image, source, object, and host-file APIs;
 - explicit execution profiles and ROM-free standalone-object execution;
-- bundled AltirraOS as the deterministic default for cartridge-backed
-  profiles, with caller-provided OS images taking precedence;
+- bundled Action! 3.6 and AltirraOS images as deterministic defaults for
+  cartridge-backed profiles, with caller-provided images taking precedence;
 - structured scheduled key, CIO, and source-injection actions with direct and
   gated PC triggers;
 - CLI adoption of the scheduled key/CIO queue;
@@ -143,10 +143,10 @@ input, symbol snapshots, call tracing, and protected-write diagnostics.
 
 Image validation must eventually depend on an explicit profile:
 
-- `OriginalCompiler`: requires the Action! cartridge and defaults to bundled
+- `OriginalCompiler`: defaults to the bundled Action! 3.6 cartridge and
   AltirraOS;
 - `CartridgeObject`: runs an emitted object with cartridge runtime services
-  and defaults to bundled AltirraOS;
+  and defaults to the same bundled images;
 - `StandaloneObject`: runs a standalone emitted object without Action! ROM;
 - `SyntheticTest`: executes small in-memory programs without external ROMs.
 
@@ -248,8 +248,9 @@ batch capture is an appropriate process boundary.
 - no ANTIC, GTIA, POKEY, display-list, audio, or cycle-accurate video work;
 - no replacement for Atari800, Altirra, or AltirraBridge;
 - no dependency from the VM core to `actionc`;
-- no proprietary ROM bundling; the redistributable AltirraOS image is the
-  explicit default for profiles that require OS services;
+- no ROM bundling without clear redistribution and source terms; the GPL
+  Action! 3.6 cartridge and permissively licensed AltirraOS image are explicit
+  defaults for profiles that require cartridge services;
 - no removal of the CLI or current capture scripts;
 - no broad module rename before the execution contract is covered by tests.
 

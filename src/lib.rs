@@ -7,7 +7,10 @@ mod memory;
 mod object;
 mod runner;
 
-use images::{BUNDLED_ALTIRRA_OS, BUNDLED_ALTIRRA_OS_LABEL, checksum16, crc32};
+use images::{
+    BUNDLED_ACTION_CARTRIDGE, BUNDLED_ACTION_CARTRIDGE_LABEL, BUNDLED_ALTIRRA_OS,
+    BUNDLED_ALTIRRA_OS_LABEL, checksum16, crc32,
+};
 pub use images::{CarHeader, CartridgeMappingInfo, ImageKind, ImageMetadata, LoadedImage};
 pub use memory::{AddressRange, Memory};
 pub use object::{AtariLoadReport, AtariLoadSegment, load_atari_object_into_memory};
@@ -173,15 +176,27 @@ impl VmConfig {
         self.validate_for_profile(ExecutionProfile::OriginalCompiler)
     }
 
-    pub fn validate_for_profile(&self, profile: ExecutionProfile) -> Result<(), String> {
-        if profile.requires_cartridge_services() && self.cartridge.is_none() {
-            return Err("run requires --cart with an Action! cartridge ROM".to_string());
-        }
+    pub fn validate_for_profile(&self, _profile: ExecutionProfile) -> Result<(), String> {
         Ok(())
     }
 
     /// Loads only the images explicitly selected in this configuration.
     pub fn load(&self) -> Result<CompilerVm, String> {
+        self.load_with_profile_defaults(None)
+    }
+
+    /// Loads the configuration and supplies the bundled Action! cartridge and
+    /// AltirraOS images when the selected profile needs them and no overrides
+    /// were given.
+    pub fn load_for_profile(&self, profile: ExecutionProfile) -> Result<CompilerVm, String> {
+        self.validate_for_profile(profile)?;
+        self.load_with_profile_defaults(Some(profile))
+    }
+
+    fn load_with_profile_defaults(
+        &self,
+        profile: Option<ExecutionProfile>,
+    ) -> Result<CompilerVm, String> {
         let mut vm = CompilerVm::default();
 
         if let Some(path) = &self.cartridge {
@@ -194,6 +209,15 @@ impl VmConfig {
 
         for (kind, path, base) in &self.extra_images {
             vm.load_image(*kind, path.clone(), *base)?;
+        }
+
+        if profile.is_some_and(ExecutionProfile::requires_cartridge_services) {
+            if vm.bus().cartridge().is_none() {
+                vm.load_bundled_action_cartridge_at(self.cartridge_base)?;
+            }
+            if vm.bus().os_rom().is_none() {
+                vm.load_bundled_altirra_os_at(self.os_base)?;
+            }
         }
 
         for hotpatch in &self.hotpatches {
@@ -216,17 +240,6 @@ impl VmConfig {
         }
         vm.set_trace_cio(self.trace_cio);
 
-        Ok(vm)
-    }
-
-    /// Loads the configuration and supplies the bundled AltirraOS image when
-    /// the selected execution profile needs OS services and no OS was given.
-    pub fn load_for_profile(&self, profile: ExecutionProfile) -> Result<CompilerVm, String> {
-        self.validate_for_profile(profile)?;
-        let mut vm = self.load()?;
-        if profile.requires_cartridge_services() && vm.bus().os_rom().is_none() {
-            vm.load_bundled_altirra_os_at(self.os_base)?;
-        }
         Ok(vm)
     }
 }
@@ -315,6 +328,16 @@ impl CompilerVm {
         Ok(())
     }
 
+    /// Installs the bundled Action! 3.6 cartridge at the standard address.
+    ///
+    /// A cartridge already installed by the caller is left unchanged.
+    pub fn load_bundled_action_cartridge(&mut self) -> Result<(), String> {
+        if self.bus.cartridge().is_none() {
+            self.load_bundled_action_cartridge_at(DEFAULT_CART_BASE)?;
+        }
+        Ok(())
+    }
+
     /// Installs the bundled AltirraOS XL/XE image at the standard OS address.
     ///
     /// An OS image already installed by the caller is left unchanged.
@@ -326,13 +349,11 @@ impl CompilerVm {
     }
 
     /// Ensures that the selected profile has its required cartridge and OS.
-    /// Cartridge-backed profiles use bundled AltirraOS unless the caller has
-    /// already installed a custom OS image.
+    /// Cartridge-backed profiles use the bundled Action! cartridge and
+    /// AltirraOS unless the caller has already installed custom images.
     pub fn prepare_execution_profile(&mut self, profile: ExecutionProfile) -> Result<(), String> {
-        if profile.requires_cartridge_services() && self.bus.cartridge().is_none() {
-            return Err(format!("{profile:?} requires an Action! cartridge image"));
-        }
         if profile.requires_cartridge_services() {
+            self.load_bundled_action_cartridge()?;
             self.load_bundled_altirra_os()?;
         }
         self.validate_execution_profile(profile)
@@ -396,6 +417,15 @@ impl CompilerVm {
         }
         self.images.push(image);
         Ok(())
+    }
+
+    fn load_bundled_action_cartridge_at(&mut self, base: u16) -> Result<(), String> {
+        self.load_image_bytes(
+            ImageKind::Cartridge,
+            BUNDLED_ACTION_CARTRIDGE_LABEL,
+            base,
+            BUNDLED_ACTION_CARTRIDGE.to_vec(),
+        )
     }
 
     fn load_bundled_altirra_os_at(&mut self, base: u16) -> Result<(), String> {
@@ -4266,27 +4296,18 @@ mod tests {
     }
 
     #[test]
-    fn run_configuration_requires_a_cartridge_but_defaults_to_bundled_os() {
+    fn run_configuration_defaults_to_bundled_action_environment() {
         let config = VmConfig::default();
-        assert!(
-            config
-                .validate_for_execution()
-                .unwrap_err()
-                .contains("--cart")
+        config.validate_for_execution().unwrap();
+        let vm = config
+            .load_for_profile(ExecutionProfile::OriginalCompiler)
+            .unwrap();
+        assert_eq!(vm.images().len(), 2);
+        assert_eq!(
+            vm.images()[0].path,
+            PathBuf::from(BUNDLED_ACTION_CARTRIDGE_LABEL)
         );
-
-        let config = VmConfig {
-            cartridge: Some(PathBuf::from("action.rom")),
-            ..VmConfig::default()
-        };
-        config.validate_for_execution().unwrap();
-
-        let config = VmConfig {
-            cartridge: Some(PathBuf::from("action.rom")),
-            os_rom: Some(PathBuf::from("atarios.rom")),
-            ..VmConfig::default()
-        };
-        config.validate_for_execution().unwrap();
+        assert_eq!(vm.images()[1].path, PathBuf::from(BUNDLED_ALTIRRA_OS_LABEL));
 
         VmConfig::default()
             .validate_for_profile(ExecutionProfile::StandaloneObject)
@@ -4297,7 +4318,32 @@ mod tests {
     }
 
     #[test]
-    fn profile_preparation_uses_bundled_altirra_os_only_when_needed() {
+    fn configuration_hotpatches_run_after_bundled_images_are_loaded() {
+        let config = VmConfig {
+            hotpatches: vec![Hotpatch::ActionQueuedInput, Hotpatch::ActionHeadlessGetkey],
+            ..VmConfig::default()
+        };
+        let vm = config
+            .load_for_profile(ExecutionProfile::OriginalCompiler)
+            .unwrap();
+        let cartridge = vm.bus().cartridge().unwrap();
+
+        assert!(
+            cartridge
+                .payload()
+                .windows(9)
+                .any(|window| { window == [0x02, b'Q', b':', 0xAD, 0xFC, 0x02, 0x49, 0xFF, 0x60] })
+        );
+        assert!(cartridge.payload().windows(13).any(|window| {
+            window
+                == [
+                    0xA2, 0x70, 0xA9, 0x07, 0x85, 0x11, 0x20, 0x40, 0xB3, 0x8D, 0xA2, 0x04, 0x60,
+                ]
+        }));
+    }
+
+    #[test]
+    fn profile_preparation_uses_bundled_images_only_when_needed() {
         let mut standalone = CompilerVm::default();
         standalone
             .prepare_execution_profile(ExecutionProfile::StandaloneObject)
@@ -4306,13 +4352,6 @@ mod tests {
         assert!(standalone.images().is_empty());
 
         let mut vm = CompilerVm::default();
-        vm.load_image_bytes(
-            ImageKind::Cartridge,
-            "test-action.rom",
-            DEFAULT_CART_BASE,
-            vec![0xEA],
-        )
-        .unwrap();
         vm.prepare_execution_profile(ExecutionProfile::OriginalCompiler)
             .unwrap();
         let os = vm.bus().os_rom().unwrap();
@@ -4321,13 +4360,20 @@ mod tests {
             AddressRange::with_size(OS_ROM_BASE, 0x4000).unwrap()
         );
         assert_eq!(vm.images().len(), 2);
+        assert_eq!(
+            vm.images()[0].path,
+            PathBuf::from(BUNDLED_ACTION_CARTRIDGE_LABEL)
+        );
+        assert_eq!(vm.images()[0].metadata.checksum16, 0x765D);
+        assert_eq!(vm.images()[0].metadata.crc32, 0xA1F9_0DFD);
+        assert_eq!(vm.images()[0].car_header.unwrap().cartridge_type, 0x0F);
         assert_eq!(vm.images()[1].path, PathBuf::from(BUNDLED_ALTIRRA_OS_LABEL));
         assert_eq!(vm.images()[1].metadata.checksum16, 0x4D75);
         assert_eq!(vm.images()[1].metadata.crc32, 0x5890_AE8E);
     }
 
     #[test]
-    fn explicit_os_image_overrides_bundled_altirra_os() {
+    fn explicit_images_override_bundled_action_environment() {
         let mut vm = CompilerVm::default();
         vm.load_image_bytes(
             ImageKind::Cartridge,
@@ -4342,6 +4388,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(vm.images().len(), 2);
+        assert_eq!(vm.images()[0].path, PathBuf::from("test-action.rom"));
         assert_eq!(vm.images()[1].path, PathBuf::from("custom-os.rom"));
     }
 

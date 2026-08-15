@@ -2544,7 +2544,7 @@ fn print_help() {
          --preset <name>      Mapping preset, currently action-os\n  \
          --profile <name>     Execution profile: original-compiler (default),\n  \
                               cartridge-object, or standalone-object\n  \
-         --cart <path>        Load an Action! cartridge image\n  \
+         --cart <path>        Override bundled Action! 3.6 cartridge image\n  \
          --cart-base <addr>   Cartridge base address, default $A000\n  \
          --os <path>          Override bundled AltirraOS with an OS ROM image\n  \
          --os-base <addr>     OS ROM base address, default $C000\n  \

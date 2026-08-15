@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use crate::memory::mapped_end;
 use crate::{CAR_HEADER_SIZE, CAR_MAGIC, Cartridge};
 
+pub(crate) const BUNDLED_ACTION_CARTRIDGE_LABEL: &str = "embedded:action.rom";
+pub(crate) const BUNDLED_ACTION_CARTRIDGE: &[u8] = include_bytes!("../roms/action.rom");
 pub(crate) const BUNDLED_ALTIRRA_OS_LABEL: &str = "embedded:altirraos-xl.rom";
 pub(crate) const BUNDLED_ALTIRRA_OS: &[u8] = include_bytes!("../roms/altirraos-xl.rom");
 

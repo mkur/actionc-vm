@@ -8,7 +8,7 @@ probe_dir="${ACTION_PROBES_DIR:-$repo_root/../actionc/experiments/original-compi
 output_dir="${ACTION_VM_OUTPUT_DIR:-$probe_dir/outputs/vm}"
 symbol_output_dir="${ACTION_VM_SYMBOL_OUTPUT_DIR:-$output_dir}"
 original_dir="${ACTION_ORIGINAL_OUTPUT_DIR:-$probe_dir/outputs/original}"
-cart_rom="${ACTION_VM_CART:-$repo_root/../actionc/roms/action.rom}"
+cart_rom="${ACTION_VM_CART:-}"
 os_rom="${ACTION_VM_OS:-}"
 max_steps="${ACTION_VM_MAX_STEPS:-60000000}"
 
@@ -241,7 +241,7 @@ Environment:
   ACTION_VM_OUTPUT_DIR       Output directory for VM-generated .COM files
   ACTION_VM_SYMBOL_OUTPUT_DIR Output directory for VM symbol JSON files
   ACTION_ORIGINAL_OUTPUT_DIR Original .COM directory for cmp summaries
-  ACTION_VM_CART             Action! cartridge ROM path
+  ACTION_VM_CART             Optional cartridge override; bundled Action! 3.6 is the default
   ACTION_VM_OS               Optional Atari OS ROM override; bundled AltirraOS is the default
   ACTION_VM_MAX_STEPS        Max VM steps per probe, default 60000000
 EOF
@@ -291,24 +291,27 @@ run_probe() {
   echo "==> $probe: $source_name -> $output_name"
   (
     cd "$repo_root"
-    os_args=()
-    if [[ -n "$os_rom" ]]; then
-      os_args=(--os "$os_rom")
-    fi
-    cargo run --quiet -- run \
-      --cart "$cart_rom" \
-      "${os_args[@]}" \
-      --hotpatch action-q-input \
-      --hotpatch action-headless-getkey \
-      --host-file "$h_source:$source_path" \
-      --host-output "$output_name:$output_path" \
-      --dump-symbols-on-stop "$symbol_path" \
-      --dump-symbol-snapshots-on-stop "$symbol_snapshots_path" \
-      --action-symbol-hooks \
-      --monitor-key-at-pc '$A2E0' \
-      --q-input-at-pc-after '$A2E0:$B2F5:'"$monitor_input" \
-      --max-steps "$max_steps" \
+    vm_command=(
+      cargo run --quiet -- run
+      --hotpatch action-q-input
+      --hotpatch action-headless-getkey
+      --host-file "$h_source:$source_path"
+      --host-output "$output_name:$output_path"
+      --dump-symbols-on-stop "$symbol_path"
+      --dump-symbol-snapshots-on-stop "$symbol_snapshots_path"
+      --action-symbol-hooks
+      --monitor-key-at-pc '$A2E0'
+      --q-input-at-pc-after '$A2E0:$B2F5:'"$monitor_input"
+      --max-steps "$max_steps"
       --history 20
+    )
+    if [[ -n "$cart_rom" ]]; then
+      vm_command+=(--cart "$cart_rom")
+    fi
+    if [[ -n "$os_rom" ]]; then
+      vm_command+=(--os "$os_rom")
+    fi
+    "${vm_command[@]}"
   )
 
   if [[ ! -s "$output_path" ]]; then
@@ -364,7 +367,9 @@ case "$1" in
     ;;
 esac
 
-require_file "$cart_rom" "Action! cartridge ROM"
+if [[ -n "$cart_rom" ]]; then
+  require_file "$cart_rom" "Action! cartridge ROM"
+fi
 if [[ -n "$os_rom" ]]; then
   require_file "$os_rom" "Atari OS ROM"
 fi
