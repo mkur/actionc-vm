@@ -1,9 +1,9 @@
 # Implementation Plan
 
-The first practical target is a headless Action! compiler runner that uses both
-the Action! cartridge ROM and an Atari OS ROM. Cartridge-only execution through
-fake OS services remains a later optimization after we know the real call
-surface.
+The first practical target used both the Action! cartridge ROM and an Atari OS
+ROM. Cartridge-backed profiles now default to the bundled AltirraOS image;
+cartridge-only execution through fake OS services remains a possible later
+optimization.
 
 ## Steps
 
@@ -13,9 +13,10 @@ surface.
    - Add ROM metadata checks: size, mapped address range, checksum/hash display.
    - Add config presets for common mappings: Action! cartridge at `$A000`, OS
      ROM at `$C000`.
-   - Status: implemented. `run` requires `--cart` and `--os`, images report
-     mapped range, checksum16, and CRC32, and the `action-os` preset captures
-     the common `$A000`/`$C000` mapping.
+   - Status: implemented. `run` requires `--cart` for cartridge-backed
+     profiles and uses bundled AltirraOS unless `--os` overrides it. Images
+     report mapped range, checksum16, and CRC32, and the `action-os` preset
+     captures the common `$A000`/`$C000` mapping.
 
 2. CPU core decision.
    - Evaluate using an existing Rust 6502 core first.

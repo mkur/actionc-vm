@@ -38,8 +38,8 @@ Choose the narrowest profile that supplies the services used by the program:
 
 | Profile | Cartridge and OS | Entry path | Intended use |
 | --- | --- | --- | --- |
-| `OriginalCompiler` | Required | Cartridge boot | Drive and inspect the original Action! compiler |
-| `CartridgeObject` | Required | Object `RUNAD` | Run generated code that calls Action! or OS services |
+| `OriginalCompiler` | Cartridge required; bundled AltirraOS by default | Cartridge boot | Drive and inspect the original Action! compiler |
+| `CartridgeObject` | Cartridge required; bundled AltirraOS by default | Object `RUNAD` | Run generated code that calls Action! or OS services |
 | `StandaloneObject` | Not required | Object `RUNAD` | Run self-contained generated code |
 | `SyntheticTest` | Not required | Caller-defined state | Small library-only CPU and bus tests |
 
@@ -78,7 +78,6 @@ Run an object that uses Action! cartridge or Atari OS services:
 cargo run -- run \
   --profile cartridge-object \
   --cart path/to/action.rom \
-  --os path/to/atari-os.rom \
   --load-object path/to/program.com \
   --max-steps 100000
 ```
@@ -88,10 +87,14 @@ Boot the original compiler with instruction tracing:
 ```sh
 cargo run -- run \
   --cart path/to/action.rom \
-  --os path/to/atari-os.rom \
   --max-steps 1000 \
   --trace-pc
 ```
+
+Cartridge-backed profiles use the embedded AltirraOS XL/XE 3.11 image when
+`--os` is omitted. Pass `--os path/to/custom-os.rom` to override it. The
+bundled image's license and provenance are recorded in
+[`roms/README.md`](roms/README.md).
 
 Addresses accept decimal, `0x` hexadecimal, or `$` hexadecimal notation.
 `--max-cycles` remains accepted as a compatibility alias for `--max-steps`;
@@ -127,7 +130,8 @@ fn run_object(object: &[u8]) -> Result<u8, String> {
 }
 ```
 
-Use `CompilerVm::load_image_bytes` for cartridge, OS, and other images.
+Use `CompilerVm::load_bundled_altirra_os` to install the default OS explicitly,
+or `CompilerVm::load_image_bytes` for custom cartridge, OS, and other images.
 `add_host_file_bytes`, `add_host_output`, and `host_file_bytes` provide
 in-memory host I/O. `ScheduledActions` supplies PC-triggered keys, CIO data,
 and source injection. `RunOutcome` retains the final VM together with a typed
@@ -172,9 +176,11 @@ layout. For the current public checkout layout, set the paths explicitly:
 ```sh
 ACTION_PROBES_DIR=../actionc-public-release/surveys/probes/original-compiler \
 ACTION_VM_CART=../actionc-public-release/roms/action.rom \
-ACTION_VM_OS=../actionc-public-release/roms/altirraos-xl.rom \
 scripts/run-probe functions
 ```
+
+Set `ACTION_VM_OS` only when comparing against a different Atari OS image; the
+probe runner otherwise uses the VM's bundled AltirraOS.
 
 VM-generated objects and symbol JSON files are written below the probe output
 directory and compared with matching original-compiler captures when present.
@@ -190,9 +196,9 @@ bus, object loading, execution policy, and structured results. The CLI owns
 argument parsing, filesystem I/O, human-readable traces, and capture-file
 formatting.
 
-The VM core must not depend on `actionc`, bundle proprietary ROM images, or
-grow into ANTIC, GTIA, POKEY, display-list, audio, or cycle-accurate video
-emulation.
+The VM core must not depend on `actionc` or bundle proprietary ROM images. Its
+redistributable AltirraOS default is the only bundled ROM. The VM must not grow
+into ANTIC, GTIA, POKEY, display-list, audio, or cycle-accurate video emulation.
 
 See [the library refactor implementation note](docs/LIBRARY_REFACTOR_IMPLEMENTATION_NOTE.md)
 for the ownership boundary, migration status, and remaining decomposition

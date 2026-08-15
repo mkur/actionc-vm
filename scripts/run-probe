@@ -9,7 +9,7 @@ output_dir="${ACTION_VM_OUTPUT_DIR:-$probe_dir/outputs/vm}"
 symbol_output_dir="${ACTION_VM_SYMBOL_OUTPUT_DIR:-$output_dir}"
 original_dir="${ACTION_ORIGINAL_OUTPUT_DIR:-$probe_dir/outputs/original}"
 cart_rom="${ACTION_VM_CART:-$repo_root/../actionc/roms/action.rom}"
-os_rom="${ACTION_VM_OS:-$repo_root/../actionc/roms/altirraos-xl.rom}"
+os_rom="${ACTION_VM_OS:-}"
 max_steps="${ACTION_VM_MAX_STEPS:-60000000}"
 
 probe_names="
@@ -242,7 +242,7 @@ Environment:
   ACTION_VM_SYMBOL_OUTPUT_DIR Output directory for VM symbol JSON files
   ACTION_ORIGINAL_OUTPUT_DIR Original .COM directory for cmp summaries
   ACTION_VM_CART             Action! cartridge ROM path
-  ACTION_VM_OS               Atari OS ROM path
+  ACTION_VM_OS               Optional Atari OS ROM override; bundled AltirraOS is the default
   ACTION_VM_MAX_STEPS        Max VM steps per probe, default 60000000
 EOF
 }
@@ -291,9 +291,13 @@ run_probe() {
   echo "==> $probe: $source_name -> $output_name"
   (
     cd "$repo_root"
+    os_args=()
+    if [[ -n "$os_rom" ]]; then
+      os_args=(--os "$os_rom")
+    fi
     cargo run --quiet -- run \
       --cart "$cart_rom" \
-      --os "$os_rom" \
+      "${os_args[@]}" \
       --hotpatch action-q-input \
       --hotpatch action-headless-getkey \
       --host-file "$h_source:$source_path" \
@@ -361,7 +365,9 @@ case "$1" in
 esac
 
 require_file "$cart_rom" "Action! cartridge ROM"
-require_file "$os_rom" "Atari OS ROM"
+if [[ -n "$os_rom" ]]; then
+  require_file "$os_rom" "Atari OS ROM"
+fi
 
 for probe in "${probes[@]}"; do
   run_probe "$probe"

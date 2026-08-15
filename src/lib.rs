@@ -7,8 +7,8 @@ mod memory;
 mod object;
 mod runner;
 
+use images::{BUNDLED_ALTIRRA_OS, BUNDLED_ALTIRRA_OS_LABEL, checksum16, crc32};
 pub use images::{CarHeader, CartridgeMappingInfo, ImageKind, ImageMetadata, LoadedImage};
-use images::{checksum16, crc32};
 pub use memory::{AddressRange, Memory};
 pub use object::{AtariLoadReport, AtariLoadSegment, load_atari_object_into_memory};
 pub use runner::{
@@ -177,12 +177,10 @@ impl VmConfig {
         if profile.requires_cartridge_services() && self.cartridge.is_none() {
             return Err("run requires --cart with an Action! cartridge ROM".to_string());
         }
-        if profile.requires_cartridge_services() && self.os_rom.is_none() {
-            return Err("run currently requires --os with an Atari OS ROM".to_string());
-        }
         Ok(())
     }
 
+    /// Loads only the images explicitly selected in this configuration.
     pub fn load(&self) -> Result<CompilerVm, String> {
         let mut vm = CompilerVm::default();
 
@@ -218,6 +216,17 @@ impl VmConfig {
         }
         vm.set_trace_cio(self.trace_cio);
 
+        Ok(vm)
+    }
+
+    /// Loads the configuration and supplies the bundled AltirraOS image when
+    /// the selected execution profile needs OS services and no OS was given.
+    pub fn load_for_profile(&self, profile: ExecutionProfile) -> Result<CompilerVm, String> {
+        self.validate_for_profile(profile)?;
+        let mut vm = self.load()?;
+        if profile.requires_cartridge_services() && vm.bus().os_rom().is_none() {
+            vm.load_bundled_altirra_os_at(self.os_base)?;
+        }
         Ok(vm)
     }
 }
@@ -306,6 +315,29 @@ impl CompilerVm {
         Ok(())
     }
 
+    /// Installs the bundled AltirraOS XL/XE image at the standard OS address.
+    ///
+    /// An OS image already installed by the caller is left unchanged.
+    pub fn load_bundled_altirra_os(&mut self) -> Result<(), String> {
+        if self.bus.os_rom().is_none() {
+            self.load_bundled_altirra_os_at(OS_ROM_BASE)?;
+        }
+        Ok(())
+    }
+
+    /// Ensures that the selected profile has its required cartridge and OS.
+    /// Cartridge-backed profiles use bundled AltirraOS unless the caller has
+    /// already installed a custom OS image.
+    pub fn prepare_execution_profile(&mut self, profile: ExecutionProfile) -> Result<(), String> {
+        if profile.requires_cartridge_services() && self.bus.cartridge().is_none() {
+            return Err(format!("{profile:?} requires an Action! cartridge image"));
+        }
+        if profile.requires_cartridge_services() {
+            self.load_bundled_altirra_os()?;
+        }
+        self.validate_execution_profile(profile)
+    }
+
     pub fn set_pc(&mut self, pc: u16) {
         self.cpu.set_pc(pc);
     }
@@ -332,7 +364,7 @@ impl CompilerVm {
                 "{profile:?} is not an Atari object execution profile"
             ));
         }
-        self.validate_execution_profile(profile)?;
+        self.prepare_execution_profile(profile)?;
         self.reset_cpu();
         self.prepare_headless_program_environment();
         let report = self.load_atari_object(bytes)?;
@@ -364,6 +396,15 @@ impl CompilerVm {
         }
         self.images.push(image);
         Ok(())
+    }
+
+    fn load_bundled_altirra_os_at(&mut self, base: u16) -> Result<(), String> {
+        self.load_image_bytes(
+            ImageKind::Rom,
+            BUNDLED_ALTIRRA_OS_LABEL,
+            base,
+            BUNDLED_ALTIRRA_OS.to_vec(),
+        )
     }
 
     pub fn add_host_file_bytes(&mut self, name: impl AsRef<str>, bytes: impl Into<Vec<u8>>) {
@@ -4225,7 +4266,7 @@ mod tests {
     }
 
     #[test]
-    fn run_configuration_requires_cartridge_and_os_rom() {
+    fn run_configuration_requires_a_cartridge_but_defaults_to_bundled_os() {
         let config = VmConfig::default();
         assert!(
             config
@@ -4238,12 +4279,7 @@ mod tests {
             cartridge: Some(PathBuf::from("action.rom")),
             ..VmConfig::default()
         };
-        assert!(
-            config
-                .validate_for_execution()
-                .unwrap_err()
-                .contains("--os")
-        );
+        config.validate_for_execution().unwrap();
 
         let config = VmConfig {
             cartridge: Some(PathBuf::from("action.rom")),
@@ -4258,6 +4294,55 @@ mod tests {
         VmConfig::default()
             .validate_for_profile(ExecutionProfile::SyntheticTest)
             .unwrap();
+    }
+
+    #[test]
+    fn profile_preparation_uses_bundled_altirra_os_only_when_needed() {
+        let mut standalone = CompilerVm::default();
+        standalone
+            .prepare_execution_profile(ExecutionProfile::StandaloneObject)
+            .unwrap();
+        assert!(standalone.bus().os_rom().is_none());
+        assert!(standalone.images().is_empty());
+
+        let mut vm = CompilerVm::default();
+        vm.load_image_bytes(
+            ImageKind::Cartridge,
+            "test-action.rom",
+            DEFAULT_CART_BASE,
+            vec![0xEA],
+        )
+        .unwrap();
+        vm.prepare_execution_profile(ExecutionProfile::OriginalCompiler)
+            .unwrap();
+        let os = vm.bus().os_rom().unwrap();
+        assert_eq!(
+            os.range(),
+            AddressRange::with_size(OS_ROM_BASE, 0x4000).unwrap()
+        );
+        assert_eq!(vm.images().len(), 2);
+        assert_eq!(vm.images()[1].path, PathBuf::from(BUNDLED_ALTIRRA_OS_LABEL));
+        assert_eq!(vm.images()[1].metadata.checksum16, 0x4D75);
+        assert_eq!(vm.images()[1].metadata.crc32, 0x5890_AE8E);
+    }
+
+    #[test]
+    fn explicit_os_image_overrides_bundled_altirra_os() {
+        let mut vm = CompilerVm::default();
+        vm.load_image_bytes(
+            ImageKind::Cartridge,
+            "test-action.rom",
+            DEFAULT_CART_BASE,
+            vec![0xEA],
+        )
+        .unwrap();
+        vm.load_image_bytes(ImageKind::Rom, "custom-os.rom", OS_ROM_BASE, vec![0xEA])
+            .unwrap();
+        vm.prepare_execution_profile(ExecutionProfile::OriginalCompiler)
+            .unwrap();
+
+        assert_eq!(vm.images().len(), 2);
+        assert_eq!(vm.images()[1].path, PathBuf::from("custom-os.rom"));
     }
 
     #[test]

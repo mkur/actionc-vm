@@ -207,7 +207,7 @@ fn validate_cli_execution(options: &CliOptions) -> Result<(), String> {
 fn run_vm(options: CliOptions) -> Result<(), String> {
     let config = options.config.clone();
     validate_cli_execution(&options)?;
-    let mut vm = config.load()?;
+    let mut vm = config.load_for_profile(options.execution_profile)?;
     for watchpoint in &options.watchpoints {
         vm.bus_mut().add_watchpoint(*watchpoint);
     }
@@ -2546,7 +2546,7 @@ fn print_help() {
                               cartridge-object, or standalone-object\n  \
          --cart <path>        Load an Action! cartridge image\n  \
          --cart-base <addr>   Cartridge base address, default $A000\n  \
-         --os <path>          Load an Atari OS ROM image at $C000\n  \
+         --os <path>          Override bundled AltirraOS with an OS ROM image\n  \
          --os-base <addr>     OS ROM base address, default $C000\n  \
          --max-cycles <n>     Run at most n CPU steps, default 1000\n  \
          --trace-pc           Print one line per executed instruction\n  \
