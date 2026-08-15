@@ -1,7 +1,151 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 
-use crate::{BusRegion, CompilerVm, CpuError, CpuRegisters, CpuStep};
+use crate::{ActionSourceInjectionReport, BusRegion, CompilerVm, CpuError, CpuRegisters, CpuStep};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcTrigger {
+    pub pc: u16,
+    pub after_pc: Option<u16>,
+}
+
+impl PcTrigger {
+    pub const fn at(pc: u16) -> Self {
+        Self { pc, after_pc: None }
+    }
+
+    pub const fn at_after(pc: u16, after_pc: u16) -> Self {
+        Self {
+            pc,
+            after_pc: Some(after_pc),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduledAction {
+    QueueKeyCode { trigger: PcTrigger, key_code: u8 },
+    QueueCioInput { trigger: PcTrigger, bytes: Vec<u8> },
+    InjectActionSource { trigger: PcTrigger, source: Vec<u8> },
+}
+
+impl ScheduledAction {
+    pub fn queue_key_code(trigger: PcTrigger, key_code: u8) -> Self {
+        Self::QueueKeyCode { trigger, key_code }
+    }
+
+    pub fn queue_cio_input(trigger: PcTrigger, bytes: impl Into<Vec<u8>>) -> Self {
+        Self::QueueCioInput {
+            trigger,
+            bytes: bytes.into(),
+        }
+    }
+
+    pub fn inject_action_source(trigger: PcTrigger, source: impl Into<Vec<u8>>) -> Self {
+        Self::InjectActionSource {
+            trigger,
+            source: source.into(),
+        }
+    }
+
+    fn trigger_mut(&mut self) -> &mut PcTrigger {
+        match self {
+            Self::QueueKeyCode { trigger, .. }
+            | Self::QueueCioInput { trigger, .. }
+            | Self::InjectActionSource { trigger, .. } => trigger,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduledActionObservation {
+    KeyCodeQueued {
+        pc: u16,
+        key_code: u8,
+    },
+    CioInputQueued {
+        pc: u16,
+        byte_count: usize,
+    },
+    ActionSourceInjected {
+        pc: u16,
+        report: ActionSourceInjectionReport,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduledActions {
+    pending: Vec<ScheduledAction>,
+    observations: Vec<ScheduledActionObservation>,
+}
+
+impl ScheduledActions {
+    pub fn new(actions: impl IntoIterator<Item = ScheduledAction>) -> Self {
+        Self {
+            pending: actions.into_iter().collect(),
+            observations: Vec::new(),
+        }
+    }
+
+    pub fn schedule(&mut self, action: ScheduledAction) {
+        self.pending.push(action);
+    }
+
+    pub fn pending(&self) -> &[ScheduledAction] {
+        &self.pending
+    }
+
+    pub fn observations(&self) -> &[ScheduledActionObservation] {
+        &self.observations
+    }
+
+    pub fn apply_before_step(
+        &mut self,
+        vm: &mut CompilerVm,
+    ) -> Result<Vec<ScheduledActionObservation>, String> {
+        let pc = vm.cpu().registers().pc;
+        let mut completed = Vec::new();
+        let mut index = 0;
+        while index < self.pending.len() {
+            let trigger = self.pending[index].trigger_mut();
+            if trigger.after_pc == Some(pc) {
+                trigger.after_pc = None;
+            }
+            if trigger.after_pc.is_some() || trigger.pc != pc {
+                index += 1;
+                continue;
+            }
+
+            let action = self.pending.remove(index);
+            let observation = match action {
+                ScheduledAction::QueueKeyCode { key_code, .. } => {
+                    vm.bus_mut().queue_key_code(key_code);
+                    ScheduledActionObservation::KeyCodeQueued { pc, key_code }
+                }
+                ScheduledAction::QueueCioInput { bytes, .. } => {
+                    let byte_count = bytes.len();
+                    vm.bus_mut().queue_scripted_cio_input_bytes(&bytes);
+                    ScheduledActionObservation::CioInputQueued { pc, byte_count }
+                }
+                ScheduledAction::InjectActionSource { source, .. } => {
+                    let report = vm.bus_mut().inject_action_source(&source)?;
+                    ScheduledActionObservation::ActionSourceInjected { pc, report }
+                }
+            };
+            self.observations.push(observation.clone());
+            completed.push(observation);
+        }
+        Ok(completed)
+    }
+}
+
+impl VmRunHooks for ScheduledActions {
+    type Error = String;
+
+    fn before_step(&mut self, vm: &mut CompilerVm) -> Result<(), Self::Error> {
+        self.apply_before_step(vm).map(|_| ())
+    }
+}
 
 /// Lifecycle hooks around each CPU instruction executed by [`VmRunner`].
 ///
@@ -435,6 +579,83 @@ mod tests {
         assert!(matches!(
             outcome.stop_reason(),
             StopReason::UnsupportedOpcode { .. }
+        ));
+    }
+
+    #[test]
+    fn scheduled_actions_support_gated_pc_triggers_and_preserve_order() {
+        let mut vm = vm_with_program(&[
+            0xEA, // $0200 NOP
+            0x4C, 0x00, 0x02, // $0201 JMP $0200
+        ]);
+        vm.prepare_headless_program_environment();
+        vm.bus_mut().ram_mut().write(crate::CH_KEY_CODE, 0xFF);
+        let trigger = PcTrigger::at_after(0x0200, 0x0201);
+        let mut actions = ScheduledActions::new([
+            ScheduledAction::queue_cio_input(trigger, [b'A', b'B']),
+            ScheduledAction::queue_key_code(trigger, 0x21),
+        ]);
+        let outcome = VmRunner::new(vm)
+            .run_with_hooks(
+                RunRequest {
+                    max_steps: 3,
+                    ..RunRequest::default()
+                },
+                &mut actions,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.report.completed_steps, 3);
+        assert!(actions.pending().is_empty());
+        assert_eq!(
+            actions.observations(),
+            [
+                ScheduledActionObservation::CioInputQueued {
+                    pc: 0x0200,
+                    byte_count: 2,
+                },
+                ScheduledActionObservation::KeyCodeQueued {
+                    pc: 0x0200,
+                    key_code: 0x21,
+                },
+            ]
+        );
+        assert_eq!(outcome.memory().read(crate::CH_KEY_CODE), 0x21);
+    }
+
+    #[test]
+    fn scheduled_source_injection_returns_a_structured_observation() {
+        let mut vm = vm_with_program(&[0xEA]);
+        vm.bus_mut()
+            .ram_mut()
+            .write_word(crate::ACTION_AFBASE, 0x2000);
+        vm.bus_mut().ram_mut().write_word(0x2000, 0);
+        vm.bus_mut().ram_mut().write_word(0x2002, 0x1000);
+        vm.bus_mut().ram_mut().write_word(crate::ACTION_BUF, 0x3000);
+        vm.bus_mut().ram_mut().write(crate::ACTION_LINEMAX, 120);
+        let mut actions = ScheduledActions::new([ScheduledAction::inject_action_source(
+            PcTrigger::at(0x0200),
+            b"BYTE value\n".to_vec(),
+        )]);
+
+        let outcome = VmRunner::new(vm)
+            .run_with_hooks(
+                RunRequest {
+                    max_steps: 1,
+                    ..RunRequest::default()
+                },
+                &mut actions,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.report.completed_steps, 1);
+        assert_eq!(outcome.vm.bus().action_editor_lines().unwrap().len(), 1);
+        assert!(matches!(
+            actions.observations(),
+            [ScheduledActionObservation::ActionSourceInjected {
+                pc: 0x0200,
+                report: ActionSourceInjectionReport { line_count: 1, .. },
+            }]
         ));
     }
 }

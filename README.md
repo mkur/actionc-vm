@@ -72,6 +72,12 @@ callers. `OriginalCompiler` and `CartridgeObject` profiles validate that the
 cartridge and OS are present; `StandaloneObject` and `SyntheticTest` support
 ROM-free execution.
 
+PC-triggered key codes, scripted CIO input, and in-memory Action! source
+injection can be supplied through `ScheduledActions`. Direct and gated
+`PcTrigger` values make the same scheduling behavior available to library
+clients and the CLI, while `ScheduledActionObservation` records what was
+delivered.
+
 `scripts/run-probe` runs the original Action! compiler in the VM against probe
 sources from `../actionc/experiments/original-compiler-probes`. It feeds monitor
 commands equivalent to:

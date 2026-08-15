@@ -7,8 +7,9 @@ use action_compiler_vm::{
     ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ACTION_SEGMENT_END_VECTOR, ATARI_KEY_C, ATARI_KEY_E,
     ATARI_KEY_RETURN, ActionEditorLine, ActionSourceInjectionReport, ActionSymbolEntry,
     AddressRange, AtariLoadReport, BusAccess, BusEvent, BusRegion, CioObservation, CioSummary,
-    CpuRegisters, CpuStep, Hotpatch, ImageKind, RunRequest, StopReason, TextScreenSnapshot,
-    VmConfig, VmRunHooks, VmRunner, action_current_proc_name, decode_action_symbol_tables,
+    CpuRegisters, CpuStep, Hotpatch, ImageKind, PcTrigger, RunRequest, ScheduledAction,
+    ScheduledActionObservation, ScheduledActions, StopReason, TextScreenSnapshot, VmConfig,
+    VmRunHooks, VmRunner, action_current_proc_name, decode_action_symbol_tables,
     format_action_symbol_dump_json,
 };
 
@@ -80,8 +81,7 @@ fn inspect(config: VmConfig) -> Result<(), String> {
 
 struct CliRunHooks<'a> {
     options: &'a CliOptions,
-    deferred_key_codes: Vec<DeferredKeyCode>,
-    deferred_scripted_cio_inputs: Vec<DeferredScriptedCioInput>,
+    scheduled_actions: ScheduledActions,
     deferred_source_injections: Vec<DeferredSourceInjection>,
     editor_line_dump_pcs: Vec<u16>,
     screen_dump_pcs: Vec<u16>,
@@ -152,44 +152,15 @@ impl VmRunHooks for CliRunHooks<'_> {
             }
         }
 
-        let mut deferred_index = 0;
-        while deferred_index < self.deferred_scripted_cio_inputs.len() {
-            if self.deferred_scripted_cio_inputs[deferred_index].after_pc == Some(pc) {
-                self.deferred_scripted_cio_inputs[deferred_index].after_pc = None;
-            }
-            if self.deferred_scripted_cio_inputs[deferred_index]
-                .after_pc
-                .is_none()
-                && self.deferred_scripted_cio_inputs[deferred_index].pc == pc
-            {
-                let deferred = self.deferred_scripted_cio_inputs.remove(deferred_index);
-                vm.bus_mut().queue_scripted_cio_input_bytes(&deferred.bytes);
-                eprintln!(
-                    "queued {} scripted CIO byte(s) at PC=${:04X}",
-                    deferred.bytes.len(),
-                    deferred.pc
-                );
-            } else {
-                deferred_index += 1;
-            }
-        }
-
-        let mut deferred_index = 0;
-        while deferred_index < self.deferred_key_codes.len() {
-            if self.deferred_key_codes[deferred_index].after_pc == Some(pc) {
-                self.deferred_key_codes[deferred_index].after_pc = None;
-            }
-            if self.deferred_key_codes[deferred_index].after_pc.is_none()
-                && self.deferred_key_codes[deferred_index].pc == pc
-            {
-                let deferred = self.deferred_key_codes.remove(deferred_index);
-                vm.bus_mut().queue_key_code(deferred.key_code);
-                eprintln!(
-                    "queued key ${:02X} at PC=${:04X}",
-                    deferred.key_code, deferred.pc
-                );
-            } else {
-                deferred_index += 1;
+        for observation in self.scheduled_actions.apply_before_step(vm)? {
+            match observation {
+                ScheduledActionObservation::KeyCodeQueued { pc, key_code } => {
+                    eprintln!("queued key ${key_code:02X} at PC=${pc:04X}");
+                }
+                ScheduledActionObservation::CioInputQueued { pc, byte_count } => {
+                    eprintln!("queued {byte_count} scripted CIO byte(s) at PC=${pc:04X}");
+                }
+                ScheduledActionObservation::ActionSourceInjected { .. } => {}
             }
         }
         Ok(())
@@ -276,10 +247,22 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         load_action_call_listings(&options)?,
         load_action_call_maps(&options)?,
     );
+    let mut scheduled_actions = ScheduledActions::default();
+    for deferred in &options.deferred_scripted_cio_inputs {
+        scheduled_actions.schedule(ScheduledAction::queue_cio_input(
+            pc_trigger(deferred.pc, deferred.after_pc),
+            deferred.bytes.clone(),
+        ));
+    }
+    for deferred in &options.deferred_key_codes {
+        scheduled_actions.schedule(ScheduledAction::queue_key_code(
+            pc_trigger(deferred.pc, deferred.after_pc),
+            deferred.key_code,
+        ));
+    }
     let mut hooks = CliRunHooks {
         options: &options,
-        deferred_key_codes: options.deferred_key_codes.clone(),
-        deferred_scripted_cio_inputs: options.deferred_scripted_cio_inputs.clone(),
+        scheduled_actions,
         deferred_source_injections: options.deferred_source_injections.clone(),
         editor_line_dump_pcs: options.editor_line_dump_pcs.clone(),
         screen_dump_pcs: options.screen_dump_pcs.clone(),
@@ -351,6 +334,13 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn pc_trigger(pc: u16, after_pc: Option<u16>) -> PcTrigger {
+    match after_pc {
+        Some(after_pc) => PcTrigger::at_after(pc, after_pc),
+        None => PcTrigger::at(pc),
+    }
 }
 
 fn describe_stop(stop: StopReason) -> (String, Option<String>) {
