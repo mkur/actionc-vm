@@ -98,6 +98,24 @@ pub const ACTION_OS_PRESET: MappingPreset = MappingPreset {
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionProfile {
+    /// Boots and drives the original Action! cartridge compiler.
+    OriginalCompiler,
+    /// Runs an Atari object that still calls cartridge or OS services.
+    CartridgeObject,
+    /// Runs an Atari object whose emitted code is self-contained.
+    StandaloneObject,
+    /// Runs caller-installed memory and register state without external images.
+    SyntheticTest,
+}
+
+impl ExecutionProfile {
+    fn requires_cartridge_services(self) -> bool {
+        matches!(self, Self::OriginalCompiler | Self::CartridgeObject)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MappingPreset {
     pub name: &'static str,
     pub cartridge_base: u16,
@@ -142,10 +160,14 @@ impl VmConfig {
     }
 
     pub fn validate_for_execution(&self) -> Result<(), String> {
-        if self.cartridge.is_none() {
+        self.validate_for_profile(ExecutionProfile::OriginalCompiler)
+    }
+
+    pub fn validate_for_profile(&self, profile: ExecutionProfile) -> Result<(), String> {
+        if profile.requires_cartridge_services() && self.cartridge.is_none() {
             return Err("run requires --cart with an Action! cartridge ROM".to_string());
         }
-        if self.os_rom.is_none() {
+        if profile.requires_cartridge_services() && self.os_rom.is_none() {
             return Err("run currently requires --os with an Atari OS ROM".to_string());
         }
         Ok(())
@@ -323,6 +345,16 @@ impl CompilerVm {
         self.cpu.reset(&mut self.bus);
     }
 
+    pub fn validate_execution_profile(&self, profile: ExecutionProfile) -> Result<(), String> {
+        if profile.requires_cartridge_services() && self.bus.cartridge().is_none() {
+            return Err(format!("{profile:?} requires an Action! cartridge image"));
+        }
+        if profile.requires_cartridge_services() && self.bus.os_rom().is_none() {
+            return Err(format!("{profile:?} requires an Atari OS ROM image"));
+        }
+        Ok(())
+    }
+
     pub fn set_pc(&mut self, pc: u16) {
         self.cpu.set_pc(pc);
     }
@@ -333,6 +365,31 @@ impl CompilerVm {
 
     pub fn load_atari_object(&mut self, bytes: &[u8]) -> Result<AtariLoadReport, String> {
         load_atari_object_into_memory(self.bus.ram_mut(), bytes)
+    }
+
+    /// Prepares and starts an object under one of the object execution profiles.
+    pub fn load_atari_object_for_execution(
+        &mut self,
+        profile: ExecutionProfile,
+        bytes: &[u8],
+    ) -> Result<AtariLoadReport, String> {
+        if !matches!(
+            profile,
+            ExecutionProfile::CartridgeObject | ExecutionProfile::StandaloneObject
+        ) {
+            return Err(format!(
+                "{profile:?} is not an Atari object execution profile"
+            ));
+        }
+        self.validate_execution_profile(profile)?;
+        self.reset_cpu();
+        self.prepare_headless_program_environment();
+        let report = self.load_atari_object(bytes)?;
+        let run_address = report
+            .run_address
+            .ok_or_else(|| "Atari object does not contain RUNAD".to_string())?;
+        self.set_pc(run_address);
+        Ok(report)
     }
 
     /// Loads an image supplied by a library caller without performing file I/O.
@@ -4482,6 +4539,96 @@ mod tests {
             ..VmConfig::default()
         };
         config.validate_for_execution().unwrap();
+
+        VmConfig::default()
+            .validate_for_profile(ExecutionProfile::StandaloneObject)
+            .unwrap();
+        VmConfig::default()
+            .validate_for_profile(ExecutionProfile::SyntheticTest)
+            .unwrap();
+    }
+
+    #[test]
+    fn validates_loaded_images_for_execution_profiles() {
+        let mut vm = CompilerVm::default();
+        vm.validate_execution_profile(ExecutionProfile::StandaloneObject)
+            .unwrap();
+        vm.validate_execution_profile(ExecutionProfile::SyntheticTest)
+            .unwrap();
+        assert!(
+            vm.validate_execution_profile(ExecutionProfile::OriginalCompiler)
+                .unwrap_err()
+                .contains("cartridge")
+        );
+
+        vm.load_image_bytes(
+            ImageKind::Cartridge,
+            "action.rom",
+            DEFAULT_CART_BASE,
+            vec![0xEA],
+        )
+        .unwrap();
+        assert!(
+            vm.validate_execution_profile(ExecutionProfile::CartridgeObject)
+                .unwrap_err()
+                .contains("OS ROM")
+        );
+
+        vm.load_image_bytes(ImageKind::Rom, "atari-os.rom", OS_ROM_BASE, vec![0xEA])
+            .unwrap();
+        vm.validate_execution_profile(ExecutionProfile::OriginalCompiler)
+            .unwrap();
+        vm.validate_execution_profile(ExecutionProfile::CartridgeObject)
+            .unwrap();
+    }
+
+    #[test]
+    fn loads_and_runs_a_standalone_object_without_external_images() {
+        let object = [
+            0xFF, 0xFF, // object marker
+            0x00, 0x30, 0x07, 0x30, // $3000-$3007
+            0xA9, 0x42, // LDA #$42
+            0x8D, 0x00, 0x06, // STA $0600
+            0x4C, 0x05, 0x30, // JMP $3005
+            0xE2, 0x02, 0xE3, 0x02, // RUNAD segment
+            0x00, 0x30, // RUNAD=$3000
+        ];
+        let mut vm = CompilerVm::default();
+        let load = vm
+            .load_atari_object_for_execution(ExecutionProfile::StandaloneObject, &object)
+            .unwrap();
+
+        assert_eq!(load.run_address, Some(0x3000));
+        assert_eq!(vm.cpu().registers().pc, 0x3000);
+        assert_eq!(vm.cpu().registers().status, 0x24);
+        let outcome = VmRunner::new(vm).run(RunRequest {
+            max_steps: 10,
+            stop_after_pc: Some(0x3005),
+            ..RunRequest::default()
+        });
+
+        assert_eq!(outcome.stop_reason(), StopReason::PcReached { pc: 0x3005 });
+        assert_eq!(outcome.report.completed_steps, 3);
+        assert_eq!(outcome.memory().read(0x0600), 0x42);
+        assert!(outcome.vm.images().is_empty());
+    }
+
+    #[test]
+    fn object_loader_rejects_non_object_profiles_and_missing_runad() {
+        let mut vm = CompilerVm::default();
+        let error = vm
+            .load_atari_object_for_execution(ExecutionProfile::SyntheticTest, &[0xFF, 0xFF])
+            .unwrap_err();
+        assert!(error.contains("not an Atari object execution profile"));
+
+        let object_without_runad = [0xFF, 0xFF, 0x00, 0x30, 0x00, 0x30, 0xEA];
+        let error = vm
+            .load_atari_object_for_execution(
+                ExecutionProfile::StandaloneObject,
+                &object_without_runad,
+            )
+            .unwrap_err();
+        assert!(error.contains("does not contain RUNAD"));
     }
 
     #[test]
