@@ -1,5 +1,7 @@
 # actionc-vm
 
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+
 `actionc-vm` is a deterministic, headless 6502 VM for Action! compiler work.
 It is used both as a Rust library and as a command-line diagnostic harness.
 
@@ -203,3 +205,15 @@ into ANTIC, GTIA, POKEY, display-list, audio, or cycle-accurate video emulation.
 See [the library refactor implementation note](docs/LIBRARY_REFACTOR_IMPLEMENTATION_NOTE.md)
 for the ownership boundary, migration status, and remaining decomposition
 work.
+
+## License
+
+Copyright (C) 2026 Michal Kurcewicz
+
+`actionc-vm` and its original supporting code are free software licensed under
+the [GNU General Public License, version 3 or any later version](LICENSE), like
+the main `actionc` project.
+
+The bundled AltirraOS image retains its
+[file-specific permissive license](roms/ALTIRRAOS-LICENSE); its provenance is
+recorded in [roms/README.md](roms/README.md).
