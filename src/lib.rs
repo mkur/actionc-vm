@@ -4097,6 +4097,45 @@ impl Bus {
                     }
                 }
             }
+            SIO_COMMAND_FORMAT | SIO_COMMAND_FORMAT_ENHANCED => {
+                let write_policy = disk.write_policy;
+                let expected = disk.image.sector_size();
+                let sector_count = disk.image.sector_count();
+                if write_policy == DiskWritePolicy::ReadOnly {
+                    observation.status = SIO_STATUS_DEVICE_ERROR;
+                    observation.detail = "disk is mounted read-only".to_string();
+                } else if request.direction & 0xC0 != SIO_DIRECTION_READ
+                    || usize::from(request.length) != expected
+                {
+                    observation.status = SIO_STATUS_DEVICE_ERROR;
+                    observation.detail = format!(
+                        "format requires a {expected}-byte result read, got direction ${:02X} and length {}",
+                        request.direction, request.length
+                    );
+                } else {
+                    let format_result = self
+                        .mounted_disk_mut(request.unit)
+                        .expect("disk was resolved before format")
+                        .image
+                        .format_sectors(0);
+                    match format_result {
+                        Err(detail) => {
+                            observation.status = SIO_STATUS_DEVICE_ERROR;
+                            observation.detail = detail;
+                        }
+                        Ok(()) => {
+                            for offset in 0..request.length {
+                                self.ram.write(request.buffer.wrapping_add(offset), 0xFF);
+                            }
+                            observation.bytes_transferred = request.length;
+                            observation.detail = format!(
+                                "formatted {} sectors with {}-byte geometry",
+                                sector_count, expected
+                            );
+                        }
+                    }
+                }
+            }
             _ => {
                 observation.status = SIO_STATUS_DEVICE_NAK;
                 observation.detail = format!("unsupported disk command ${:02X}", request.command);
@@ -5189,7 +5228,7 @@ mod tests {
         )?;
         vm.cpu.registers.pc = TRAMPOLINE;
         vm.cpu.registers.x = x;
-        for _ in 0..200_000 {
+        for _ in 0..2_000_000 {
             vm.step_cpu().map_err(|err| format!("{err:?}"))?;
             if vm.cpu().registers().pc == TRAMPOLINE + 3 {
                 return Ok(vm.cpu().registers());
@@ -5534,6 +5573,43 @@ mod tests {
     }
 
     #[test]
+    fn cpu_formats_copy_on_write_disk_and_returns_no_bad_sectors() {
+        let mut original = test_atr_bytes(256, 5);
+        original[16..].fill(0xA5);
+        let mut bus = Bus::default();
+        bus.mount_atr_bytes(1, original, DiskWritePolicy::CopyOnWrite)
+            .unwrap();
+        let mut cpu = Cpu::default();
+        prepare_siov_call(
+            &mut bus,
+            &mut cpu,
+            1,
+            SIO_COMMAND_FORMAT,
+            SIO_DIRECTION_READ,
+            0x4000,
+            256,
+            0,
+        );
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.y, SIO_STATUS_SUCCESS);
+        assert!((0..256u16).all(|offset| bus.ram().read(0x4000 + offset) == 0xFF));
+        assert!(
+            bus.mounted_atr_bytes(1).unwrap()[16..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(bus.dirty_disk_sectors(1), Some(vec![1, 2, 3, 4, 5]));
+        assert_eq!(bus.sio_observations()[0].bytes_transferred, 256);
+        assert!(
+            bus.sio_observations()[0]
+                .detail
+                .contains("formatted 5 sectors")
+        );
+    }
+
+    #[test]
     fn cpu_reports_deterministic_siov_disk_errors() {
         let cases = [
             (
@@ -5566,6 +5642,14 @@ mod tests {
                 SIO_DIRECTION_WRITE,
                 128,
                 1,
+                SIO_STATUS_DEVICE_ERROR,
+            ),
+            (
+                2,
+                SIO_COMMAND_FORMAT,
+                SIO_DIRECTION_READ,
+                128,
+                0,
                 SIO_STATUS_DEVICE_ERROR,
             ),
             (2, 0x99, 0, 0, 0, SIO_STATUS_DEVICE_NAK),
@@ -6066,6 +6150,73 @@ mod tests {
                     SIO_STATUS_SUCCESS | SIO_STATUS_DEVICE_TIMEOUT
                 )
         }));
+    }
+
+    #[test]
+    fn bundled_mydos_formats_and_remounts_a_copy_on_write_disk() {
+        let mut vm = boot_bundled_mydos_to_prompt(DiskWritePolicy::CopyOnWrite);
+        let contents = b"SURVIVES ATR EXPORT";
+
+        native_write_file(&mut vm, b"D1:BEFORE.TXT\x9B", b"ERASE ME");
+        vm.bus_mut().ram_mut().write(0x07C4, 0x02);
+        vm.bus_mut().ram_mut().write(0x07CC, 0x10);
+        let sio_before_format = vm.bus().sio_observations().len();
+
+        assert_eq!(
+            native_cio_filename_command(&mut vm, 254, b"D1:\x9B", 0, 0),
+            1
+        );
+
+        let format = vm
+            .bus()
+            .sio_observations()
+            .iter()
+            .skip(sio_before_format)
+            .find(|observation| {
+                matches!(
+                    observation.command,
+                    SIO_COMMAND_FORMAT | SIO_COMMAND_FORMAT_ENHANCED
+                )
+            })
+            .expect("MyDOS should issue an SIO format request");
+        assert_eq!(format.unit, 1);
+        assert_eq!(format.status, SIO_STATUS_SUCCESS);
+        assert_eq!(format.bytes_transferred, 256);
+        assert!(native_file_open_status(&mut vm, b"D1:BEFORE.TXT\x9B") >= 0x80);
+
+        native_write_file(&mut vm, b"D1:AFTER.TXT\x9B", contents);
+        assert_eq!(
+            native_read_file(&mut vm, b"D1:AFTER.TXT\x9B", contents.len()),
+            contents
+        );
+        let formatted = vm.mounted_atr_bytes(1).unwrap();
+
+        let mut remounted = CompilerVm::default();
+        remounted
+            .mount_bundled_mydos(1, DiskWritePolicy::ReadOnly)
+            .unwrap();
+        remounted
+            .mount_atr_bytes(2, formatted, DiskWritePolicy::ReadOnly)
+            .unwrap();
+        remounted
+            .prepare_execution_profile(ExecutionProfile::DiskBoot)
+            .unwrap();
+        remounted.reset_cpu();
+        for _ in 0..400_000 {
+            if remounted.bus().dos_boot_is_ready() && remounted.cpu().registers().pc == 0xEA2D {
+                break;
+            }
+            remounted.step_cpu().unwrap();
+        }
+        assert_eq!(remounted.cpu().registers().pc, 0xEA2D);
+        assert_eq!(
+            native_file_open_status(&mut remounted, b"D2:AFTER.TXT\x9B"),
+            1
+        );
+        assert_eq!(
+            native_read_file(&mut remounted, b"D2:AFTER.TXT\x9B", contents.len()),
+            contents
+        );
     }
 
     #[test]

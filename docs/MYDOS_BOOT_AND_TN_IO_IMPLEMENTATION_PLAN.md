@@ -24,7 +24,7 @@ object, host-file, and runtime-library workflows.
 
 ## Implementation Status
 
-Slices 0 through 6 and Milestones A and B are complete as of 2026-08-19.
+Slices 0 through 8 and Milestones A through C are complete as of 2026-08-19.
 The implementation now provides:
 
 - ownership-aware native CIO fallback and buffered host-file reads;
@@ -38,15 +38,18 @@ The implementation now provides:
 - a scripted TN test that browses D1, views a known text file, assigns D2 to
   the second panel, and copies the file between drives;
 - byte-for-byte verification of a file larger than TN's available transfer
-  buffer, proving the repeated `Bget`/`Bput` path.
+  buffer, proving the repeated `Bget`/`Bput` path;
+- native and TN-driven coverage of rename, delete, lock/unlock, subdirectory,
+  wildcard, and binary-load workflows;
+- copy-on-write formatting through MyDOS's observed SIO `$21` contract, with
+  ATR export and read-only remount verification.
 
 TN's View output is asserted through the VM's structured channel-zero CIO
 capture. Directory state is asserted through the decoded TN screen, while the
 copy result is read back through the real MyDOS handler. All observed disk SIO
 requests in this workflow are handled by the mounted ATR service.
 
-Slices 8 and 9 remain: format-specific SIO and final public-surface
-stabilization.
+Slice 9 remains: final public-surface stabilization.
 
 Slice 7 is complete through complementary native-CIO and TN UI tests. A
 focused native test proves MyDOS commands 32 through 36 and 41 for rename,
@@ -56,6 +59,14 @@ drives TN's keyboard UI to rename and delete a file, lock and unlock another
 file, create and enter a subdirectory, and return to its parent. This keeps
 failures attributable: the native layer characterizes DOS commands, while the
 TN layer also covers selection, dialogs, filename input, and panel refresh.
+
+Slice 8 is complete. Drives 1 through 8 retain independent mounted state and
+unit-tagged observations, and the TN fixture copies a large file from D1 to
+D2. The VM recognizes the MyDOS format request as command `$21` with a
+sector-sized read buffer, clears only a copy-on-write image, and returns an
+all-`$FF` no-bad-sector result. An integration test formats D1 through the real
+MyDOS handler, writes a file, exports the modified ATR, remounts it as D2 next
+to a clean MyDOS boot disk, and reads the file back through native CIO.
 
 ## Current Baseline
 

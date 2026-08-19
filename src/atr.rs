@@ -136,6 +136,22 @@ impl AtrImage {
         Ok(())
     }
 
+    /// Resets every logical sector to a deterministic fill byte while
+    /// preserving the ATR header and geometry.
+    pub fn format_sectors(&mut self, fill: u8) -> Result<(), String> {
+        let sector_count = u16::try_from(self.sector_count).map_err(|_| {
+            format!(
+                "ATR has {} sectors, exceeding the 16-bit SIO sector range",
+                self.sector_count
+            )
+        })?;
+        for sector in 1..=sector_count {
+            let length = self.sector_len(sector)?;
+            self.write_sector(sector, &vec![fill; length])?;
+        }
+        Ok(())
+    }
+
     fn sector_range(&self, sector: u16) -> Result<(usize, usize), String> {
         if sector == 0 {
             return Err("ATR sector numbers start at one".to_string());
@@ -291,5 +307,21 @@ mod tests {
         assert!(!image.is_dirty());
         assert_eq!(image.original_bytes(), image.as_bytes());
         assert_eq!(image.into_bytes().len(), original.len());
+    }
+
+    #[test]
+    fn formats_all_sectors_without_changing_atr_geometry() {
+        let mut bytes = atr_bytes(256, 5);
+        bytes[16..].fill(0xA5);
+        let header = bytes[0..16].to_vec();
+        let mut image = AtrImage::from_bytes(bytes).unwrap();
+
+        image.format_sectors(0).unwrap();
+
+        assert_eq!(&image.as_bytes()[0..16], header);
+        assert!(image.as_bytes()[16..].iter().all(|byte| *byte == 0));
+        assert_eq!(image.sector_size(), 256);
+        assert_eq!(image.sector_count(), 5);
+        assert_eq!(image.dirty_sectors(), vec![1, 2, 3, 4, 5]);
     }
 }
