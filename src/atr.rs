@@ -324,4 +324,22 @@ mod tests {
         assert_eq!(image.sector_count(), 5);
         assert_eq!(image.dirty_sectors(), vec![1, 2, 3, 4, 5]);
     }
+
+    #[test]
+    fn copy_on_write_serialization_is_independent_of_write_order() {
+        let original = atr_bytes(256, 6);
+        let mut first = AtrImage::from_bytes(original.clone()).unwrap();
+        let mut second = AtrImage::from_bytes(original.clone()).unwrap();
+
+        first.write_sector(4, &[0x44; 256]).unwrap();
+        first.write_sector(6, &[0x66; 256]).unwrap();
+        second.write_sector(6, &[0x66; 256]).unwrap();
+        second.write_sector(4, &[0x44; 256]).unwrap();
+
+        assert_eq!(first.as_bytes(), second.as_bytes());
+        assert_eq!(first.original_bytes(), original);
+        assert_eq!(second.original_bytes(), original);
+        assert_eq!(first.dirty_sectors(), vec![4, 6]);
+        assert_eq!(second.dirty_sectors(), vec![4, 6]);
+    }
 }

@@ -9,8 +9,8 @@ use actionc_vm::{
     AddressRange, AtariLoadReport, BusAccess, BusEvent, BusRegion, CioObservation, CioSummary,
     CpuRegisters, CpuStep, DiskWritePolicy, ExecutionProfile, Hotpatch, ImageKind, PcTrigger,
     RunRequest, ScheduledAction, ScheduledActionObservation, ScheduledActions, SioObservation,
-    StopReason, TextScreenSnapshot, VmConfig, VmRunHooks, VmRunner, action_current_proc_name,
-    decode_action_symbol_tables, format_action_symbol_dump_json,
+    SioSummary, StopReason, TextScreenSnapshot, VmConfig, VmRunHooks, VmRunner,
+    action_current_proc_name, decode_action_symbol_tables, format_action_symbol_dump_json,
 };
 
 fn main() {
@@ -340,6 +340,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         vm.bus().events(),
         vm.bus().cio_summary(),
         vm.bus().cio_observations(),
+        vm.bus().sio_summary(),
         vm.bus().sio_observations(),
         vm.bus().cartridge().map(|cart| cart.mapping_info()),
         &hooks.action_fixup_trace,
@@ -2440,6 +2441,7 @@ fn print_stop_report(
     events: &[BusEvent],
     cio_summary: &CioSummary,
     cio_observations: &VecDeque<CioObservation>,
+    sio_summary: &SioSummary,
     sio_observations: &VecDeque<SioObservation>,
     cartridge: Option<actionc_vm::CartridgeMappingInfo>,
     action_fixup_trace: &ActionFixupTrace,
@@ -2546,7 +2548,18 @@ fn print_stop_report(
             );
         }
     }
-    if !sio_observations.is_empty() {
+    if sio_summary.calls > 0 {
+        eprintln!(
+            "SIO summary: calls={} ok={} errors={} status={} read={} write={} format={} bytes={}",
+            sio_summary.calls,
+            sio_summary.successful,
+            sio_summary.errors,
+            sio_summary.statuses,
+            sio_summary.reads,
+            sio_summary.writes,
+            sio_summary.formats,
+            sio_summary.bytes_transferred
+        );
         eprintln!("recent SIO:");
         for observation in sio_observations
             .iter()

@@ -24,7 +24,7 @@ object, host-file, and runtime-library workflows.
 
 ## Implementation Status
 
-Slices 0 through 8 and Milestones A through C are complete as of 2026-08-19.
+Slices 0 through 9 and Milestones A through C are complete as of 2026-08-20.
 The implementation now provides:
 
 - ownership-aware native CIO fallback and buffered host-file reads;
@@ -49,7 +49,7 @@ capture. Directory state is asserted through the decoded TN screen, while the
 copy result is read back through the real MyDOS handler. All observed disk SIO
 requests in this workflow are handled by the mounted ATR service.
 
-Slice 9 remains: final public-surface stabilization.
+No implementation slices remain.
 
 Slice 7 is complete through complementary native-CIO and TN UI tests. A
 focused native test proves MyDOS commands 32 through 36 and 41 for rename,
@@ -68,7 +68,18 @@ all-`$FF` no-bad-sector result. An integration test formats D1 through the real
 MyDOS handler, writes a file, exports the modified ATR, remounts it as D2 next
 to a clean MyDOS boot disk, and reads the file back through native CIO.
 
-## Current Baseline
+Slice 9 is complete. Disk boot is a documented public execution profile rather
+than an experimental path. The README describes the CLI and byte-oriented
+library surfaces, supported ATR geometries, SIO commands, and deliberate
+non-emulation boundary. Stop reports now include a cumulative compact SIO
+summary before the bounded recent-request trace, and a regression proves that
+equivalent copy-on-write changes serialize identically regardless of write
+order. The existing MyDOS notice remains the authority for fixture provenance
+and redistribution terms.
+
+## Starting Baseline
+
+This section records the VM state before the implementation slices began.
 
 The VM already has useful prerequisites:
 
@@ -217,12 +228,12 @@ CPU registers, flags, stack, and memory buffer that real callers observe.
 These return details must be characterized with small synthetic programs before
 MyDOS boot is used as the oracle.
 
-The initial command set is deliberately narrow:
+The implemented command set is deliberately narrow:
 
-1. drive status;
-2. read sector;
-3. write/put sector for copy-on-write disks;
-4. format commands required by the selected MyDOS version.
+1. drive status (`$53`);
+2. read sector (`$52`);
+3. write/put sector (`$57`/`$50`) for copy-on-write disks;
+4. format (`$21`/`$22`) for copy-on-write disks.
 
 Command byte values and status payloads must be derived from traces and focused
 tests rather than guessed. Unsupported commands must fail deterministically
@@ -407,7 +418,7 @@ MyDOS on disposable images:
 - format;
 - switch and copy between drives.
 
-### Slice 9: stabilization and public surface
+### Slice 9: stabilization and public surface — complete
 
 - remove the experimental marker from the disk-boot profile;
 - document the library and CLI APIs;

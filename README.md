@@ -26,6 +26,8 @@ Altirra, or another full emulator.
   headless program environment;
 - the OS and CIO behavior needed by the current Action! workflows, including
   in-memory `H:`/`D:` host files and captured outputs;
+- ATR-backed drives 1 through 8, native MyDOS boot, and deterministic
+  high-level disk I/O at the OS `SIOV` boundary;
 - scheduled keyboard input, CIO input, and Action! source injection at direct
   or gated PC triggers;
 - watchpoints, protected code ranges, traces, memory dumps, and structured stop
@@ -105,9 +107,34 @@ cargo run -- run \
 ATR mounts are read-only by default. The VM services disk status and sector
 reads at the OS `SIOV` boundary, preserving real DOS filesystem behavior
 without emulating serial timing. `--stop-on-dos-ready` stops after DOS publishes
-its vectors and installs a native `D:` handler. Add
+its vectors and installs a native `D:` handler. Repeat `--disk` to mount drives
+1 through 8. Add
 `--disk-writeback 1:path/to/result.atr` to enable copy-on-write sector updates
 and save the resulting image without overwriting the mounted input.
+
+### ATR disk support
+
+The validated ATR model accepts 128-byte and 256-byte sector images with a
+standard 16-byte header. In 256-byte images, the first three boot sectors retain
+their 128-byte layout. Logical sector numbers are one-based, and serialization
+preserves the original header and geometry.
+
+The high-level disk service implements the commands exercised by the bundled
+MyDOS and TN fixtures:
+
+| SIO command | Operation | Write policy |
+| --- | --- | --- |
+| `$53` | Drive status | Read-only or copy-on-write |
+| `$52` | Read sector | Read-only or copy-on-write |
+| `$50`, `$57` | Put/write sector | Copy-on-write only |
+| `$21`, `$22` | Format and return a no-bad-sector list | Copy-on-write only |
+
+MyDOS 4.53/3 has been verified to use `$21` with a sector-sized read buffer.
+Formatting clears the in-memory sector payload while preserving ATR geometry;
+MyDOS then writes its filesystem structures through normal sector commands.
+Unsupported commands, invalid transfer shapes, absent drives, and writes to a
+read-only image return deterministic SIO errors and remain visible in the
+structured observations and CLI stop report.
 
 Cartridge-backed profiles use embedded Action! 3.6 and AltirraOS XL/XE 3.11
 images. Pass `--cart path/to/custom-action.rom` or
@@ -153,7 +180,8 @@ Use `CompilerVm::load_bundled_action_cartridge` and
 `CompilerVm::load_bundled_altirra_os` to install the defaults explicitly, or
 `CompilerVm::load_image_bytes` for custom cartridge, OS, and other images.
 `mount_atr_bytes` installs a caller-owned ATR on a numbered drive and exposes
-bounded `SioObservation` records for disk traffic. `mount_bundled_mydos`
+bounded `SioObservation` records plus a cumulative `SioSummary` for disk
+traffic. `mount_bundled_mydos`
 provides the repository's audited MyDOS 4.53/3 fixture; its license,
 provenance, and corresponding source are recorded in
 [`disks/MYDOS-NOTICE.md`](disks/MYDOS-NOTICE.md).

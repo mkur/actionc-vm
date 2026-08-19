@@ -552,6 +552,11 @@ impl CompilerVm {
         self.bus.set_trace_sio(trace_sio);
     }
 
+    /// Mounts a validated 128-byte or 256-byte-sector ATR as drive 1 through 8.
+    ///
+    /// `ReadOnly` rejects sector writes and format requests. `CopyOnWrite`
+    /// keeps the caller's input snapshot and applies changes only to the VM's
+    /// in-memory image.
     pub fn mount_atr_bytes(
         &mut self,
         unit: u8,
@@ -561,18 +566,22 @@ impl CompilerVm {
         self.bus.mount_atr_bytes(unit, bytes, policy)
     }
 
+    /// Mounts the audited MyDOS 4.53/3 fixture on the requested drive.
     pub fn mount_bundled_mydos(&mut self, unit: u8, policy: DiskWritePolicy) -> Result<(), String> {
         self.mount_atr_bytes(unit, BUNDLED_MYDOS_ATR.to_vec(), policy)
     }
 
+    /// Returns a serialized copy of the mounted image, including COW changes.
     pub fn mounted_atr_bytes(&self, unit: u8) -> Option<Vec<u8>> {
         self.bus.mounted_atr_bytes(unit)
     }
 
+    /// Returns the unchanged ATR bytes supplied when the drive was mounted.
     pub fn original_atr_bytes(&self, unit: u8) -> Option<Vec<u8>> {
         self.bus.original_atr_bytes(unit)
     }
 
+    /// Returns sorted, one-based logical sector numbers changed by COW writes.
     pub fn dirty_disk_sectors(&self, unit: u8) -> Option<Vec<u16>> {
         self.bus.dirty_disk_sectors(unit)
     }
@@ -2693,6 +2702,7 @@ pub struct Bus {
     cio_fallback_policy: CioFallbackPolicy,
     mounted_disks: [Option<MountedDisk>; 8],
     trace_sio: bool,
+    sio_summary: SioSummary,
     sio_observations: VecDeque<SioObservation>,
     sio_timeout_pending: bool,
     redirect_disk_boot_to_cart: bool,
@@ -2731,6 +2741,7 @@ impl Default for Bus {
             cio_fallback_policy: CioFallbackPolicy::Headless,
             mounted_disks: std::array::from_fn(|_| None),
             trace_sio: false,
+            sio_summary: SioSummary::default(),
             sio_observations: VecDeque::new(),
             sio_timeout_pending: false,
             redirect_disk_boot_to_cart: false,
@@ -2824,6 +2835,10 @@ impl Bus {
 
     pub fn sio_observations(&self) -> &VecDeque<SioObservation> {
         &self.sio_observations
+    }
+
+    pub fn sio_summary(&self) -> &SioSummary {
+        &self.sio_summary
     }
 
     pub fn clear_events(&mut self) {
@@ -4147,6 +4162,24 @@ impl Bus {
 
     fn finish_sio_observation(&mut self, observation: SioObservation) -> u8 {
         self.ram.write(DSTATS, observation.status);
+        self.sio_summary.calls += 1;
+        if observation.status == SIO_STATUS_SUCCESS {
+            self.sio_summary.successful += 1;
+        } else {
+            self.sio_summary.errors += 1;
+        }
+        match observation.command {
+            SIO_COMMAND_STATUS => self.sio_summary.statuses += 1,
+            SIO_COMMAND_READ_SECTOR => self.sio_summary.reads += 1,
+            SIO_COMMAND_PUT_SECTOR | SIO_COMMAND_WRITE_SECTOR => {
+                self.sio_summary.writes += 1;
+            }
+            SIO_COMMAND_FORMAT | SIO_COMMAND_FORMAT_ENHANCED => {
+                self.sio_summary.formats += 1;
+            }
+            _ => {}
+        }
+        self.sio_summary.bytes_transferred += u64::from(observation.bytes_transferred);
         if self.trace_sio {
             eprintln!(
                 "SIO: cyc={} dev=${:02X} unit={} cmd=${:02X} dir=${:02X} sector={} buf=${:04X} len={} status=${:02X} bytes={} {}",
@@ -4695,6 +4728,22 @@ pub struct CioObservation {
     pub bytes_read: Option<u16>,
     pub bytes_written: Option<u16>,
     pub preview: Option<String>,
+}
+
+/// Cumulative counters for disk requests intercepted at the OS `SIOV` entry.
+///
+/// Unlike the bounded recent-observation queue, these counters cover the
+/// complete lifetime of the bus.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SioSummary {
+    pub calls: u64,
+    pub successful: u64,
+    pub errors: u64,
+    pub statuses: u64,
+    pub reads: u64,
+    pub writes: u64,
+    pub formats: u64,
+    pub bytes_transferred: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5606,6 +5655,16 @@ mod tests {
             bus.sio_observations()[0]
                 .detail
                 .contains("formatted 5 sectors")
+        );
+        assert_eq!(
+            bus.sio_summary(),
+            &SioSummary {
+                calls: 1,
+                successful: 1,
+                formats: 1,
+                bytes_transferred: 256,
+                ..SioSummary::default()
+            }
         );
     }
 
