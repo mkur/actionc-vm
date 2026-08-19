@@ -45,15 +45,17 @@ capture. Directory state is asserted through the decoded TN screen, while the
 copy result is read back through the real MyDOS handler. All observed disk SIO
 requests in this workflow are handled by the mounted ATR service.
 
-Slices 7 through 9 remain: broader MyDOS mutation coverage, format-specific
-SIO, and final public-surface stabilization.
+Slices 8 and 9 remain: format-specific SIO and final public-surface
+stabilization.
 
-The native-CIO foundation for Slice 7 is also complete. A focused test now
-proves MyDOS commands 32 through 36 and 41 for rename, delete, mkdir,
-lock/unlock, and current-directory changes; wildcard deletion; and command 39
-loading and executing a known load-format object. The remaining Slice 7 work
-is to drive representative mutations through TN's own UI rather than call the
-same DOS interfaces from a test trampoline.
+Slice 7 is complete through complementary native-CIO and TN UI tests. A
+focused native test proves MyDOS commands 32 through 36 and 41 for rename,
+delete, mkdir, lock/unlock, and current-directory changes; wildcard deletion;
+and command 39 loading and executing a known load-format object. A second test
+drives TN's keyboard UI to rename and delete a file, lock and unlock another
+file, create and enter a subdirectory, and return to its parent. This keeps
+failures attributable: the native layer characterizes DOS commands, while the
+TN layer also covers selection, dialogs, filename input, and panel refresh.
 
 ## Current Baseline
 

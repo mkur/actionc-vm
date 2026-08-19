@@ -5352,6 +5352,40 @@ mod tests {
         false
     }
 
+    fn queue_keyboard_text(vm: &mut CompilerVm, characters: &[u8]) {
+        let table = vm.bus().ram().read_word(0x0079);
+        let key_codes = characters
+            .iter()
+            .map(|character| {
+                (0u8..=0x7F)
+                    .find(|key_code| {
+                        vm.bus_mut().read(table.wrapping_add(u16::from(*key_code))) == *character
+                    })
+                    .unwrap_or_else(|| panic!("no keyboard code for ${character:02X}"))
+            })
+            .collect::<Vec<_>>();
+        for key_code in key_codes {
+            vm.bus_mut().queue_key_code(key_code);
+        }
+    }
+
+    fn run_until_screen_lacks(vm: &mut CompilerVm, needle: &str, max_steps: usize) -> bool {
+        for step in 0..max_steps {
+            vm.step_cpu().unwrap();
+            if step % 1024 == 0
+                && vm
+                    .bus()
+                    .text_screen_snapshot(40, 24)
+                    .lines
+                    .iter()
+                    .all(|line| !line.contains(needle))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     #[test]
     fn maps_image_bytes_at_requested_base() {
         let mut memory = Memory::default();
@@ -6159,6 +6193,146 @@ mod tests {
                     SIO_STATUS_SUCCESS | SIO_STATUS_DEVICE_TIMEOUT
                 )
         }));
+    }
+
+    #[test]
+    fn tn_standalone_mutates_files_and_directories_through_its_ui() {
+        const TN_NEST_LEVEL: u16 = 0x2C62;
+        const TN_ENTRY_POINTERS: u16 = 0x2C4C;
+
+        let mut vm = boot_bundled_mydos_to_prompt(DiskWritePolicy::CopyOnWrite);
+        native_write_file(&mut vm, b"D1:AOLD.TXT\x9B", b"TN UI MUTATION");
+        native_write_file(&mut vm, b"D1:BLOCK.TXT\x9B", b"ATTRIBUTE TARGET");
+        vm.bus_mut().ram_mut().write(0x070A, 0xFF);
+        let report = vm.load_atari_object(TN_STANDALONE_OBJECT).unwrap();
+        vm.set_pc(report.run_address.unwrap());
+
+        assert!(run_until_screen_contains(&mut vm, "AOLD", 5_000_000));
+        for _ in 0..300_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        queue_keyboard_text(&mut vm, b"R");
+        assert!(run_until_screen_contains(&mut vm, "Rename", 2_000_000));
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+        queue_keyboard_text(&mut vm, b"ANEW.TXT\x9B");
+        assert!(
+            run_until_screen_contains(&mut vm, "ANEW", 5_000_000),
+            "PC=${:04X}\n{}",
+            vm.cpu().registers().pc,
+            vm.bus().text_screen_snapshot(40, 24).lines.join("\n")
+        );
+        for _ in 0..200_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        queue_keyboard_text(&mut vm, b"D");
+        assert!(run_until_screen_contains(&mut vm, "Delete", 2_000_000));
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+        queue_keyboard_text(&mut vm, b"D");
+        assert!(
+            run_until_screen_lacks(&mut vm, "ANEW", 5_000_000),
+            "PC=${:04X}\n{}",
+            vm.cpu().registers().pc,
+            vm.bus().text_screen_snapshot(40, 24).lines.join("\n")
+        );
+        for _ in 0..200_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        let selected_entry = vm
+            .bus()
+            .ram()
+            .read_word(vm.bus().ram().read_word(TN_ENTRY_POINTERS));
+        let original_attribute = vm.bus().ram().read(selected_entry.wrapping_add(1)) & 0x20;
+        queue_keyboard_text(&mut vm, b"A");
+        for _ in 0..5_000_000 {
+            vm.step_cpu().unwrap();
+            let entry = vm
+                .bus()
+                .ram()
+                .read_word(vm.bus().ram().read_word(TN_ENTRY_POINTERS));
+            if vm.bus().ram().read(entry.wrapping_add(1)) & 0x20 != original_attribute {
+                break;
+            }
+        }
+        let selected_entry = vm
+            .bus()
+            .ram()
+            .read_word(vm.bus().ram().read_word(TN_ENTRY_POINTERS));
+        assert_ne!(
+            vm.bus().ram().read(selected_entry.wrapping_add(1)) & 0x20,
+            original_attribute
+        );
+        queue_keyboard_text(&mut vm, b"A");
+        for _ in 0..5_000_000 {
+            vm.step_cpu().unwrap();
+            let entry = vm
+                .bus()
+                .ram()
+                .read_word(vm.bus().ram().read_word(TN_ENTRY_POINTERS));
+            if vm.bus().ram().read(entry.wrapping_add(1)) & 0x20 == original_attribute {
+                break;
+            }
+        }
+        let selected_entry = vm
+            .bus()
+            .ram()
+            .read_word(vm.bus().ram().read_word(TN_ENTRY_POINTERS));
+        assert_eq!(
+            vm.bus().ram().read(selected_entry.wrapping_add(1)) & 0x20,
+            original_attribute
+        );
+        for _ in 0..200_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        queue_keyboard_text(&mut vm, b"M");
+        assert!(run_until_screen_contains(
+            &mut vm,
+            "Subdirectory",
+            2_000_000
+        ));
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+        queue_keyboard_text(&mut vm, b"SUBDIR\x9B");
+        assert!(run_until_screen_contains(&mut vm, "SUBDIR", 5_000_000));
+        for _ in 0..200_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        queue_keyboard_text(&mut vm, b"\x9B");
+        for _ in 0..5_000_000 {
+            vm.step_cpu().unwrap();
+            if vm.bus().ram().read(TN_NEST_LEVEL) == 1 {
+                break;
+            }
+        }
+        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 1);
+        for _ in 0..200_000 {
+            vm.step_cpu().unwrap();
+        }
+        queue_keyboard_text(&mut vm, b"\x1B");
+        for _ in 0..5_000_000 {
+            vm.step_cpu().unwrap();
+            if vm.bus().ram().read(TN_NEST_LEVEL) == 0 {
+                break;
+            }
+        }
+        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 0);
+
+        assert!(native_file_open_status(&mut vm, b"D1:ANEW.TXT\x9B") >= 0x80);
+        assert_eq!(native_file_open_status(&mut vm, b"D1:BLOCK.TXT\x9B"), 1);
+        assert_eq!(
+            native_cio_filename_command(&mut vm, 41, b"D1:SUBDIR\x9B", 0, 0),
+            1
+        );
+        assert!(vm.disk_is_dirty(1));
     }
 
     #[test]
