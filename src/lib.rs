@@ -101,6 +101,7 @@ pub const CIO_COMMAND_DRAW_TO: u8 = 0x11;
 pub const CIO_COMMAND_FILL: u8 = 0x12;
 pub const CIO_COMMAND_POINT: u8 = 0x25;
 pub const CIO_COMMAND_NOTE: u8 = 0x26;
+pub const ATASCII_EOL: u8 = 0x9B;
 pub const GRAPHICS_COLOR: u16 = 0x02FD;
 pub const GRAPHICS_FILL_COLOR: u16 = 0x02FB;
 pub const CIO_OBSERVATION_LIMIT: usize = 128;
@@ -2238,9 +2239,12 @@ impl Cpu {
                 false
             }
             CIO_COMMAND_PUTCHR | CIO_COMMAND_PUTREC => {
-                if let Some(written) =
-                    bus.write_screen_bytes_for_iocb(self.registers.x, self.registers.a)
-                {
+                let terminate_record = command == CIO_COMMAND_PUTREC;
+                if let Some(written) = bus.write_screen_bytes_for_iocb(
+                    self.registers.x,
+                    self.registers.a,
+                    terminate_record,
+                ) {
                     observation.handled = true;
                     observation.detail = format!("write screen {written} pixel(s)");
                     observation.result_a = Some(self.registers.a);
@@ -2250,9 +2254,11 @@ impl Cpu {
                     self.return_from_ciov(bus, self.registers.a, 0x01);
                     return true;
                 }
-                if let Some(written) =
-                    bus.write_host_bytes_for_iocb(self.registers.x, self.registers.a)
-                {
+                if let Some(written) = bus.write_host_bytes_for_iocb(
+                    self.registers.x,
+                    self.registers.a,
+                    terminate_record,
+                ) {
                     observation.handled = true;
                     observation.detail = format!("write host {written} byte(s)");
                     observation.result_a = Some(self.registers.a);
@@ -2267,7 +2273,11 @@ impl Cpu {
                     bus.finish_cio_observation(observation);
                     return false;
                 }
-                let bytes = bus.cio_output_bytes_for_iocb(self.registers.x, self.registers.a);
+                let bytes = bus.cio_output_bytes_for_iocb(
+                    self.registers.x,
+                    self.registers.a,
+                    terminate_record,
+                );
                 bus.capture_cio_channel0_output(&bytes);
                 observation.handled = true;
                 observation.detail = format!("write E: {} byte(s)", bytes.len());
@@ -3496,7 +3506,12 @@ impl Bus {
         Some(offset)
     }
 
-    fn write_host_bytes_for_iocb(&mut self, x: u8, accumulator: u8) -> Option<usize> {
+    fn write_host_bytes_for_iocb(
+        &mut self,
+        x: u8,
+        accumulator: u8,
+        terminate_record: bool,
+    ) -> Option<usize> {
         let channel = cio_channel_index(x)?;
         let Some(CioHarnessDevice::Host { file_index, offset }) = self.cio_harness_devices[channel]
         else {
@@ -3506,7 +3521,7 @@ impl Bus {
             return None;
         }
 
-        let bytes = self.cio_output_bytes_for_iocb(x, accumulator);
+        let bytes = self.cio_output_bytes_for_iocb(x, accumulator, terminate_record);
         self.host_files[file_index].bytes.extend_from_slice(&bytes);
         self.cio_harness_devices[channel] = Some(CioHarnessDevice::Host {
             file_index,
@@ -3524,11 +3539,16 @@ impl Bus {
         self.graphics_pixel(self.ram.read_word(COLCRS), self.ram.read(ROWCRS))
     }
 
-    fn write_screen_bytes_for_iocb(&mut self, x: u8, accumulator: u8) -> Option<usize> {
+    fn write_screen_bytes_for_iocb(
+        &mut self,
+        x: u8,
+        accumulator: u8,
+        terminate_record: bool,
+    ) -> Option<usize> {
         if self.cio_channel_device(x) != Some(CioHarnessDevice::Screen) {
             return None;
         }
-        let bytes = self.cio_output_bytes_for_iocb(x, accumulator);
+        let bytes = self.cio_output_bytes_for_iocb(x, accumulator, terminate_record);
         let mut column = self.ram.read_word(COLCRS);
         let row = self.ram.read(ROWCRS);
         for byte in &bytes {
@@ -3588,17 +3608,24 @@ impl Bus {
         }
     }
 
-    fn cio_output_bytes_for_iocb(&self, x: u8, accumulator: u8) -> Vec<u8> {
+    fn cio_output_bytes_for_iocb(&self, x: u8, accumulator: u8, terminate_record: bool) -> Vec<u8> {
         let base = x as u16;
         let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(base));
         let length = self.ram.read_word(IOCB_LENGTH_BASE.wrapping_add(base));
         if buffer == 0 || length == 0 {
-            return vec![accumulator];
+            let mut bytes = vec![accumulator];
+            if terminate_record && accumulator != ATASCII_EOL {
+                bytes.push(ATASCII_EOL);
+            }
+            return bytes;
         }
 
         let mut bytes = Vec::with_capacity(length as usize);
         for offset in 0..length {
             bytes.push(self.ram.read(buffer.wrapping_add(offset)));
+        }
+        if terminate_record && bytes.last() != Some(&ATASCII_EOL) {
+            bytes.push(ATASCII_EOL);
         }
         bytes
     }
@@ -6791,7 +6818,7 @@ mod tests {
         bus.ram_mut().write_word(COLCRS, 10);
         bus.ram_mut().write(ROWCRS, 20);
 
-        assert_eq!(bus.write_screen_bytes_for_iocb(0x60, 3), Some(1));
+        assert_eq!(bus.write_screen_bytes_for_iocb(0x60, 3, false), Some(1));
         assert_eq!(bus.graphics_pixel(10, 20), 3);
         assert_eq!(bus.read_screen_pixel(), 3);
 
@@ -6815,8 +6842,8 @@ mod tests {
         let mut bus = Bus::default();
         bus.ram_mut().write(IOCB_COMMAND_BASE, CIO_COMMAND_PUTREC);
         bus.ram_mut().write_word(IOCB_BUFFER_BASE, 0x3000);
-        bus.ram_mut().write_word(IOCB_LENGTH_BASE, 3);
-        bus.ram_mut().map(0x3000, b"OK\x9B").unwrap();
+        bus.ram_mut().write_word(IOCB_LENGTH_BASE, 2);
+        bus.ram_mut().map(0x3000, b"OK").unwrap();
         bus.ram_mut().write(0x01FC, 0xFF);
         bus.ram_mut().write(0x01FD, 0x1F);
         let mut cpu = Cpu::default();
