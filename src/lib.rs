@@ -2059,7 +2059,24 @@ impl Cpu {
             CIO_COMMAND_GETCHR | CIO_COMMAND_GETREC => {
                 match bus.cio_channel_device(self.registers.x) {
                     Some(CioHarnessDevice::QueuedInput) => {
-                        if let Some(character) = bus.pop_scripted_cio_input_byte() {
+                        if command == CIO_COMMAND_GETREC
+                            && let Some(result) = bus.read_scripted_cio_record(self.registers.x)
+                        {
+                            observation.handled = true;
+                            observation.detail = result.detail;
+                            observation.result_a = Some(result.accumulator);
+                            observation.result_y = Some(result.status);
+                            observation.bytes_read = Some(result.bytes_read as u16);
+                            if !result.preview.is_empty() {
+                                observation.preview = Some(result.preview);
+                            }
+                            bus.finish_cio_observation(observation);
+                            self.return_from_ciov(bus, result.accumulator, result.status);
+                            return true;
+                        }
+                        if command == CIO_COMMAND_GETCHR
+                            && let Some(character) = bus.pop_scripted_cio_input_byte()
+                        {
                             bus.trace_cio(format_args!(
                                 "  Q: read ${character:02X} `{}`",
                                 atari_debug_char(character)
@@ -3221,6 +3238,40 @@ impl Bus {
             bytes_read: 0,
             detail: "read host char EOF".to_string(),
             preview: String::new(),
+        })
+    }
+
+    fn read_scripted_cio_record(&mut self, x: u8) -> Option<CioReadResult> {
+        let requested = self.ram.read_word(IOCB_LENGTH_BASE.wrapping_add(x as u16));
+        let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(x as u16));
+        if requested == 0 || self.scripted_cio_input.is_empty() {
+            return None;
+        }
+
+        let mut written = 0u16;
+        let mut preview = Vec::new();
+        while written < requested {
+            let Some(byte) = self.pop_scripted_cio_input_byte() else {
+                break;
+            };
+            self.ram.write(buffer.wrapping_add(written), byte);
+            if preview.len() < CIO_READ_PREVIEW_LIMIT {
+                preview.push(byte);
+            }
+            written = written.wrapping_add(1);
+            if byte == 0x9B {
+                break;
+            }
+        }
+
+        self.ram
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(x as u16), written);
+        Some(CioReadResult {
+            accumulator: 0,
+            status: 0x01,
+            bytes_read: written as usize,
+            detail: format!("read queued record {written} byte(s)"),
+            preview: format_cio_preview(&preview),
         })
     }
 
@@ -6320,6 +6371,39 @@ mod tests {
 
         bus.queue_scripted_cio_input_byte(b'R');
         assert!(!bus.scripted_cio_input_is_idle());
+    }
+
+    #[test]
+    fn cpu_reads_scripted_cio_input_as_a_record() {
+        let mut bus = Bus::default();
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x20), CIO_COMMAND_GETREC);
+        bus.ram_mut()
+            .write_word(IOCB_BUFFER_BASE.wrapping_add(0x20), 0x3000);
+        bus.ram_mut()
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(0x20), 8);
+        bus.cio_harness_devices[2] = Some(CioHarnessDevice::QueuedInput);
+        bus.queue_scripted_cio_input_bytes(b"123\x9Bnext");
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        let mut cpu = Cpu::default();
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x20;
+        cpu.registers.sp = 0xFB;
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers().pc, 0x2000);
+        assert_eq!(cpu.registers().y, 0x01);
+        assert_eq!(bus.ram().read_word(IOCB_LENGTH_BASE + 0x20), 4);
+        assert_eq!(
+            (0..4)
+                .map(|offset| bus.ram().read(0x3000 + offset))
+                .collect::<Vec<_>>(),
+            b"123\x9B"
+        );
+        assert_eq!(bus.scripted_cio_input.front(), Some(&b'n'));
+        assert_eq!(bus.cio_summary().bytes_read, 4);
     }
 
     #[test]
