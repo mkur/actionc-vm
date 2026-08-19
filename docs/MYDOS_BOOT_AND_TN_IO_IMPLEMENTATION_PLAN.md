@@ -22,6 +22,32 @@ TN -> CIOV -> MyDOS D: handler -> SIOV -> VM ATR sector service
 This work must preserve the VM's existing cartridge compiler, standalone
 object, host-file, and runtime-library workflows.
 
+## Implementation Status
+
+Slices 0 through 6 and Milestones A and B are complete as of 2026-08-19.
+The implementation now provides:
+
+- ownership-aware native CIO fallback and buffered host-file reads;
+- validated 128-byte and 256-byte ATR images;
+- read, status, and copy-on-write sector service at `SIOV`;
+- deterministic boot of the bundled MyDOS 4.53/3 image without a cartridge;
+- native MyDOS directory and file CIO integration tests;
+- explicit CLI ATR writeback to a different path;
+- a reproducible standalone TN 1.25 fixture with source and compiler
+  provenance;
+- a scripted TN test that browses D1, views a known text file, assigns D2 to
+  the second panel, and copies the file between drives;
+- byte-for-byte verification of a file larger than TN's available transfer
+  buffer, proving the repeated `Bget`/`Bput` path.
+
+TN's View output is asserted through the VM's structured channel-zero CIO
+capture. Directory state is asserted through the decoded TN screen, while the
+copy result is read back through the real MyDOS handler. All observed disk SIO
+requests in this workflow are handled by the mounted ATR service.
+
+Slices 7 through 9 remain: broader MyDOS mutation coverage, format-specific
+SIO, and final public-surface stabilization.
+
 ## Current Baseline
 
 The VM already has useful prerequisites:

@@ -5134,6 +5134,8 @@ impl BankedCartridge {
 mod tests {
     use super::*;
 
+    const TN_STANDALONE_OBJECT: &[u8] = include_bytes!("../tests/fixtures/tn-standalone.com");
+
     fn test_atr_bytes(sector_size: usize, sectors: usize) -> Vec<u8> {
         let payload = if sector_size == 128 {
             sectors * 128
@@ -5205,6 +5207,91 @@ mod tests {
             ram.write(IOCB_AUX1_BASE.wrapping_add(x as u16), aux1);
             ram.write(IOCB_AUX2_BASE.wrapping_add(x as u16), 0);
         }
+    }
+
+    fn native_write_file(vm: &mut CompilerVm, name: &[u8], bytes: &[u8]) {
+        const X: u8 = 0x10;
+        const FILENAME: u16 = 0x4200;
+        const DATA: u16 = 0x6000;
+        const CHUNK_SIZE: usize = 0x2000;
+
+        vm.bus_mut().ram_mut().map(FILENAME, name).unwrap();
+        vm.bus_mut()
+            .ram_mut()
+            .write(IOCB_DEVICE_BASE.wrapping_add(u16::from(X)), 0xFF);
+        configure_iocb(vm, X, CIO_COMMAND_OPEN, FILENAME, 0, 8);
+        assert_eq!(run_native_ciov(vm, X).unwrap().y, 1);
+        for chunk in bytes.chunks(CHUNK_SIZE) {
+            vm.bus_mut().ram_mut().map(DATA, chunk).unwrap();
+            configure_iocb(vm, X, CIO_COMMAND_PUTCHR, DATA, chunk.len() as u16, 0);
+            assert_eq!(run_native_ciov(vm, X).unwrap().y, 1);
+        }
+        configure_iocb(vm, X, CIO_COMMAND_CLOSE, 0, 0, 0);
+        assert_eq!(run_native_ciov(vm, X).unwrap().y, 1);
+    }
+
+    fn native_read_file(vm: &mut CompilerVm, name: &[u8], length: usize) -> Vec<u8> {
+        const X: u8 = 0x10;
+        const FILENAME: u16 = 0x4200;
+        const DATA: u16 = 0x6000;
+        const CHUNK_SIZE: usize = 0x2000;
+
+        vm.bus_mut().ram_mut().map(FILENAME, name).unwrap();
+        vm.bus_mut()
+            .ram_mut()
+            .write(IOCB_DEVICE_BASE.wrapping_add(u16::from(X)), 0xFF);
+        configure_iocb(vm, X, CIO_COMMAND_OPEN, FILENAME, 0, 4);
+        assert_eq!(run_native_ciov(vm, X).unwrap().y, 1);
+        let mut bytes = Vec::with_capacity(length);
+        while bytes.len() < length {
+            let chunk_length = CHUNK_SIZE.min(length - bytes.len());
+            configure_iocb(vm, X, CIO_COMMAND_GETCHR, DATA, chunk_length as u16, 0);
+            let read_status = run_native_ciov(vm, X).unwrap().y;
+            assert!(
+                read_status < 0x80,
+                "native read failed with ${read_status:02X}"
+            );
+            bytes.extend(
+                (0..chunk_length as u16)
+                    .map(|offset| vm.bus().ram().read(DATA.wrapping_add(offset))),
+            );
+        }
+        configure_iocb(vm, X, CIO_COMMAND_CLOSE, 0, 0, 0);
+        assert_eq!(run_native_ciov(vm, X).unwrap().y, 1);
+        bytes
+    }
+
+    fn run_until_screen_contains(vm: &mut CompilerVm, needle: &str, max_steps: usize) -> bool {
+        for step in 0..max_steps {
+            vm.step_cpu().unwrap();
+            if step % 1024 == 0
+                && vm
+                    .bus()
+                    .text_screen_snapshot(40, 24)
+                    .lines
+                    .iter()
+                    .any(|line| line.contains(needle))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn run_until_cio_output_contains(vm: &mut CompilerVm, needle: &[u8], max_steps: usize) -> bool {
+        for step in 0..max_steps {
+            vm.step_cpu().unwrap();
+            if step % 1024 == 0
+                && vm
+                    .bus()
+                    .cio_channel0_output()
+                    .windows(needle.len())
+                    .any(|window| window == needle)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     #[test]
@@ -5796,6 +5883,133 @@ mod tests {
         assert_eq!(actual, text);
         configure_iocb(&mut vm, x, CIO_COMMAND_CLOSE, 0, 0, 0);
         assert_eq!(run_native_ciov(&mut vm, x).unwrap().y, 1);
+    }
+
+    #[test]
+    fn tn_standalone_browses_views_and_copies_a_large_file_through_mydos() {
+        const SOURCE_NAME: &[u8] = b"D1:AATEST.TXT\x9B";
+        const DESTINATION_NAME: &[u8] = b"D2:AATEST.TXT\x9B";
+        const TN_ACTIVE_PANEL: u16 = 0x2C71;
+        const SWAP_RIGHT_KEY: u8 = 0x07;
+        const SWAP_LEFT_KEY: u8 = 0x06;
+        const DRIVE_2_KEY: u8 = 0x1E;
+        const VIEW_KEY: u8 = 0x50;
+        const COPY_KEY: u8 = 0x52;
+
+        let mut vm = CompilerVm::default();
+        vm.mount_bundled_mydos(1, DiskWritePolicy::CopyOnWrite)
+            .unwrap();
+        vm.mount_bundled_mydos(2, DiskWritePolicy::CopyOnWrite)
+            .unwrap();
+        vm.prepare_execution_profile(ExecutionProfile::DiskBoot)
+            .unwrap();
+        vm.reset_cpu();
+        for _ in 0..400_000 {
+            if vm.bus().dos_boot_is_ready() && vm.cpu().registers().pc == 0xEA2D {
+                break;
+            }
+            vm.step_cpu().unwrap();
+        }
+        assert_eq!(vm.cpu().registers().pc, 0xEA2D);
+
+        let mut contents = Vec::with_capacity(24_500);
+        while contents.len() < 24_350 {
+            contents.extend_from_slice(b"TN LARGE FILE EXERCISES BUFFERED CIO\x9B");
+        }
+        contents.extend_from_slice(b"VIEW-CONTENT-END\x9B");
+        native_write_file(&mut vm, SOURCE_NAME, &contents);
+
+        // Disable MyDOS's absent D8 RAM disk. TN will initially show D1 in
+        // both panels; the scripted UI then assigns the right panel to D2.
+        vm.bus_mut().ram_mut().write(0x070A, 0xFF);
+        let report = vm.load_atari_object(TN_STANDALONE_OBJECT).unwrap();
+        vm.set_pc(report.run_address.unwrap());
+
+        assert!(run_until_screen_contains(&mut vm, "AATEST", 5_000_000));
+        for _ in 0..300_000 {
+            vm.step_cpu().unwrap();
+        }
+        let tn_buffer = vm.bus().ram().read_word(0x2C4A);
+        let transfer_capacity = vm
+            .bus()
+            .ram()
+            .read_word(MEMTOP_OS_TOP_OF_FREE_MEMORY)
+            .wrapping_sub(tn_buffer);
+        assert!(
+            contents.len() > usize::from(transfer_capacity),
+            "fixture has {} bytes but TN can transfer {transfer_capacity} bytes per pass",
+            contents.len()
+        );
+
+        vm.bus_mut().queue_key_code(SWAP_RIGHT_KEY);
+        for _ in 0..1_000_000 {
+            vm.step_cpu().unwrap();
+            if vm.bus().ram().read(TN_ACTIVE_PANEL) == 1 {
+                break;
+            }
+        }
+        assert_eq!(vm.bus().ram().read(TN_ACTIVE_PANEL), 1);
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        vm.bus_mut().queue_key_code(DRIVE_2_KEY);
+        assert!(
+            run_until_screen_contains(&mut vm, "D2>", 5_000_000),
+            "panel={}, PC=${:04X}\n{}",
+            vm.bus().ram().read(TN_ACTIVE_PANEL),
+            vm.cpu().registers().pc,
+            vm.bus().text_screen_snapshot(40, 24).lines.join("\n")
+        );
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        vm.bus_mut().queue_key_code(SWAP_LEFT_KEY);
+        for _ in 0..1_000_000 {
+            vm.step_cpu().unwrap();
+            if vm.bus().ram().read(TN_ACTIVE_PANEL) == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            vm.bus().ram().read(TN_ACTIVE_PANEL),
+            0,
+            "{}",
+            vm.bus().text_screen_snapshot(40, 24).lines.join("\n")
+        );
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        vm.bus_mut().queue_key_code(VIEW_KEY);
+        assert!(
+            run_until_cio_output_contains(&mut vm, b"VIEW-CONTENT-END", 12_000_000),
+            "PC=${:04X}, captured {} byte(s)",
+            vm.cpu().registers().pc,
+            vm.bus().cio_channel0_output().len()
+        );
+
+        vm.bus_mut().queue_key_code(ATARI_KEY_RETURN);
+        assert!(run_until_screen_contains(&mut vm, "AATEST", 5_000_000));
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        vm.bus_mut().queue_key_code(COPY_KEY);
+        for _ in 0..12_000_000 {
+            vm.step_cpu().unwrap();
+        }
+        let copied = native_read_file(&mut vm, DESTINATION_NAME, contents.len());
+        assert_eq!(copied, contents);
+        assert!(vm.disk_is_dirty(2));
+        assert!(vm.bus().sio_observations().iter().all(|observation| {
+            observation.handled
+                && matches!(
+                    observation.status,
+                    SIO_STATUS_SUCCESS | SIO_STATUS_DEVICE_TIMEOUT
+                )
+        }));
     }
 
     #[test]

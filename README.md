@@ -159,6 +159,9 @@ provenance, and corresponding source are recorded in
 [`disks/MYDOS-NOTICE.md`](disks/MYDOS-NOTICE.md).
 `mounted_atr_bytes`, `original_atr_bytes`, and `dirty_disk_sectors` expose the
 copy-on-write result and its exact changed-sector set to library callers.
+The integration suite also boots a provenance-pinned standalone TN 1.25,
+navigates its two-panel UI, views a large file, and verifies an inter-drive
+copy byte for byte through the native MyDOS handler.
 `add_host_file_bytes`, `add_host_output`, and `host_file_bytes` provide
 in-memory host I/O. `ScheduledActions` supplies PC-triggered keys, CIO data,
 and source injection. `RunOutcome` retains the final VM together with a typed
