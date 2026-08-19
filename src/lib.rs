@@ -2,11 +2,13 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 
+mod atr;
 mod images;
 mod memory;
 mod object;
 mod runner;
 
+pub use atr::AtrImage;
 use images::{
     BUNDLED_ACTION_CARTRIDGE, BUNDLED_ACTION_CARTRIDGE_LABEL, BUNDLED_ALTIRRA_OS,
     BUNDLED_ALTIRRA_OS_LABEL, checksum16, crc32,
