@@ -105,7 +105,9 @@ cargo run -- run \
 ATR mounts are read-only by default. The VM services disk status and sector
 reads at the OS `SIOV` boundary, preserving real DOS filesystem behavior
 without emulating serial timing. `--stop-on-dos-ready` stops after DOS publishes
-its vectors and installs a native `D:` handler.
+its vectors and installs a native `D:` handler. Add
+`--disk-writeback 1:path/to/result.atr` to enable copy-on-write sector updates
+and save the resulting image without overwriting the mounted input.
 
 Cartridge-backed profiles use embedded Action! 3.6 and AltirraOS XL/XE 3.11
 images. Pass `--cart path/to/custom-action.rom` or
@@ -155,6 +157,8 @@ bounded `SioObservation` records for disk traffic. `mount_bundled_mydos`
 provides the repository's audited MyDOS 4.53/3 fixture; its license,
 provenance, and corresponding source are recorded in
 [`disks/MYDOS-NOTICE.md`](disks/MYDOS-NOTICE.md).
+`mounted_atr_bytes`, `original_atr_bytes`, and `dirty_disk_sectors` expose the
+copy-on-write result and its exact changed-sector set to library callers.
 `add_host_file_bytes`, `add_host_output`, and `host_file_bytes` provide
 in-memory host I/O. `ScheduledActions` supplies PC-triggered keys, CIO data,
 and source injection. `RunOutcome` retains the final VM together with a typed

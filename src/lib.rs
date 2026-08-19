@@ -569,6 +569,14 @@ impl CompilerVm {
         self.bus.mounted_atr_bytes(unit)
     }
 
+    pub fn original_atr_bytes(&self, unit: u8) -> Option<Vec<u8>> {
+        self.bus.original_atr_bytes(unit)
+    }
+
+    pub fn dirty_disk_sectors(&self, unit: u8) -> Option<Vec<u16>> {
+        self.bus.dirty_disk_sectors(unit)
+    }
+
     pub fn disk_is_dirty(&self, unit: u8) -> bool {
         self.bus.disk_is_dirty(unit)
     }
@@ -2918,8 +2926,21 @@ impl Bus {
         self.mounted_disks[index].as_ref()
     }
 
+    fn mounted_disk_mut(&mut self, unit: u8) -> Option<&mut MountedDisk> {
+        let index = disk_unit_index(unit).ok()?;
+        self.mounted_disks[index].as_mut()
+    }
+
     pub fn mounted_atr_bytes(&self, unit: u8) -> Option<Vec<u8>> {
         Some(self.mounted_disk(unit)?.image.as_bytes().to_vec())
+    }
+
+    pub fn original_atr_bytes(&self, unit: u8) -> Option<Vec<u8>> {
+        Some(self.mounted_disk(unit)?.image.original_bytes().to_vec())
+    }
+
+    pub fn dirty_disk_sectors(&self, unit: u8) -> Option<Vec<u16>> {
+        Some(self.mounted_disk(unit)?.image.dirty_sectors())
     }
 
     pub fn disk_is_dirty(&self, unit: u8) -> bool {
@@ -4042,13 +4063,39 @@ impl Bus {
                 }
             }
             SIO_COMMAND_PUT_SECTOR | SIO_COMMAND_WRITE_SECTOR => {
-                observation.status = SIO_STATUS_DEVICE_ERROR;
-                observation.detail = match disk.write_policy {
-                    DiskWritePolicy::ReadOnly => "disk is mounted read-only".to_string(),
-                    DiskWritePolicy::CopyOnWrite => {
-                        "copy-on-write sector service is not implemented yet".to_string()
+                let write_policy = disk.write_policy;
+                match disk.image.sector_len(request.aux) {
+                    Err(detail) => {
+                        observation.status = SIO_STATUS_DEVICE_NAK;
+                        observation.detail = detail;
                     }
-                };
+                    Ok(_) if write_policy == DiskWritePolicy::ReadOnly => {
+                        observation.status = SIO_STATUS_DEVICE_ERROR;
+                        observation.detail = "disk is mounted read-only".to_string();
+                    }
+                    Ok(expected)
+                        if request.direction & 0xC0 != SIO_DIRECTION_WRITE
+                            || usize::from(request.length) != expected =>
+                    {
+                        observation.status = SIO_STATUS_DEVICE_ERROR;
+                        observation.detail = format!(
+                            "sector {} requires a {expected}-byte write, got direction ${:02X} and length {}",
+                            request.aux, request.direction, request.length
+                        );
+                    }
+                    Ok(expected) => {
+                        let data = (0..request.length)
+                            .map(|offset| self.ram.read(request.buffer.wrapping_add(offset)))
+                            .collect::<Vec<_>>();
+                        self.mounted_disk_mut(request.unit)
+                            .expect("disk was resolved before write")
+                            .image
+                            .write_sector(request.aux, &data)
+                            .expect("sector and length were validated before write");
+                        observation.bytes_transferred = expected as u16;
+                        observation.detail = format!("wrote sector {}", request.aux);
+                    }
+                }
             }
             _ => {
                 observation.status = SIO_STATUS_DEVICE_NAK;
@@ -5149,6 +5196,17 @@ mod tests {
         Err("native CIO call did not return to its trampoline".to_string())
     }
 
+    fn configure_iocb(vm: &mut CompilerVm, x: u8, command: u8, buffer: u16, length: u16, aux1: u8) {
+        let ram = vm.bus_mut().ram_mut();
+        ram.write(IOCB_COMMAND_BASE.wrapping_add(x as u16), command);
+        ram.write_word(IOCB_BUFFER_BASE.wrapping_add(x as u16), buffer);
+        ram.write_word(IOCB_LENGTH_BASE.wrapping_add(x as u16), length);
+        if command == CIO_COMMAND_OPEN {
+            ram.write(IOCB_AUX1_BASE.wrapping_add(x as u16), aux1);
+            ram.write(IOCB_AUX2_BASE.wrapping_add(x as u16), 0);
+        }
+    }
+
     #[test]
     fn maps_image_bytes_at_requested_base() {
         let mut memory = Memory::default();
@@ -5244,6 +5302,56 @@ mod tests {
             vec![0x20, 0xFF, 0xE0, 0x00]
         );
         assert_eq!(bus.sio_observations()[0].bytes_transferred, 4);
+    }
+
+    #[test]
+    fn cpu_writes_copy_on_write_sectors_and_reads_them_back() {
+        let original = test_atr_bytes(128, 4);
+        let mut bus = Bus::default();
+        bus.mount_atr_bytes(1, original.clone(), DiskWritePolicy::CopyOnWrite)
+            .unwrap();
+        for offset in 0..128u16 {
+            bus.ram_mut().write(0x4000 + offset, offset as u8 ^ 0xA5);
+        }
+        let mut cpu = Cpu::default();
+        prepare_siov_call(
+            &mut bus,
+            &mut cpu,
+            1,
+            SIO_COMMAND_WRITE_SECTOR,
+            SIO_DIRECTION_WRITE,
+            0x4000,
+            128,
+            2,
+        );
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.y, SIO_STATUS_SUCCESS);
+        assert_eq!(bus.sio_observations()[0].bytes_transferred, 128);
+        assert!(bus.disk_is_dirty(1));
+        assert_eq!(bus.dirty_disk_sectors(1), Some(vec![2]));
+        assert_eq!(bus.original_atr_bytes(1), Some(original));
+
+        for offset in 0..128u16 {
+            bus.ram_mut().write(0x4100 + offset, 0);
+        }
+        prepare_siov_call(
+            &mut bus,
+            &mut cpu,
+            1,
+            SIO_COMMAND_READ_SECTOR,
+            SIO_DIRECTION_READ,
+            0x4100,
+            128,
+            2,
+        );
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.y, SIO_STATUS_SUCCESS);
+        for offset in 0..128u16 {
+            assert_eq!(bus.ram().read(0x4100 + offset), offset as u8 ^ 0xA5);
+        }
     }
 
     #[test]
@@ -5617,6 +5725,77 @@ mod tests {
             vm.bus().cio_observations().back().unwrap().detail,
             "close passthrough"
         );
+    }
+
+    #[test]
+    fn bundled_mydos_persists_a_file_on_a_copy_on_write_disk() {
+        let mut vm = CompilerVm::default();
+        vm.mount_bundled_mydos(1, DiskWritePolicy::CopyOnWrite)
+            .unwrap();
+        vm.prepare_execution_profile(ExecutionProfile::DiskBoot)
+            .unwrap();
+        vm.reset_cpu();
+
+        for _ in 0..400_000 {
+            if vm.bus().dos_boot_is_ready() && vm.cpu().registers().pc == 0xEA2D {
+                break;
+            }
+            vm.step_cpu().unwrap();
+        }
+        assert_eq!(vm.cpu().registers().pc, 0xEA2D);
+
+        let x = 0x10;
+        let filename = 0x4200;
+        let data = 0x4300;
+        let text = b"HELLO FROM VM\x9B";
+        vm.bus_mut()
+            .ram_mut()
+            .map(filename, b"D:VMTEST.TXT\x9B")
+            .unwrap();
+        vm.bus_mut()
+            .ram_mut()
+            .write(IOCB_DEVICE_BASE.wrapping_add(x as u16), 0xFF);
+        configure_iocb(&mut vm, x, CIO_COMMAND_OPEN, filename, 0, 8);
+        assert_eq!(run_native_ciov(&mut vm, x).unwrap().y, 1);
+
+        vm.bus_mut().ram_mut().map(data, text).unwrap();
+        configure_iocb(&mut vm, x, CIO_COMMAND_PUTCHR, data, text.len() as u16, 0);
+        assert_eq!(run_native_ciov(&mut vm, x).unwrap().y, 1);
+        configure_iocb(&mut vm, x, CIO_COMMAND_CLOSE, 0, 0, 0);
+        assert_eq!(run_native_ciov(&mut vm, x).unwrap().y, 1);
+
+        assert!(vm.disk_is_dirty(1));
+        assert!(!vm.dirty_disk_sectors(1).unwrap().is_empty());
+        assert_eq!(
+            vm.original_atr_bytes(1).unwrap(),
+            BUNDLED_MYDOS_ATR.to_vec()
+        );
+        assert_ne!(vm.mounted_atr_bytes(1).unwrap(), BUNDLED_MYDOS_ATR.to_vec());
+        assert!(vm.bus().sio_observations().iter().any(|observation| {
+            matches!(
+                observation.command,
+                SIO_COMMAND_PUT_SECTOR | SIO_COMMAND_WRITE_SECTOR
+            ) && observation.status == SIO_STATUS_SUCCESS
+                && observation.bytes_transferred > 0
+        }));
+
+        vm.bus_mut()
+            .ram_mut()
+            .write(IOCB_DEVICE_BASE.wrapping_add(x as u16), 0xFF);
+        configure_iocb(&mut vm, x, CIO_COMMAND_OPEN, filename, 0, 4);
+        assert_eq!(run_native_ciov(&mut vm, x).unwrap().y, 1);
+        configure_iocb(&mut vm, x, CIO_COMMAND_GETREC, data, text.len() as u16, 0);
+        let read_registers = run_native_ciov(&mut vm, x).unwrap();
+        let actual = (0..text.len() as u16)
+            .map(|offset| vm.bus().ram().read(data + offset))
+            .collect::<Vec<_>>();
+        // MyDOS returns the positive record-complete status $03 after GETREC;
+        // the IOCB status and Y agree and the requested record includes EOL.
+        assert_eq!(read_registers.y, 3);
+        assert_eq!(vm.bus().ram().read(0x0343 + u16::from(x)), 3);
+        assert_eq!(actual, text);
+        configure_iocb(&mut vm, x, CIO_COMMAND_CLOSE, 0, 0, 0);
+        assert_eq!(run_native_ciov(&mut vm, x).unwrap().y, 1);
     }
 
     #[test]

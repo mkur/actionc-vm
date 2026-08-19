@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 const ATR_HEADER_SIZE: usize = 16;
 const ATR_MAGIC: u16 = 0x0296;
 const BOOT_SECTOR_COUNT: usize = 3;
@@ -25,9 +27,10 @@ pub struct MountedDisk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtrImage {
     bytes: Vec<u8>,
+    original_bytes: Vec<u8>,
     sector_size: usize,
     sector_count: usize,
-    dirty: bool,
+    dirty_sectors: BTreeSet<u16>,
 }
 
 impl AtrImage {
@@ -62,11 +65,13 @@ impl AtrImage {
             return Err("ATR image contains no sectors".to_string());
         }
 
+        let original_bytes = bytes.clone();
         Ok(Self {
             bytes,
+            original_bytes,
             sector_size,
             sector_count,
-            dirty: false,
+            dirty_sectors: BTreeSet::new(),
         })
     }
 
@@ -87,11 +92,20 @@ impl AtrImage {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        !self.dirty_sectors.is_empty()
+    }
+
+    pub fn dirty_sectors(&self) -> Vec<u16> {
+        self.dirty_sectors.iter().copied().collect()
+    }
+
+    pub fn original_bytes(&self) -> &[u8] {
+        &self.original_bytes
     }
 
     pub fn clear_dirty(&mut self) {
-        self.dirty = false;
+        self.original_bytes.clone_from(&self.bytes);
+        self.dirty_sectors.clear();
     }
 
     pub fn sector_len(&self, sector: u16) -> Result<usize, String> {
@@ -113,7 +127,11 @@ impl AtrImage {
         }
         if self.bytes[start..start + len] != *data {
             self.bytes[start..start + len].copy_from_slice(data);
-            self.dirty = true;
+        }
+        if self.original_bytes[start..start + len] == *data {
+            self.dirty_sectors.remove(&sector);
+        } else {
+            self.dirty_sectors.insert(sector);
         }
         Ok(())
     }
@@ -260,11 +278,18 @@ mod tests {
 
         image.write_sector(4, &[0xA5; 256]).unwrap();
         assert!(image.is_dirty());
+        assert_eq!(image.dirty_sectors(), vec![4]);
         assert_eq!(image.read_sector(4).unwrap(), &[0xA5; 256]);
         assert_eq!(&original[0..16], &image.as_bytes()[0..16]);
+        assert_eq!(image.original_bytes(), original);
+
+        image.write_sector(4, &[0; 256]).unwrap();
+        assert!(!image.is_dirty());
+        image.write_sector(4, &[0xA5; 256]).unwrap();
 
         image.clear_dirty();
         assert!(!image.is_dirty());
+        assert_eq!(image.original_bytes(), image.as_bytes());
         assert_eq!(image.into_bytes().len(), original.len());
     }
 }

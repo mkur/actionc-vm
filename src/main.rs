@@ -497,11 +497,30 @@ fn write_symbol_snapshots(
 
 fn write_stop_outputs(options: &CliOptions, bus: &actionc_vm::Bus) -> Result<(), String> {
     write_host_outputs(&options.config, bus)?;
+    write_disk_outputs(options, bus)?;
     if let Some(path) = &options.raw_memory_dump_path {
         write_raw_memory_dump(path, bus)?;
     }
     if let Some(path) = &options.symbol_dump_path {
         write_symbol_dump(path, bus)?;
+    }
+    Ok(())
+}
+
+fn write_disk_outputs(options: &CliOptions, bus: &actionc_vm::Bus) -> Result<(), String> {
+    for (unit, path) in &options.disk_writebacks {
+        let bytes = bus
+            .mounted_atr_bytes(*unit)
+            .ok_or_else(|| format!("disk unit {unit} is not mounted"))?;
+        fs::write(path, &bytes)
+            .map_err(|err| format!("failed to write disk `{}`: {err}", path.display()))?;
+        eprintln!(
+            "wrote drive {unit} ATR: {} byte(s), {} dirty sector(s) to {}",
+            bytes.len(),
+            bus.dirty_disk_sectors(*unit)
+                .map_or(0, |sectors| sectors.len()),
+            path.display()
+        );
     }
     Ok(())
 }
@@ -592,6 +611,7 @@ struct CliOptions {
     pokes: Vec<MemoryPoke>,
     protected_code_ranges: Vec<AddressRange>,
     allowed_code_write_ranges: Vec<AddressRange>,
+    disk_writebacks: Vec<(u8, PathBuf)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,6 +712,7 @@ impl Default for CliOptions {
             pokes: Vec::new(),
             protected_code_ranges: Vec::new(),
             allowed_code_write_ranges: Vec::new(),
+            disk_writebacks: Vec::new(),
         }
     }
 }
@@ -738,6 +759,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut pokes = Vec::new();
     let mut protected_code_ranges = Vec::new();
     let mut allowed_code_write_ranges = Vec::new();
+    let mut disk_writebacks = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
@@ -971,6 +993,11 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 let (unit, path) = parse_disk_map(value)?;
                 config.disks.push((unit, path, DiskWritePolicy::ReadOnly));
             }
+            "--disk-writeback" => {
+                index += 1;
+                let value = required_value(&args, index, "--disk-writeback")?;
+                disk_writebacks.push(parse_disk_map(value)?);
+            }
             "--map" => {
                 index += 1;
                 let value = required_value(&args, index, "--map")?;
@@ -1013,6 +1040,24 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         index += 1;
     }
 
+    for (unit, output_path) in &disk_writebacks {
+        let Some((_, input_path, policy)) = config
+            .disks
+            .iter_mut()
+            .find(|(mounted_unit, _, _)| mounted_unit == unit)
+        else {
+            return Err(format!(
+                "--disk-writeback for drive {unit} requires a matching --disk mount"
+            ));
+        };
+        if input_path == output_path {
+            return Err(format!(
+                "drive {unit} writeback path must differ from its input ATR"
+            ));
+        }
+        *policy = DiskWritePolicy::CopyOnWrite;
+    }
+
     Ok(CliOptions {
         config,
         execution_profile,
@@ -1049,6 +1094,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         pokes,
         protected_code_ranges,
         allowed_code_write_ranges,
+        disk_writebacks,
     })
 }
 
@@ -2699,6 +2745,8 @@ fn print_help() {
          --host-output <n:path>\n  \
          Register writable host file H:n/D:n and save it to path on stop\n  \
          --disk <unit:path>   Mount a read-only ATR on drive 1-8\n  \
+         --disk-writeback <unit:path>\n  \
+                              Enable copy-on-write and save the resulting ATR on stop\n  \
          --load-object <path> Load Atari load-format object into RAM and run RUNAD\n  \
          --poke <addr=byte>   Write one RAM byte before execution; repeatable\n  \
          --protect-code-range <a:b>\n  \
@@ -2779,6 +2827,44 @@ mod tests {
             )]
         );
         assert!(options.config.trace_sio);
+    }
+
+    #[test]
+    fn parses_explicit_copy_on_write_disk_output() {
+        let options = parse_options(vec![
+            "--disk".to_string(),
+            "1:input.atr".to_string(),
+            "--disk-writeback".to_string(),
+            "1:output.atr".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options.config.disks,
+            vec![(1, PathBuf::from("input.atr"), DiskWritePolicy::CopyOnWrite)]
+        );
+        assert_eq!(
+            options.disk_writebacks,
+            vec![(1, PathBuf::from("output.atr"))]
+        );
+        assert!(
+            parse_options(vec![
+                "--disk-writeback".to_string(),
+                "1:output.atr".to_string()
+            ])
+            .unwrap_err()
+            .contains("matching --disk")
+        );
+        assert!(
+            parse_options(vec![
+                "--disk".to_string(),
+                "1:same.atr".to_string(),
+                "--disk-writeback".to_string(),
+                "1:same.atr".to_string()
+            ])
+            .unwrap_err()
+            .contains("must differ")
+        );
     }
 
     #[test]
