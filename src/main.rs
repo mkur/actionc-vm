@@ -7,10 +7,10 @@ use actionc_vm::{
     ACTION_MONITOR_KEY_CODE, ACTION_OS_PRESET, ACTION_SEGMENT_END_VECTOR, ATARI_KEY_C, ATARI_KEY_E,
     ATARI_KEY_RETURN, ActionEditorLine, ActionSourceInjectionReport, ActionSymbolEntry,
     AddressRange, AtariLoadReport, BusAccess, BusEvent, BusRegion, CioObservation, CioSummary,
-    CpuRegisters, CpuStep, ExecutionProfile, Hotpatch, ImageKind, PcTrigger, RunRequest,
-    ScheduledAction, ScheduledActionObservation, ScheduledActions, StopReason, TextScreenSnapshot,
-    VmConfig, VmRunHooks, VmRunner, action_current_proc_name, decode_action_symbol_tables,
-    format_action_symbol_dump_json,
+    CpuRegisters, CpuStep, DiskWritePolicy, ExecutionProfile, Hotpatch, ImageKind, PcTrigger,
+    RunRequest, ScheduledAction, ScheduledActionObservation, ScheduledActions, SioObservation,
+    StopReason, TextScreenSnapshot, VmConfig, VmRunHooks, VmRunner, action_current_proc_name,
+    decode_action_symbol_tables, format_action_symbol_dump_json,
 };
 
 fn main() {
@@ -337,6 +337,7 @@ fn run_vm(options: CliOptions) -> Result<(), String> {
         vm.bus().events(),
         vm.bus().cio_summary(),
         vm.bus().cio_observations(),
+        vm.bus().sio_observations(),
         vm.bus().cartridge().map(|cart| cart.mapping_info()),
         &hooks.action_fixup_trace,
         &hooks.action_code_pointer_trace,
@@ -802,6 +803,9 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
             "--trace-cio" => {
                 config.trace_cio = true;
             }
+            "--trace-sio" => {
+                config.trace_sio = true;
+            }
             "--trace-action-fixups" => {
                 trace_action_fixups = true;
             }
@@ -950,6 +954,12 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
                 index += 1;
                 let value = required_value(&args, index, "--host-output")?;
                 config.host_outputs.push(parse_host_file_map(value)?);
+            }
+            "--disk" => {
+                index += 1;
+                let value = required_value(&args, index, "--disk")?;
+                let (unit, path) = parse_disk_map(value)?;
+                config.disks.push((unit, path, DiskWritePolicy::ReadOnly));
             }
             "--map" => {
                 index += 1;
@@ -1307,6 +1317,22 @@ fn parse_host_file_map(value: &str) -> Result<(String, PathBuf), String> {
         return Err("host file path must not be empty".to_string());
     }
     Ok((name.to_string(), PathBuf::from(path)))
+}
+
+fn parse_disk_map(value: &str) -> Result<(u8, PathBuf), String> {
+    let Some((unit, path)) = value.split_once(':') else {
+        return Err(format!("disk `{value}` must be unit:path"));
+    };
+    let unit = unit
+        .parse::<u8>()
+        .map_err(|_| format!("invalid disk unit `{unit}`"))?;
+    if !(1..=8).contains(&unit) {
+        return Err(format!("disk unit must be in 1..=8, got {unit}"));
+    }
+    if path.is_empty() {
+        return Err("disk path must not be empty".to_string());
+    }
+    Ok((unit, PathBuf::from(path)))
 }
 
 fn ascii_to_atascii(ch: char) -> u8 {
@@ -2356,6 +2382,7 @@ fn print_stop_report(
     events: &[BusEvent],
     cio_summary: &CioSummary,
     cio_observations: &VecDeque<CioObservation>,
+    sio_observations: &VecDeque<SioObservation>,
     cartridge: Option<actionc_vm::CartridgeMappingInfo>,
     action_fixup_trace: &ActionFixupTrace,
     action_code_pointer_trace: &ActionCodePointerTrace,
@@ -2458,6 +2485,36 @@ fn print_stop_report(
                     .map(|value| format!("${value:02X}"))
                     .unwrap_or_else(|| "--".to_string()),
                 format_cio_detail(observation)
+            );
+        }
+    }
+    if !sio_observations.is_empty() {
+        eprintln!("recent SIO:");
+        for observation in sio_observations
+            .iter()
+            .rev()
+            .take(32)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            eprintln!(
+                "  cyc={} dev=${:02X} unit={} cmd=${:02X} dir=${:02X} ret=${:04X} sector={} buf=${:04X} len={} status=${:02X} bytes={} {}",
+                observation.cycle,
+                observation.device,
+                observation.unit,
+                observation.command,
+                observation.direction,
+                observation.return_pc,
+                observation
+                    .sector
+                    .map(|sector| sector.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                observation.buffer,
+                observation.length,
+                observation.status,
+                observation.bytes_transferred,
+                observation.detail
             );
         }
     }
@@ -2591,6 +2648,7 @@ fn print_help() {
          --q-input-at-pc-after <after:pc:text>\n  \
                               Queue Q: input at pc, but only after after_pc was reached\n  \
          --trace-cio          Print harness CIO calls while running\n  \
+         --trace-sio          Print intercepted disk SIO calls while running\n  \
          --key-at-pc <pc:k>   Queue key k when execution reaches pc\n  \
          --key-at-pc-after <after:pc:k>\n  \
                               Queue key k at pc, but only after after_pc was reached\n  \
@@ -2627,6 +2685,7 @@ fn print_help() {
          --host-file <n:path> Register a host file visible as H:n and D:n\n  \
          --host-output <n:path>\n  \
          Register writable host file H:n/D:n and save it to path on stop\n  \
+         --disk <unit:path>   Mount a read-only ATR on drive 1-8\n  \
          --load-object <path> Load Atari load-format object into RAM and run RUNAD\n  \
          --poke <addr=byte>   Write one RAM byte before execution; repeatable\n  \
          --protect-code-range <a:b>\n  \
@@ -2680,6 +2739,26 @@ mod tests {
                 PathBuf::from("/tmp/functions.com")
             )]
         );
+    }
+
+    #[test]
+    fn parses_read_only_disk_and_sio_trace_options() {
+        let options = parse_options(vec![
+            "--disk".to_string(),
+            "2:C:\\images\\mydos.atr".to_string(),
+            "--trace-sio".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options.config.disks,
+            vec![(
+                2,
+                PathBuf::from("C:\\images\\mydos.atr"),
+                DiskWritePolicy::ReadOnly
+            )]
+        );
+        assert!(options.config.trace_sio);
     }
 
     #[test]

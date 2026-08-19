@@ -3,6 +3,19 @@ const ATR_MAGIC: u16 = 0x0296;
 const BOOT_SECTOR_COUNT: usize = 3;
 const BOOT_SECTOR_SIZE: usize = 128;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskWritePolicy {
+    ReadOnly,
+    CopyOnWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountedDisk {
+    pub unit: u8,
+    pub image: AtrImage,
+    pub write_policy: DiskWritePolicy,
+}
+
 /// A validated, mutable ATR disk image.
 ///
 /// Sector numbers are one-based, as they are in Atari SIO. On 256-byte ATRs,

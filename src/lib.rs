@@ -8,7 +8,7 @@ mod memory;
 mod object;
 mod runner;
 
-pub use atr::AtrImage;
+pub use atr::{AtrImage, DiskWritePolicy, MountedDisk};
 use images::{
     BUNDLED_ACTION_CARTRIDGE, BUNDLED_ACTION_CARTRIDGE_LABEL, BUNDLED_ALTIRRA_OS,
     BUNDLED_ALTIRRA_OS_LABEL, checksum16, crc32,
@@ -83,6 +83,28 @@ pub const CONSOL: u16 = 0xD01F;
 pub const CONSOL_NO_KEYS: u8 = 0x07;
 pub const SEROUT_SERIAL_OUTPUT: u16 = 0xD20D;
 pub const CIOV: u16 = 0xE456;
+pub const SIOV: u16 = 0xE459;
+pub const DDEVIC: u16 = 0x0300;
+pub const DUNIT: u16 = 0x0301;
+pub const DCOMND: u16 = 0x0302;
+pub const DSTATS: u16 = 0x0303;
+pub const DBUFLO: u16 = 0x0304;
+pub const DTIMLO: u16 = 0x0306;
+pub const DBYTLO: u16 = 0x0308;
+pub const DAUX1: u16 = 0x030A;
+pub const SIO_DISK_DEVICE: u8 = 0x31;
+pub const SIO_COMMAND_FORMAT: u8 = 0x21;
+pub const SIO_COMMAND_FORMAT_ENHANCED: u8 = 0x22;
+pub const SIO_COMMAND_PUT_SECTOR: u8 = 0x50;
+pub const SIO_COMMAND_READ_SECTOR: u8 = 0x52;
+pub const SIO_COMMAND_STATUS: u8 = 0x53;
+pub const SIO_COMMAND_WRITE_SECTOR: u8 = 0x57;
+pub const SIO_DIRECTION_READ: u8 = 0x40;
+pub const SIO_DIRECTION_WRITE: u8 = 0x80;
+pub const SIO_STATUS_SUCCESS: u8 = 0x01;
+pub const SIO_STATUS_DEVICE_TIMEOUT: u8 = 0x8A;
+pub const SIO_STATUS_DEVICE_NAK: u8 = 0x8B;
+pub const SIO_STATUS_DEVICE_ERROR: u8 = 0x90;
 pub const IOCB_DEVICE_BASE: u16 = 0x0341;
 pub const IOCB_COMMAND_BASE: u16 = 0x0342;
 pub const IOCB_BUFFER_BASE: u16 = 0x0344;
@@ -108,6 +130,7 @@ pub const GRAPHICS_COLOR: u16 = 0x02FD;
 pub const GRAPHICS_FILL_COLOR: u16 = 0x02FB;
 pub const CIO_OBSERVATION_LIMIT: usize = 128;
 pub const CIO_READ_PREVIEW_LIMIT: usize = 80;
+pub const SIO_OBSERVATION_LIMIT: usize = 128;
 pub const RUNAD: u16 = 0x02E2;
 pub const CARTCS_COLDSTART_VECTOR: u16 = 0xBFFA;
 pub const OSS_BANKED_8K_WINDOW_SIZE: usize = 0x2000;
@@ -168,7 +191,9 @@ pub struct VmConfig {
     pub hotpatches: Vec<Hotpatch>,
     pub host_files: Vec<(String, PathBuf)>,
     pub host_outputs: Vec<(String, PathBuf)>,
+    pub disks: Vec<(u8, PathBuf, DiskWritePolicy)>,
     pub trace_cio: bool,
+    pub trace_sio: bool,
 }
 
 impl Default for VmConfig {
@@ -183,7 +208,9 @@ impl Default for VmConfig {
             hotpatches: Vec::new(),
             host_files: Vec::new(),
             host_outputs: Vec::new(),
+            disks: Vec::new(),
             trace_cio: false,
+            trace_sio: false,
         }
     }
 }
@@ -260,7 +287,13 @@ impl VmConfig {
         for (name, _) in &self.host_outputs {
             vm.add_host_output(name);
         }
+        for (unit, path, policy) in &self.disks {
+            let bytes = fs::read(path)
+                .map_err(|err| format!("failed to read disk `{}`: {err}", path.display()))?;
+            vm.mount_atr_bytes(*unit, bytes, *policy)?;
+        }
         vm.set_trace_cio(self.trace_cio);
+        vm.set_trace_sio(self.trace_sio);
 
         Ok(vm)
     }
@@ -473,6 +506,27 @@ impl CompilerVm {
 
     pub fn set_trace_cio(&mut self, trace_cio: bool) {
         self.bus.set_trace_cio(trace_cio);
+    }
+
+    pub fn set_trace_sio(&mut self, trace_sio: bool) {
+        self.bus.set_trace_sio(trace_sio);
+    }
+
+    pub fn mount_atr_bytes(
+        &mut self,
+        unit: u8,
+        bytes: impl Into<Vec<u8>>,
+        policy: DiskWritePolicy,
+    ) -> Result<(), String> {
+        self.bus.mount_atr_bytes(unit, bytes, policy)
+    }
+
+    pub fn mounted_atr_bytes(&self, unit: u8) -> Option<Vec<u8>> {
+        self.bus.mounted_atr_bytes(unit)
+    }
+
+    pub fn disk_is_dirty(&self, unit: u8) -> bool {
+        self.bus.disk_is_dirty(unit)
     }
 
     pub fn protect_code_ranges(&mut self, ranges: &[AddressRange]) {
@@ -942,6 +996,15 @@ impl Cpu {
         let pc = self.registers.pc;
         let registers_before = self.registers;
         if pc == CIOV && self.try_emulate_ciov(bus) {
+            return Ok(CpuStep {
+                pc,
+                opcode: 0xFF,
+                registers_before,
+                registers_after: self.registers,
+                cycles: self.cycles,
+            });
+        }
+        if pc == SIOV && self.try_emulate_siov(bus) {
             return Ok(CpuStep {
                 pc,
                 opcode: 0xFF,
@@ -2332,6 +2395,26 @@ impl Cpu {
         self.cycles += 6;
     }
 
+    fn try_emulate_siov(&mut self, bus: &mut Bus) -> bool {
+        let return_pc = self.peek_return_address(bus);
+        let Some(status) = bus.try_service_siov(return_pc, self.cycles) else {
+            return false;
+        };
+
+        // The OS SIO exit leaves A=0, returns status in Y and DSTATS, and
+        // performs CPY #0 before RTS. Thus carry is set for every byte-sized
+        // status and N reflects the high bit used by SIO errors.
+        self.registers.a = 0;
+        self.registers.y = status;
+        let lo = self.pop(bus);
+        let hi = self.pop(bus);
+        self.registers.pc = u16::from_le_bytes([lo, hi]).wrapping_add(1);
+        self.set_flag(StatusFlags::CARRY, true);
+        self.set_zn(status);
+        self.cycles += 6;
+        true
+    }
+
     fn peek_return_address(&self, bus: &Bus) -> u16 {
         let lo_address = 0x0100 | self.registers.sp.wrapping_add(1) as u16;
         let hi_address = 0x0100 | self.registers.sp.wrapping_add(2) as u16;
@@ -2556,6 +2639,9 @@ pub struct Bus {
     cio_summary: CioSummary,
     cio_observations: VecDeque<CioObservation>,
     cio_fallback_policy: CioFallbackPolicy,
+    mounted_disks: [Option<MountedDisk>; 8],
+    trace_sio: bool,
+    sio_observations: VecDeque<SioObservation>,
     sio_timeout_pending: bool,
     redirect_disk_boot_to_cart: bool,
     self_test_rom_enabled: bool,
@@ -2590,6 +2676,9 @@ impl Default for Bus {
             cio_summary: CioSummary::default(),
             cio_observations: VecDeque::new(),
             cio_fallback_policy: CioFallbackPolicy::Headless,
+            mounted_disks: std::array::from_fn(|_| None),
+            trace_sio: false,
+            sio_observations: VecDeque::new(),
             sio_timeout_pending: false,
             redirect_disk_boot_to_cart: false,
             self_test_rom_enabled: true,
@@ -2679,6 +2768,10 @@ impl Bus {
         &self.cio_observations
     }
 
+    pub fn sio_observations(&self) -> &VecDeque<SioObservation> {
+        &self.sio_observations
+    }
+
     pub fn clear_events(&mut self) {
         self.events.clear();
     }
@@ -2747,6 +2840,45 @@ impl Bus {
 
     pub fn set_trace_cio(&mut self, trace_cio: bool) {
         self.trace_cio = trace_cio;
+    }
+
+    pub fn set_trace_sio(&mut self, trace_sio: bool) {
+        self.trace_sio = trace_sio;
+    }
+
+    pub fn mount_atr_bytes(
+        &mut self,
+        unit: u8,
+        bytes: impl Into<Vec<u8>>,
+        policy: DiskWritePolicy,
+    ) -> Result<(), String> {
+        let index = disk_unit_index(unit)?;
+        let image = AtrImage::from_bytes(bytes)?;
+        self.mounted_disks[index] = Some(MountedDisk {
+            unit,
+            image,
+            write_policy: policy,
+        });
+        Ok(())
+    }
+
+    pub fn unmount_disk(&mut self, unit: u8) -> Result<Option<MountedDisk>, String> {
+        let index = disk_unit_index(unit)?;
+        Ok(self.mounted_disks[index].take())
+    }
+
+    pub fn mounted_disk(&self, unit: u8) -> Option<&MountedDisk> {
+        let index = disk_unit_index(unit).ok()?;
+        self.mounted_disks[index].as_ref()
+    }
+
+    pub fn mounted_atr_bytes(&self, unit: u8) -> Option<Vec<u8>> {
+        Some(self.mounted_disk(unit)?.image.as_bytes().to_vec())
+    }
+
+    pub fn disk_is_dirty(&self, unit: u8) -> bool {
+        self.mounted_disk(unit)
+            .is_some_and(|disk| disk.image.is_dirty())
     }
 
     pub fn set_cio_fallback_policy(&mut self, policy: CioFallbackPolicy) {
@@ -3736,6 +3868,134 @@ impl Bus {
         }
     }
 
+    fn try_service_siov(&mut self, return_pc: u16, cycle: u64) -> Option<u8> {
+        if !self.mounted_disks.iter().any(Option::is_some) {
+            return None;
+        }
+        let request = SioRequest::decode(&self.ram);
+        if request.device != SIO_DISK_DEVICE {
+            return None;
+        }
+
+        let sector = matches!(
+            request.command,
+            SIO_COMMAND_READ_SECTOR | SIO_COMMAND_PUT_SECTOR | SIO_COMMAND_WRITE_SECTOR
+        )
+        .then_some(request.aux);
+        let mut observation = SioObservation {
+            cycle,
+            return_pc,
+            device: request.device,
+            unit: request.unit,
+            command: request.command,
+            direction: request.direction,
+            sector,
+            buffer: request.buffer,
+            length: request.length,
+            handled: true,
+            status: SIO_STATUS_SUCCESS,
+            bytes_transferred: 0,
+            detail: String::new(),
+        };
+
+        let Some(disk) = self.mounted_disk(request.unit) else {
+            observation.status = SIO_STATUS_DEVICE_TIMEOUT;
+            observation.detail = "disk unit is not mounted".to_string();
+            return Some(self.finish_sio_observation(observation));
+        };
+
+        match request.command {
+            SIO_COMMAND_STATUS => {
+                if request.direction & 0xC0 != SIO_DIRECTION_READ || request.length != 4 {
+                    observation.status = SIO_STATUS_DEVICE_ERROR;
+                    observation.detail = "status request requires a four-byte read".to_string();
+                } else {
+                    let status = disk_status_bytes(disk);
+                    for (offset, byte) in status.into_iter().enumerate() {
+                        self.ram
+                            .write(request.buffer.wrapping_add(offset as u16), byte);
+                    }
+                    observation.bytes_transferred = 4;
+                    observation.detail = "read disk status".to_string();
+                }
+            }
+            SIO_COMMAND_READ_SECTOR => {
+                let data = disk.image.read_sector(request.aux).map(<[u8]>::to_vec);
+                match data {
+                    Err(detail) => {
+                        observation.status = SIO_STATUS_DEVICE_NAK;
+                        observation.detail = detail;
+                    }
+                    Ok(data)
+                        if request.direction & 0xC0 != SIO_DIRECTION_READ
+                            || usize::from(request.length) != data.len() =>
+                    {
+                        observation.status = SIO_STATUS_DEVICE_ERROR;
+                        observation.detail = format!(
+                            "sector {} requires a {}-byte read, got direction ${:02X} and length {}",
+                            request.aux,
+                            data.len(),
+                            request.direction,
+                            request.length
+                        );
+                    }
+                    Ok(data) => {
+                        for (offset, byte) in data.iter().copied().enumerate() {
+                            self.ram
+                                .write(request.buffer.wrapping_add(offset as u16), byte);
+                        }
+                        observation.bytes_transferred = data.len() as u16;
+                        observation.detail = format!("read sector {}", request.aux);
+                    }
+                }
+            }
+            SIO_COMMAND_PUT_SECTOR | SIO_COMMAND_WRITE_SECTOR => {
+                observation.status = SIO_STATUS_DEVICE_ERROR;
+                observation.detail = match disk.write_policy {
+                    DiskWritePolicy::ReadOnly => "disk is mounted read-only".to_string(),
+                    DiskWritePolicy::CopyOnWrite => {
+                        "copy-on-write sector service is not implemented yet".to_string()
+                    }
+                };
+            }
+            _ => {
+                observation.status = SIO_STATUS_DEVICE_NAK;
+                observation.detail = format!("unsupported disk command ${:02X}", request.command);
+            }
+        }
+
+        Some(self.finish_sio_observation(observation))
+    }
+
+    fn finish_sio_observation(&mut self, observation: SioObservation) -> u8 {
+        self.ram.write(DSTATS, observation.status);
+        if self.trace_sio {
+            eprintln!(
+                "SIO: cyc={} dev=${:02X} unit={} cmd=${:02X} dir=${:02X} sector={} buf=${:04X} len={} status=${:02X} bytes={} {}",
+                observation.cycle,
+                observation.device,
+                observation.unit,
+                observation.command,
+                observation.direction,
+                observation
+                    .sector
+                    .map(|sector| sector.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                observation.buffer,
+                observation.length,
+                observation.status,
+                observation.bytes_transferred,
+                observation.detail
+            );
+        }
+        let status = observation.status;
+        if self.sio_observations.len() == SIO_OBSERVATION_LIMIT {
+            self.sio_observations.pop_front();
+        }
+        self.sio_observations.push_back(observation);
+        status
+    }
+
     fn start_cio_observation(
         &self,
         x: u8,
@@ -4058,6 +4318,49 @@ struct CioReadResult {
     preview: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SioRequest {
+    device: u8,
+    unit: u8,
+    command: u8,
+    direction: u8,
+    buffer: u16,
+    length: u16,
+    aux: u16,
+}
+
+impl SioRequest {
+    fn decode(memory: &Memory) -> Self {
+        Self {
+            device: memory.read(DDEVIC),
+            unit: memory.read(DUNIT),
+            command: memory.read(DCOMND),
+            direction: memory.read(DSTATS),
+            buffer: memory.read_word(DBUFLO),
+            length: memory.read_word(DBYTLO),
+            aux: memory.read_word(DAUX1),
+        }
+    }
+}
+
+fn disk_unit_index(unit: u8) -> Result<usize, String> {
+    if !(1..=8).contains(&unit) {
+        return Err(format!("disk unit must be in 1..=8, got {unit}"));
+    }
+    Ok(usize::from(unit - 1))
+}
+
+fn disk_status_bytes(disk: &MountedDisk) -> [u8; 4] {
+    let density = if disk.image.sector_size() == 256 {
+        0x20
+    } else if disk.image.sector_count() == 1040 {
+        0x80
+    } else {
+        0x00
+    };
+    [density, 0xFF, 0xE0, 0x00]
+}
+
 fn normalize_host_file_name(name: &str) -> String {
     let trimmed = name.trim();
     let without_device = trimmed
@@ -4214,6 +4517,23 @@ pub struct CioObservation {
     pub bytes_read: Option<u16>,
     pub bytes_written: Option<u16>,
     pub preview: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SioObservation {
+    pub cycle: u64,
+    pub return_pc: u16,
+    pub device: u8,
+    pub unit: u8,
+    pub command: u8,
+    pub direction: u8,
+    pub sector: Option<u16>,
+    pub buffer: u16,
+    pub length: u16,
+    pub handled: bool,
+    pub status: u8,
+    pub bytes_transferred: u16,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4675,6 +4995,44 @@ impl BankedCartridge {
 mod tests {
     use super::*;
 
+    fn test_atr_bytes(sector_size: usize, sectors: usize) -> Vec<u8> {
+        let payload = if sector_size == 128 {
+            sectors * 128
+        } else {
+            sectors.min(3) * 128 + sectors.saturating_sub(3) * 256
+        };
+        let paragraphs = payload / 16;
+        let mut bytes = vec![0; 16 + payload];
+        bytes[0..2].copy_from_slice(&0x0296u16.to_le_bytes());
+        bytes[2..4].copy_from_slice(&(paragraphs as u16).to_le_bytes());
+        bytes[4..6].copy_from_slice(&(sector_size as u16).to_le_bytes());
+        bytes[6] = (paragraphs >> 16) as u8;
+        bytes
+    }
+
+    fn prepare_siov_call(
+        bus: &mut Bus,
+        cpu: &mut Cpu,
+        unit: u8,
+        command: u8,
+        direction: u8,
+        buffer: u16,
+        length: u16,
+        aux: u16,
+    ) {
+        bus.ram_mut().write(DDEVIC, SIO_DISK_DEVICE);
+        bus.ram_mut().write(DUNIT, unit);
+        bus.ram_mut().write(DCOMND, command);
+        bus.ram_mut().write(DSTATS, direction);
+        bus.ram_mut().write_word(DBUFLO, buffer);
+        bus.ram_mut().write_word(DBYTLO, length);
+        bus.ram_mut().write_word(DAUX1, aux);
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        cpu.registers.pc = SIOV;
+        cpu.registers.sp = 0xFB;
+    }
+
     #[test]
     fn maps_image_bytes_at_requested_base() {
         let mut memory = Memory::default();
@@ -4684,6 +5042,169 @@ mod tests {
         assert_eq!(memory.read(0xA000), 0x11);
         assert_eq!(memory.read(0xA001), 0x22);
         assert_eq!(memory.read(0xA002), 0x33);
+    }
+
+    #[test]
+    fn mounts_numbered_atr_images_without_host_paths() {
+        let mut vm = CompilerVm::default();
+        let bytes = test_atr_bytes(128, 720);
+
+        vm.mount_atr_bytes(1, bytes.clone(), DiskWritePolicy::ReadOnly)
+            .unwrap();
+
+        assert_eq!(vm.mounted_atr_bytes(1), Some(bytes));
+        assert!(!vm.disk_is_dirty(1));
+        assert!(
+            vm.mount_atr_bytes(0, test_atr_bytes(128, 1), DiskWritePolicy::ReadOnly)
+                .is_err()
+        );
+        assert_eq!(vm.bus_mut().unmount_disk(1).unwrap().unwrap().unit, 1);
+        assert!(vm.mounted_atr_bytes(1).is_none());
+    }
+
+    #[test]
+    fn cpu_services_siov_sector_reads_and_matches_os_return_state() {
+        let mut bytes = test_atr_bytes(256, 5);
+        let sector_four = 16 + 3 * 128;
+        for (index, byte) in bytes[sector_four..sector_four + 256].iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let mut bus = Bus::default();
+        bus.mount_atr_bytes(1, bytes, DiskWritePolicy::ReadOnly)
+            .unwrap();
+        let mut cpu = Cpu::default();
+        prepare_siov_call(
+            &mut bus,
+            &mut cpu,
+            1,
+            SIO_COMMAND_READ_SECTOR,
+            SIO_DIRECTION_READ,
+            0x4000,
+            256,
+            4,
+        );
+
+        let step = cpu.step(&mut bus).unwrap();
+
+        assert_eq!(step.pc, SIOV);
+        assert_eq!(step.opcode, 0xFF);
+        assert_eq!(cpu.registers.pc, 0x2000);
+        assert_eq!(cpu.registers.sp, 0xFD);
+        assert_eq!(cpu.registers.a, 0);
+        assert_eq!(cpu.registers.y, SIO_STATUS_SUCCESS);
+        assert_ne!(cpu.registers.status & StatusFlags::CARRY.bits(), 0);
+        assert_eq!(cpu.registers.status & StatusFlags::NEGATIVE.bits(), 0);
+        assert_eq!(bus.ram().read(DSTATS), SIO_STATUS_SUCCESS);
+        assert_eq!(bus.ram().read(0x4000), 0);
+        assert_eq!(bus.ram().read(0x40FF), 0xFF);
+        assert_eq!(bus.sio_observations().len(), 1);
+        assert_eq!(bus.sio_observations()[0].bytes_transferred, 256);
+        assert_eq!(bus.sio_observations()[0].sector, Some(4));
+    }
+
+    #[test]
+    fn cpu_services_siov_status_with_atr_density() {
+        let mut bus = Bus::default();
+        bus.mount_atr_bytes(1, test_atr_bytes(256, 720), DiskWritePolicy::ReadOnly)
+            .unwrap();
+        let mut cpu = Cpu::default();
+        prepare_siov_call(
+            &mut bus,
+            &mut cpu,
+            1,
+            SIO_COMMAND_STATUS,
+            SIO_DIRECTION_READ,
+            0x4000,
+            4,
+            0,
+        );
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(
+            (0..4)
+                .map(|offset| bus.ram().read(0x4000 + offset))
+                .collect::<Vec<_>>(),
+            vec![0x20, 0xFF, 0xE0, 0x00]
+        );
+        assert_eq!(bus.sio_observations()[0].bytes_transferred, 4);
+    }
+
+    #[test]
+    fn cpu_reports_deterministic_siov_disk_errors() {
+        let cases = [
+            (
+                1,
+                SIO_COMMAND_READ_SECTOR,
+                SIO_DIRECTION_READ,
+                128,
+                1,
+                SIO_STATUS_DEVICE_TIMEOUT,
+            ),
+            (
+                2,
+                SIO_COMMAND_READ_SECTOR,
+                SIO_DIRECTION_READ,
+                128,
+                0,
+                SIO_STATUS_DEVICE_NAK,
+            ),
+            (
+                2,
+                SIO_COMMAND_READ_SECTOR,
+                SIO_DIRECTION_READ,
+                127,
+                1,
+                SIO_STATUS_DEVICE_ERROR,
+            ),
+            (
+                2,
+                SIO_COMMAND_WRITE_SECTOR,
+                SIO_DIRECTION_WRITE,
+                128,
+                1,
+                SIO_STATUS_DEVICE_ERROR,
+            ),
+            (2, 0x99, 0, 0, 0, SIO_STATUS_DEVICE_NAK),
+        ];
+
+        for (unit, command, direction, length, aux, expected_status) in cases {
+            let mut bus = Bus::default();
+            bus.mount_atr_bytes(2, test_atr_bytes(128, 4), DiskWritePolicy::ReadOnly)
+                .unwrap();
+            let mut cpu = Cpu::default();
+            prepare_siov_call(
+                &mut bus, &mut cpu, unit, command, direction, 0x4000, length, aux,
+            );
+
+            cpu.step(&mut bus).unwrap();
+
+            assert_eq!(cpu.registers.y, expected_status);
+            assert_eq!(bus.ram().read(DSTATS), expected_status);
+            assert_ne!(cpu.registers.status & StatusFlags::NEGATIVE.bits(), 0);
+            assert_eq!(bus.sio_observations().len(), 1);
+            assert_eq!(bus.sio_observations()[0].status, expected_status);
+        }
+    }
+
+    #[test]
+    fn cpu_leaves_siov_to_the_os_when_disk_service_is_inactive() {
+        let mut bus = Bus::default();
+        let mut cpu = Cpu::default();
+        prepare_siov_call(
+            &mut bus,
+            &mut cpu,
+            1,
+            SIO_COMMAND_READ_SECTOR,
+            SIO_DIRECTION_READ,
+            0x4000,
+            128,
+            1,
+        );
+
+        assert!(!cpu.try_emulate_siov(&mut bus));
+        assert_eq!(cpu.registers.pc, SIOV);
+        assert!(bus.sio_observations().is_empty());
     }
 
     #[test]
