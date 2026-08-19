@@ -5209,6 +5209,58 @@ mod tests {
         }
     }
 
+    fn boot_bundled_mydos_to_prompt(policy: DiskWritePolicy) -> CompilerVm {
+        let mut vm = CompilerVm::default();
+        vm.mount_bundled_mydos(1, policy).unwrap();
+        vm.prepare_execution_profile(ExecutionProfile::DiskBoot)
+            .unwrap();
+        vm.reset_cpu();
+        for _ in 0..400_000 {
+            if vm.bus().dos_boot_is_ready() && vm.cpu().registers().pc == 0xEA2D {
+                return vm;
+            }
+            vm.step_cpu().unwrap();
+        }
+        panic!(
+            "bundled MyDOS did not reach its command prompt; PC=${:04X}",
+            vm.cpu().registers().pc
+        );
+    }
+
+    fn native_cio_filename_command(
+        vm: &mut CompilerVm,
+        command: u8,
+        name: &[u8],
+        aux1: u8,
+        aux2: u8,
+    ) -> u8 {
+        const X: u8 = 0x10;
+        const FILENAME: u16 = 0x4200;
+
+        vm.bus_mut().ram_mut().map(FILENAME, name).unwrap();
+        let ram = vm.bus_mut().ram_mut();
+        ram.write(IOCB_DEVICE_BASE.wrapping_add(u16::from(X)), 0xFF);
+        ram.write(IOCB_COMMAND_BASE.wrapping_add(u16::from(X)), command);
+        ram.write_word(IOCB_BUFFER_BASE.wrapping_add(u16::from(X)), FILENAME);
+        ram.write_word(IOCB_LENGTH_BASE.wrapping_add(u16::from(X)), 0);
+        ram.write(IOCB_AUX1_BASE.wrapping_add(u16::from(X)), aux1);
+        ram.write(IOCB_AUX2_BASE.wrapping_add(u16::from(X)), aux2);
+        let status = run_native_ciov(vm, X).unwrap().y;
+        if command != CIO_COMMAND_OPEN {
+            configure_iocb(vm, X, CIO_COMMAND_CLOSE, 0, 0, 0);
+            let _ = run_native_ciov(vm, X).unwrap();
+        }
+        status
+    }
+
+    fn native_file_open_status(vm: &mut CompilerVm, name: &[u8]) -> u8 {
+        const X: u8 = 0x10;
+        let status = native_cio_filename_command(vm, CIO_COMMAND_OPEN, name, 4, 0);
+        configure_iocb(vm, X, CIO_COMMAND_CLOSE, 0, 0, 0);
+        let _ = run_native_ciov(vm, X).unwrap();
+        status
+    }
+
     fn native_write_file(vm: &mut CompilerVm, name: &[u8], bytes: &[u8]) {
         const X: u8 = 0x10;
         const FILENAME: u16 = 0x4200;
@@ -5220,7 +5272,13 @@ mod tests {
             .ram_mut()
             .write(IOCB_DEVICE_BASE.wrapping_add(u16::from(X)), 0xFF);
         configure_iocb(vm, X, CIO_COMMAND_OPEN, FILENAME, 0, 8);
-        assert_eq!(run_native_ciov(vm, X).unwrap().y, 1);
+        let open_status = run_native_ciov(vm, X).unwrap().y;
+        assert_eq!(
+            open_status,
+            1,
+            "failed to create {}",
+            format_cio_preview(name)
+        );
         for chunk in bytes.chunks(CHUNK_SIZE) {
             vm.bus_mut().ram_mut().map(DATA, chunk).unwrap();
             configure_iocb(vm, X, CIO_COMMAND_PUTCHR, DATA, chunk.len() as u16, 0);
@@ -5883,6 +5941,97 @@ mod tests {
         assert_eq!(actual, text);
         configure_iocb(&mut vm, x, CIO_COMMAND_CLOSE, 0, 0, 0);
         assert_eq!(run_native_ciov(&mut vm, x).unwrap().y, 1);
+    }
+
+    #[test]
+    fn bundled_mydos_handles_tn_file_and_subdirectory_mutations() {
+        const XIO_RENAME: u8 = 32;
+        const XIO_DELETE: u8 = 33;
+        const XIO_MKDIR: u8 = 34;
+        const XIO_LOCK: u8 = 35;
+        const XIO_UNLOCK: u8 = 36;
+        const XIO_BINARY_LOAD: u8 = 39;
+        const XIO_CHDIR: u8 = 41;
+
+        let mut vm = boot_bundled_mydos_to_prompt(DiskWritePolicy::CopyOnWrite);
+
+        native_write_file(&mut vm, b"D1:LOCKED.TXT\x9B", b"LOCKED");
+        assert_eq!(
+            native_cio_filename_command(&mut vm, XIO_LOCK, b"D1:LOCKED.TXT\x9B", 0, 0),
+            1
+        );
+        assert!(
+            native_cio_filename_command(&mut vm, XIO_DELETE, b"D1:LOCKED.TXT\x9B", 0, 0) >= 0x80
+        );
+        assert_eq!(native_file_open_status(&mut vm, b"D1:LOCKED.TXT\x9B"), 1);
+        assert_eq!(
+            native_cio_filename_command(&mut vm, XIO_UNLOCK, b"D1:LOCKED.TXT\x9B", 0, 0),
+            1
+        );
+        assert_eq!(
+            native_cio_filename_command(&mut vm, XIO_DELETE, b"D1:LOCKED.TXT\x9B", 0, 0),
+            1
+        );
+        assert!(native_file_open_status(&mut vm, b"D1:LOCKED.TXT\x9B") >= 0x80);
+
+        native_write_file(&mut vm, b"D1:OLD.TXT\x9B", b"RENAMED CONTENT");
+        assert_eq!(
+            native_cio_filename_command(&mut vm, XIO_RENAME, b"D1:OLD.TXT,NEW.TXT\x9B", 0, 0,),
+            1
+        );
+        assert!(native_file_open_status(&mut vm, b"D1:OLD.TXT\x9B") >= 0x80);
+        assert_eq!(native_file_open_status(&mut vm, b"D1:NEW.TXT\x9B"), 1);
+
+        assert_eq!(
+            native_cio_filename_command(&mut vm, XIO_MKDIR, b"D1:SUBDIR\x9B", 8, 0),
+            1
+        );
+        assert_eq!(
+            native_cio_filename_command(&mut vm, XIO_CHDIR, b"D1:SUBDIR\x9B", 0, 0),
+            1
+        );
+        native_write_file(&mut vm, b"D:INNER.TXT\x9B", b"INSIDE");
+        assert_eq!(
+            native_read_file(&mut vm, b"D1:SUBDIR:INNER.TXT\x9B", 6),
+            b"INSIDE"
+        );
+        assert_eq!(
+            native_cio_filename_command(&mut vm, XIO_CHDIR, b"D1:\x9B", 0, 0),
+            1
+        );
+        assert!(native_file_open_status(&mut vm, b"D1:INNER.TXT\x9B") >= 0x80);
+
+        native_write_file(&mut vm, b"D1:A.TMP\x9B", b"A");
+        native_write_file(&mut vm, b"D1:B.TMP\x9B", b"B");
+        native_write_file(&mut vm, b"D1:KEEP.DAT\x9B", b"KEEP");
+        assert_eq!(
+            native_cio_filename_command(&mut vm, XIO_DELETE, b"D1:*.TMP\x9B", 0, 0),
+            1
+        );
+        assert!(native_file_open_status(&mut vm, b"D1:A.TMP\x9B") >= 0x80);
+        assert!(native_file_open_status(&mut vm, b"D1:B.TMP\x9B") >= 0x80);
+        assert_eq!(native_file_open_status(&mut vm, b"D1:KEEP.DAT\x9B"), 1);
+
+        let load_object = [
+            0xFF, 0xFF, 0x00, 0x50, 0x05, 0x50, 0xA9, 0x42, 0x8D, 0xFF, 0x4F, 0x60, 0xE2, 0x02,
+            0xE3, 0x02, 0x00, 0x50,
+        ];
+        native_write_file(&mut vm, b"D1:LOADME.COM\x9B", &load_object);
+        vm.bus_mut().ram_mut().write(0x4FFF, 0);
+        assert_eq!(
+            native_cio_filename_command(&mut vm, XIO_BINARY_LOAD, b"D1:LOADME.COM\x9B", 4, 0,),
+            1
+        );
+        assert_eq!(vm.bus().ram().read(0x4FFF), 0x42);
+
+        assert!(vm.disk_is_dirty(1));
+        assert!(vm.bus().sio_observations().iter().all(|observation| {
+            observation.handled
+                && matches!(
+                    observation.status,
+                    SIO_STATUS_SUCCESS | SIO_STATUS_DEVICE_TIMEOUT
+                )
+        }));
     }
 
     #[test]
