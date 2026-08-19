@@ -97,8 +97,12 @@ pub const CIO_COMMAND_PUTREC: u8 = 0x09;
 pub const CIO_COMMAND_PUTCHR: u8 = 0x0B;
 pub const CIO_COMMAND_CLOSE: u8 = 0x0C;
 pub const CIO_COMMAND_STATUS: u8 = 0x0D;
+pub const CIO_COMMAND_DRAW_TO: u8 = 0x11;
+pub const CIO_COMMAND_FILL: u8 = 0x12;
 pub const CIO_COMMAND_POINT: u8 = 0x25;
 pub const CIO_COMMAND_NOTE: u8 = 0x26;
+pub const GRAPHICS_COLOR: u16 = 0x02FD;
+pub const GRAPHICS_FILL_COLOR: u16 = 0x02FB;
 pub const CIO_OBSERVATION_LIMIT: usize = 128;
 pub const CIO_READ_PREVIEW_LIMIT: usize = 80;
 pub const RUNAD: u16 = 0x02E2;
@@ -2119,6 +2123,19 @@ impl Cpu {
                             return true;
                         }
                     }
+                    Some(CioHarnessDevice::Screen) => {
+                        let character = bus.read_screen_pixel();
+                        observation.handled = true;
+                        observation.detail = format!("read screen pixel ${character:02X}");
+                        observation.result_a = Some(character);
+                        observation.result_y = Some(0x01);
+                        observation.bytes_read = Some(1);
+                        observation.preview = Some(format_cio_preview(&[character]));
+                        bus.finish_cio_observation(observation);
+                        self.return_from_ciov(bus, character, 0x01);
+                        return true;
+                    }
+                    Some(CioHarnessDevice::Editor) => {}
                     None => {}
                 }
 
@@ -2202,7 +2219,37 @@ impl Cpu {
                 bus.finish_cio_observation(observation);
                 false
             }
+            CIO_COMMAND_DRAW_TO | CIO_COMMAND_FILL => {
+                if bus.draw_screen_to_cursor(self.registers.x, command == CIO_COMMAND_FILL) {
+                    observation.handled = true;
+                    observation.detail = if command == CIO_COMMAND_FILL {
+                        "fill screen rectangle".to_string()
+                    } else {
+                        "draw screen line".to_string()
+                    };
+                    observation.result_a = Some(self.registers.a);
+                    observation.result_y = Some(0x01);
+                    bus.finish_cio_observation(observation);
+                    self.return_from_ciov(bus, self.registers.a, 0x01);
+                    return true;
+                }
+                observation.detail = format!("command ${command:02X} passthrough");
+                bus.finish_cio_observation(observation);
+                false
+            }
             CIO_COMMAND_PUTCHR | CIO_COMMAND_PUTREC => {
+                if let Some(written) =
+                    bus.write_screen_bytes_for_iocb(self.registers.x, self.registers.a)
+                {
+                    observation.handled = true;
+                    observation.detail = format!("write screen {written} pixel(s)");
+                    observation.result_a = Some(self.registers.a);
+                    observation.result_y = Some(0x01);
+                    observation.bytes_written = Some(written as u16);
+                    bus.finish_cio_observation(observation);
+                    self.return_from_ciov(bus, self.registers.a, 0x01);
+                    return true;
+                }
                 if let Some(written) =
                     bus.write_host_bytes_for_iocb(self.registers.x, self.registers.a)
                 {
@@ -2464,6 +2511,9 @@ pub struct Bus {
     keyboard_read_waiting: bool,
     cio_channel0_output: Vec<u8>,
     cio_harness_devices: [Option<CioHarnessDevice>; 8],
+    graphics_pixels: HashMap<(u16, u8), u8>,
+    graphics_pen: Option<(u16, u8)>,
+    graphics_mode: Option<u8>,
     host_files: Vec<HostFile>,
     host_file_lookup: HashMap<String, usize>,
     trace_cio: bool,
@@ -2494,6 +2544,9 @@ impl Default for Bus {
             keyboard_read_waiting: false,
             cio_channel0_output: Vec::new(),
             cio_harness_devices: [None; 8],
+            graphics_pixels: HashMap::new(),
+            graphics_pen: None,
+            graphics_mode: None,
             host_files: Vec::new(),
             host_file_lookup: HashMap::new(),
             trace_cio: false,
@@ -2660,6 +2713,17 @@ impl Bus {
 
     pub fn cio_channel0_output(&self) -> &[u8] {
         &self.cio_channel0_output
+    }
+
+    pub fn graphics_pixel(&self, column: u16, row: u8) -> u8 {
+        self.graphics_pixels
+            .get(&(column, row))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn graphics_mode(&self) -> Option<u8> {
+        self.graphics_mode
     }
 
     pub fn decoded_cio_channel0_output(&self) -> String {
@@ -3152,6 +3216,13 @@ impl Bus {
         ));
         let device = match self.peek_mapped(spec_buffer).to_ascii_uppercase() {
             b'Q' => CioHarnessDevice::QueuedInput,
+            b'E' => CioHarnessDevice::Editor,
+            b'S' => {
+                self.graphics_mode = Some(self.ram.read(IOCB_AUX1_BASE.wrapping_add(x as u16)));
+                self.graphics_pixels.clear();
+                self.graphics_pen = None;
+                CioHarnessDevice::Screen
+            }
             b'H' | b'D' => {
                 let device_name = self.peek_mapped(spec_buffer).to_ascii_uppercase() as char;
                 let spec = self.read_iocb_string(spec_buffer, spec_length);
@@ -3449,6 +3520,74 @@ impl Bus {
         Some(bytes.len())
     }
 
+    fn read_screen_pixel(&self) -> u8 {
+        self.graphics_pixel(self.ram.read_word(COLCRS), self.ram.read(ROWCRS))
+    }
+
+    fn write_screen_bytes_for_iocb(&mut self, x: u8, accumulator: u8) -> Option<usize> {
+        if self.cio_channel_device(x) != Some(CioHarnessDevice::Screen) {
+            return None;
+        }
+        let bytes = self.cio_output_bytes_for_iocb(x, accumulator);
+        let mut column = self.ram.read_word(COLCRS);
+        let row = self.ram.read(ROWCRS);
+        for byte in &bytes {
+            self.graphics_pixels.insert((column, row), *byte);
+            self.graphics_pen = Some((column, row));
+            column = column.wrapping_add(1);
+        }
+        Some(bytes.len())
+    }
+
+    fn draw_screen_to_cursor(&mut self, x: u8, fill: bool) -> bool {
+        if self.cio_channel_device(x) != Some(CioHarnessDevice::Screen) {
+            return false;
+        }
+        let target = (self.ram.read_word(COLCRS), self.ram.read(ROWCRS));
+        let start = self.graphics_pen.unwrap_or(target);
+        let color = self.ram.read(GRAPHICS_FILL_COLOR);
+        if fill {
+            let min_column = start.0.min(target.0);
+            let max_column = start.0.max(target.0);
+            let min_row = start.1.min(target.1);
+            let max_row = start.1.max(target.1);
+            for row in min_row..=max_row {
+                for column in min_column..=max_column {
+                    self.graphics_pixels.insert((column, row), color);
+                }
+            }
+        } else {
+            self.draw_screen_line(start, target, color);
+        }
+        self.graphics_pen = Some(target);
+        true
+    }
+
+    fn draw_screen_line(&mut self, start: (u16, u8), end: (u16, u8), color: u8) {
+        let (mut x0, mut y0) = (i32::from(start.0), i32::from(start.1));
+        let (x1, y1) = (i32::from(end.0), i32::from(end.1));
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut error = dx + dy;
+        loop {
+            self.graphics_pixels.insert((x0 as u16, y0 as u8), color);
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+            let twice_error = error * 2;
+            if twice_error >= dy {
+                error += dy;
+                x0 += sx;
+            }
+            if twice_error <= dx {
+                error += dx;
+                y0 += sy;
+            }
+        }
+    }
+
     fn cio_output_bytes_for_iocb(&self, x: u8, accumulator: u8) -> Vec<u8> {
         let base = x as u16;
         let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(base));
@@ -3591,6 +3730,8 @@ impl Bus {
     fn describe_cio_device(&self, device: CioHarnessDevice) -> String {
         match device {
             CioHarnessDevice::QueuedInput => "Q:".to_string(),
+            CioHarnessDevice::Editor => "E:".to_string(),
+            CioHarnessDevice::Screen => "S:".to_string(),
             CioHarnessDevice::Host { file_index, offset } => self
                 .host_files
                 .get(file_index)
@@ -3791,6 +3932,8 @@ struct HostFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CioHarnessDevice {
     QueuedInput,
+    Editor,
+    Screen,
     Host { file_index: usize, offset: usize },
 }
 
@@ -6639,6 +6782,32 @@ mod tests {
                 offset: 300
             })
         );
+    }
+
+    #[test]
+    fn headless_screen_supports_pixel_line_and_fill_operations() {
+        let mut bus = Bus::default();
+        bus.cio_harness_devices[6] = Some(CioHarnessDevice::Screen);
+        bus.ram_mut().write_word(COLCRS, 10);
+        bus.ram_mut().write(ROWCRS, 20);
+
+        assert_eq!(bus.write_screen_bytes_for_iocb(0x60, 3), Some(1));
+        assert_eq!(bus.graphics_pixel(10, 20), 3);
+        assert_eq!(bus.read_screen_pixel(), 3);
+
+        bus.ram_mut().write_word(COLCRS, 12);
+        bus.ram_mut().write(ROWCRS, 22);
+        bus.ram_mut().write(GRAPHICS_FILL_COLOR, 5);
+        assert!(bus.draw_screen_to_cursor(0x60, false));
+        assert_eq!(bus.graphics_pixel(11, 21), 5);
+        assert_eq!(bus.graphics_pixel(12, 22), 5);
+
+        bus.ram_mut().write_word(COLCRS, 14);
+        bus.ram_mut().write(ROWCRS, 24);
+        bus.ram_mut().write(GRAPHICS_FILL_COLOR, 7);
+        assert!(bus.draw_screen_to_cursor(0x60, true));
+        assert_eq!(bus.graphics_pixel(13, 23), 7);
+        assert_eq!(bus.graphics_pixel(14, 24), 7);
     }
 
     #[test]
