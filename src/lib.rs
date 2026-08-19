@@ -3488,7 +3488,13 @@ impl Bus {
                 CioHarnessDevice::Screen
             }
             b'H' | b'D' => {
-                let device_name = self.peek_mapped(spec_buffer).to_ascii_uppercase() as char;
+                let device_letter = self.peek_mapped(spec_buffer).to_ascii_uppercase();
+                // Once DOS has been booted, its installed D: handler owns all
+                // disk semantics. H: remains available for explicit host files.
+                if self.disk_boot_mode && device_letter == b'D' {
+                    return false;
+                }
+                let device_name = device_letter as char;
                 let spec = self.read_iocb_string(spec_buffer, spec_length);
                 let name = normalize_host_file_name(&spec);
                 let Some(file_index) = self.host_file_lookup.get(&name).copied() else {
@@ -5119,6 +5125,30 @@ mod tests {
         cpu.registers.sp = 0xFB;
     }
 
+    fn run_native_ciov(vm: &mut CompilerVm, x: u8) -> Result<CpuRegisters, String> {
+        const TRAMPOLINE: u16 = 0x4000;
+        vm.bus_mut().ram_mut().map(
+            TRAMPOLINE,
+            &[
+                0x20,
+                CIOV as u8,
+                (CIOV >> 8) as u8, // JSR CIOV
+                0x4C,
+                0x03,
+                0x40, // JMP $4003
+            ],
+        )?;
+        vm.cpu.registers.pc = TRAMPOLINE;
+        vm.cpu.registers.x = x;
+        for _ in 0..200_000 {
+            vm.step_cpu().map_err(|err| format!("{err:?}"))?;
+            if vm.cpu().registers().pc == TRAMPOLINE + 3 {
+                return Ok(vm.cpu().registers());
+            }
+        }
+        Err("native CIO call did not return to its trampoline".to_string())
+    }
+
     #[test]
     fn maps_image_bytes_at_requested_base() {
         let mut memory = Memory::default();
@@ -5506,6 +5536,86 @@ mod tests {
                 .sio_observations()
                 .iter()
                 .any(|observation| observation.command == SIO_COMMAND_READ_SECTOR)
+        );
+    }
+
+    #[test]
+    fn bundled_mydos_lists_its_directory_through_native_cio() {
+        let mut vm = CompilerVm::default();
+        vm.add_host_file_bytes("DOS.SYS", b"harness shadow".to_vec());
+        vm.mount_bundled_mydos(1, DiskWritePolicy::ReadOnly)
+            .unwrap();
+        vm.prepare_execution_profile(ExecutionProfile::DiskBoot)
+            .unwrap();
+        vm.reset_cpu();
+
+        for _ in 0..400_000 {
+            if vm.bus().dos_boot_is_ready() && vm.cpu().registers().pc == 0xEA2D {
+                break;
+            }
+            vm.step_cpu().unwrap();
+        }
+        assert!(vm.bus().dos_boot_is_ready());
+        assert_eq!(vm.cpu().registers().pc, 0xEA2D);
+
+        let x = 0x10;
+        let filename = 0x4200;
+        let directory_record = 0x4300;
+        vm.bus_mut().ram_mut().map(filename, b"D:*.*\x9B").unwrap();
+        vm.bus_mut()
+            .ram_mut()
+            .write(IOCB_DEVICE_BASE.wrapping_add(x as u16), 0xFF);
+        vm.bus_mut()
+            .ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(x as u16), CIO_COMMAND_OPEN);
+        vm.bus_mut()
+            .ram_mut()
+            .write_word(IOCB_BUFFER_BASE.wrapping_add(x as u16), filename);
+        vm.bus_mut()
+            .ram_mut()
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(x as u16), 0);
+        vm.bus_mut()
+            .ram_mut()
+            .write(IOCB_AUX1_BASE.wrapping_add(x as u16), 6);
+        vm.bus_mut()
+            .ram_mut()
+            .write(IOCB_AUX2_BASE.wrapping_add(x as u16), 0);
+
+        assert_eq!(run_native_ciov(&mut vm, x).unwrap().y, 1);
+        assert_eq!(vm.bus().cio_channel_device(x), None);
+        assert_eq!(
+            vm.bus().cio_observations().back().unwrap().detail,
+            "open passthrough"
+        );
+
+        vm.bus_mut()
+            .ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(x as u16), CIO_COMMAND_GETREC);
+        vm.bus_mut()
+            .ram_mut()
+            .write_word(IOCB_BUFFER_BASE.wrapping_add(x as u16), directory_record);
+        vm.bus_mut()
+            .ram_mut()
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(x as u16), 19);
+
+        assert_eq!(run_native_ciov(&mut vm, x).unwrap().y, 1);
+        let record = (0..19)
+            .map(|offset| vm.bus().ram().read(directory_record + offset))
+            .collect::<Vec<_>>();
+        assert!(record.windows(3).any(|window| window == b"DOS"));
+        assert!(record.windows(3).any(|window| window == b"SYS"));
+        assert_eq!(
+            vm.bus().cio_observations().back().unwrap().detail,
+            "read passthrough"
+        );
+
+        vm.bus_mut()
+            .ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(x as u16), CIO_COMMAND_CLOSE);
+        assert_eq!(run_native_ciov(&mut vm, x).unwrap().y, 1);
+        assert_eq!(
+            vm.bus().cio_observations().back().unwrap().detail,
+            "close passthrough"
         );
     }
 
