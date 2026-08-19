@@ -132,6 +132,16 @@ pub enum ExecutionProfile {
     SyntheticTest,
 }
 
+/// Selects what the VM does when its headless CIO bridge does not own an IOCB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CioFallbackPolicy {
+    /// Preserve the headless harness behavior, including accepting CLOSE on an
+    /// otherwise empty channel.
+    Headless,
+    /// Let the installed Atari OS or DOS handler process unowned IOCBs.
+    NativeOs,
+}
+
 impl ExecutionProfile {
     fn requires_cartridge_services(self) -> bool {
         matches!(self, Self::OriginalCompiler | Self::CartridgeObject)
@@ -2105,6 +2115,12 @@ impl Cpu {
                     Some(CioHarnessDevice::Host { .. }) => {
                         let result = if command == CIO_COMMAND_GETREC {
                             bus.read_host_record(self.registers.x)
+                        } else if bus
+                            .ram()
+                            .read_word(IOCB_LENGTH_BASE.wrapping_add(self.registers.x as u16))
+                            != 0
+                        {
+                            bus.read_host_block(self.registers.x)
                         } else {
                             bus.read_host_character(self.registers.x)
                         };
@@ -2166,8 +2182,16 @@ impl Cpu {
                 true
             }
             CIO_COMMAND_CLOSE => {
+                let closed_harness_device = bus.close_harness_cio_device(self.registers.x);
+                if !closed_harness_device
+                    && bus.cio_fallback_policy() == CioFallbackPolicy::NativeOs
+                {
+                    observation.detail = "close passthrough".to_string();
+                    bus.finish_cio_observation(observation);
+                    return false;
+                }
                 observation.handled = true;
-                observation.detail = if bus.close_harness_cio_device(self.registers.x) {
+                observation.detail = if closed_harness_device {
                     "close harness device".to_string()
                 } else {
                     "close empty channel".to_string()
@@ -2529,6 +2553,7 @@ pub struct Bus {
     trace_cio: bool,
     cio_summary: CioSummary,
     cio_observations: VecDeque<CioObservation>,
+    cio_fallback_policy: CioFallbackPolicy,
     sio_timeout_pending: bool,
     redirect_disk_boot_to_cart: bool,
     self_test_rom_enabled: bool,
@@ -2562,6 +2587,7 @@ impl Default for Bus {
             trace_cio: false,
             cio_summary: CioSummary::default(),
             cio_observations: VecDeque::new(),
+            cio_fallback_policy: CioFallbackPolicy::Headless,
             sio_timeout_pending: false,
             redirect_disk_boot_to_cart: false,
             self_test_rom_enabled: true,
@@ -2719,6 +2745,14 @@ impl Bus {
 
     pub fn set_trace_cio(&mut self, trace_cio: bool) {
         self.trace_cio = trace_cio;
+    }
+
+    pub fn set_cio_fallback_policy(&mut self, policy: CioFallbackPolicy) {
+        self.cio_fallback_policy = policy;
+    }
+
+    pub fn cio_fallback_policy(&self) -> CioFallbackPolicy {
+        self.cio_fallback_policy
     }
 
     pub fn cio_channel0_output(&self) -> &[u8] {
@@ -3352,6 +3386,55 @@ impl Bus {
             bytes_read: 0,
             detail: "read host char EOF".to_string(),
             preview: String::new(),
+        })
+    }
+
+    fn read_host_block(&mut self, x: u8) -> Option<CioReadResult> {
+        let channel = cio_channel_index(x)?;
+        let Some(CioHarnessDevice::Host { file_index, offset }) = self.cio_harness_devices[channel]
+        else {
+            return None;
+        };
+        let requested = self.ram.read_word(IOCB_LENGTH_BASE.wrapping_add(x as u16));
+        let buffer = self.ram.read_word(IOCB_BUFFER_BASE.wrapping_add(x as u16));
+        let file = self.host_files.get(file_index)?;
+        if file.writable || requested == 0 {
+            return None;
+        }
+
+        let available = file.bytes.len().saturating_sub(offset);
+        let transferred = usize::from(requested).min(available);
+        let mut preview = Vec::new();
+        for index in 0..transferred {
+            let byte = file.bytes[offset + index];
+            self.ram.write(buffer.wrapping_add(index as u16), byte);
+            if preview.len() < CIO_READ_PREVIEW_LIMIT {
+                preview.push(byte);
+            }
+        }
+
+        self.ram
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(x as u16), transferred as u16);
+        self.cio_harness_devices[channel] = Some(CioHarnessDevice::Host {
+            file_index,
+            offset: offset + transferred,
+        });
+
+        let status = if transferred == usize::from(requested) {
+            0x01
+        } else {
+            0x88
+        };
+        Some(CioReadResult {
+            accumulator: if status == 0x01 { 0 } else { status },
+            status,
+            bytes_read: transferred,
+            detail: if status == 0x01 {
+                format!("read host block {transferred} byte(s)")
+            } else {
+                format!("read host block {transferred} byte(s), EOF")
+            },
+            preview: format_cio_preview(&preview),
         })
     }
 
@@ -6708,6 +6791,107 @@ mod tests {
         assert_eq!(cpu.registers.y, 0x01);
         assert_eq!(bus.cio_channel_device(0x10), None);
         assert_eq!(bus.cio_summary.closes, 1);
+    }
+
+    #[test]
+    fn cpu_passes_unowned_close_to_native_os_when_requested() {
+        let mut bus = Bus::default();
+        bus.set_cio_fallback_policy(CioFallbackPolicy::NativeOs);
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x10), CIO_COMMAND_CLOSE);
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        let mut cpu = Cpu::default();
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x10;
+        cpu.registers.sp = 0xFB;
+
+        assert!(!cpu.try_emulate_ciov(&mut bus));
+        assert_eq!(cpu.registers.pc, CIOV);
+        assert_eq!(bus.cio_channel_device(0x10), None);
+        assert_eq!(
+            bus.cio_observations().back().unwrap().detail,
+            "close passthrough"
+        );
+    }
+
+    #[test]
+    fn cpu_reads_host_getchr_blocks_without_text_translation() {
+        let mut bus = Bus::default();
+        bus.add_host_file("DATA.BIN", vec![0x00, b'\n', 0xFF, 0x42, 0x43]);
+        bus.cio_harness_devices[1] = Some(CioHarnessDevice::Host {
+            file_index: 0,
+            offset: 0,
+        });
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x10), CIO_COMMAND_GETCHR);
+        bus.ram_mut()
+            .write_word(IOCB_BUFFER_BASE.wrapping_add(0x10), 0x3000);
+        let mut cpu = Cpu::default();
+        cpu.registers.x = 0x10;
+
+        bus.ram_mut()
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(0x10), 3);
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        cpu.registers.pc = CIOV;
+        cpu.registers.sp = 0xFB;
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.y, 0x01);
+        assert_eq!(bus.ram().read_word(IOCB_LENGTH_BASE + 0x10), 3);
+        assert_eq!(
+            (0..3)
+                .map(|offset| bus.ram().read(0x3000 + offset))
+                .collect::<Vec<_>>(),
+            vec![0x00, b'\n', 0xFF]
+        );
+
+        bus.ram_mut()
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(0x10), 3);
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        cpu.registers.pc = CIOV;
+        cpu.registers.sp = 0xFB;
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.y, 0x88);
+        assert_eq!(bus.ram().read_word(IOCB_LENGTH_BASE + 0x10), 2);
+        assert_eq!(bus.ram().read(0x3000), 0x42);
+        assert_eq!(bus.ram().read(0x3001), 0x43);
+        assert_eq!(
+            bus.cio_channel_device(0x10),
+            Some(CioHarnessDevice::Host {
+                file_index: 0,
+                offset: 5
+            })
+        );
+    }
+
+    #[test]
+    fn zero_length_host_getchr_remains_a_translated_character_read() {
+        let mut bus = Bus::default();
+        bus.add_host_file("TEXT.ACT", b"\n".to_vec());
+        bus.cio_harness_devices[1] = Some(CioHarnessDevice::Host {
+            file_index: 0,
+            offset: 0,
+        });
+        bus.ram_mut()
+            .write(IOCB_COMMAND_BASE.wrapping_add(0x10), CIO_COMMAND_GETCHR);
+        bus.ram_mut()
+            .write_word(IOCB_LENGTH_BASE.wrapping_add(0x10), 0);
+        bus.ram_mut().write(0x01FC, 0xFF);
+        bus.ram_mut().write(0x01FD, 0x1F);
+        let mut cpu = Cpu::default();
+        cpu.registers.pc = CIOV;
+        cpu.registers.x = 0x10;
+        cpu.registers.sp = 0xFB;
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.a, ATASCII_EOL);
+        assert_eq!(cpu.registers.y, 0x01);
+        assert_eq!(bus.ram().read_word(IOCB_LENGTH_BASE + 0x10), 0);
     }
 
     #[test]
