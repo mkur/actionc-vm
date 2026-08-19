@@ -87,6 +87,9 @@ pub const IOCB_BUFFER_BASE: u16 = 0x0344;
 pub const IOCB_LENGTH_BASE: u16 = 0x0348;
 pub const IOCB_AUX1_BASE: u16 = 0x034A;
 pub const IOCB_AUX2_BASE: u16 = 0x034B;
+pub const IOCB_AUX3_BASE: u16 = 0x034C;
+pub const IOCB_AUX4_BASE: u16 = 0x034D;
+pub const IOCB_AUX5_BASE: u16 = 0x034E;
 pub const CIO_COMMAND_OPEN: u8 = 0x03;
 pub const CIO_COMMAND_GETREC: u8 = 0x05;
 pub const CIO_COMMAND_GETCHR: u8 = 0x07;
@@ -94,6 +97,8 @@ pub const CIO_COMMAND_PUTREC: u8 = 0x09;
 pub const CIO_COMMAND_PUTCHR: u8 = 0x0B;
 pub const CIO_COMMAND_CLOSE: u8 = 0x0C;
 pub const CIO_COMMAND_STATUS: u8 = 0x0D;
+pub const CIO_COMMAND_POINT: u8 = 0x25;
+pub const CIO_COMMAND_NOTE: u8 = 0x26;
 pub const CIO_OBSERVATION_LIMIT: usize = 128;
 pub const CIO_READ_PREVIEW_LIMIT: usize = 80;
 pub const RUNAD: u16 = 0x02E2;
@@ -2169,6 +2174,34 @@ impl Cpu {
                 bus.finish_cio_observation(observation);
                 false
             }
+            CIO_COMMAND_NOTE => {
+                if let Some(offset) = bus.note_host_position(self.registers.x) {
+                    observation.handled = true;
+                    observation.detail = format!("note host offset {offset}");
+                    observation.result_a = Some(self.registers.a);
+                    observation.result_y = Some(0x01);
+                    bus.finish_cio_observation(observation);
+                    self.return_from_ciov(bus, self.registers.a, 0x01);
+                    return true;
+                }
+                observation.detail = "note passthrough".to_string();
+                bus.finish_cio_observation(observation);
+                false
+            }
+            CIO_COMMAND_POINT => {
+                if let Some(offset) = bus.point_host_position(self.registers.x) {
+                    observation.handled = true;
+                    observation.detail = format!("point host offset {offset}");
+                    observation.result_a = Some(self.registers.a);
+                    observation.result_y = Some(0x01);
+                    bus.finish_cio_observation(observation);
+                    self.return_from_ciov(bus, self.registers.a, 0x01);
+                    return true;
+                }
+                observation.detail = "point passthrough".to_string();
+                bus.finish_cio_observation(observation);
+                false
+            }
             CIO_COMMAND_PUTCHR | CIO_COMMAND_PUTREC => {
                 if let Some(written) =
                     bus.write_host_bytes_for_iocb(self.registers.x, self.registers.a)
@@ -3354,6 +3387,42 @@ impl Bus {
             detail: format!("read host record {written} byte(s)"),
             preview: format_cio_preview(&preview),
         })
+    }
+
+    fn note_host_position(&mut self, x: u8) -> Option<usize> {
+        let CioHarnessDevice::Host { offset, .. } = self.cio_channel_device(x)? else {
+            return None;
+        };
+        let sector = offset / 256;
+        self.ram
+            .write(IOCB_AUX3_BASE.wrapping_add(x as u16), (sector & 0xFF) as u8);
+        self.ram.write(
+            IOCB_AUX4_BASE.wrapping_add(x as u16),
+            ((sector >> 8) & 0xFF) as u8,
+        );
+        self.ram
+            .write(IOCB_AUX5_BASE.wrapping_add(x as u16), (offset & 0xFF) as u8);
+        Some(offset)
+    }
+
+    fn point_host_position(&mut self, x: u8) -> Option<usize> {
+        let channel = cio_channel_index(x)?;
+        let CioHarnessDevice::Host { file_index, .. } = self.cio_harness_devices[channel]? else {
+            return None;
+        };
+        let sector = u16::from_le_bytes([
+            self.ram.read(IOCB_AUX3_BASE.wrapping_add(x as u16)),
+            self.ram.read(IOCB_AUX4_BASE.wrapping_add(x as u16)),
+        ]);
+        let byte = self.ram.read(IOCB_AUX5_BASE.wrapping_add(x as u16));
+        let offset = usize::from(sector)
+            .saturating_mul(256)
+            .saturating_add(usize::from(byte));
+        if offset > self.host_files.get(file_index)?.bytes.len() {
+            return None;
+        }
+        self.cio_harness_devices[channel] = Some(CioHarnessDevice::Host { file_index, offset });
+        Some(offset)
     }
 
     fn write_host_bytes_for_iocb(&mut self, x: u8, accumulator: u8) -> Option<usize> {
@@ -6540,6 +6609,34 @@ mod tests {
             Some(CioHarnessDevice::Host {
                 file_index: 0,
                 offset: 0
+            })
+        );
+    }
+
+    #[test]
+    fn host_note_and_point_round_trip_the_file_cursor() {
+        let mut bus = Bus::default();
+        bus.add_host_file("DATA.BIN", vec![0; 400]);
+        bus.cio_harness_devices[1] = Some(CioHarnessDevice::Host {
+            file_index: 0,
+            offset: 300,
+        });
+
+        assert_eq!(bus.note_host_position(0x10), Some(300));
+        assert_eq!(bus.ram().read(IOCB_AUX3_BASE + 0x10), 1);
+        assert_eq!(bus.ram().read(IOCB_AUX4_BASE + 0x10), 0);
+        assert_eq!(bus.ram().read(IOCB_AUX5_BASE + 0x10), 44);
+
+        bus.cio_harness_devices[1] = Some(CioHarnessDevice::Host {
+            file_index: 0,
+            offset: 0,
+        });
+        assert_eq!(bus.point_host_position(0x10), Some(300));
+        assert_eq!(
+            bus.cio_channel_device(0x10),
+            Some(CioHarnessDevice::Host {
+                file_index: 0,
+                offset: 300
             })
         );
     }
