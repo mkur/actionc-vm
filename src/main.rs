@@ -181,6 +181,9 @@ impl VmRunHooks for CliRunHooks<'_> {
     }
 
     fn stop_reason(&self, vm: &actionc_vm::CompilerVm, step: &CpuStep) -> Option<StopReason> {
+        if self.options.stop_on_dos_ready && vm.bus().dos_boot_is_ready() {
+            return Some(StopReason::DosReady { pc: step.pc });
+        }
         (self.options.stop_on_input_idle
             && self.scheduled_actions.pending().is_empty()
             && self.deferred_source_injections.is_empty()
@@ -383,6 +386,7 @@ fn describe_stop(stop: StopReason) -> (String, Option<String>) {
             "scripted input consumed; VM is waiting for input".to_string(),
             None,
         ),
+        StopReason::DosReady { .. } => ("DOS installed its native D: handler".to_string(), None),
         StopReason::UnsupportedOpcode { pc, opcode } => {
             let reason = format!("unsupported opcode ${opcode:02X} at ${pc:04X}");
             (reason.clone(), Some(reason))
@@ -557,6 +561,7 @@ struct CliOptions {
     execution_profile: ExecutionProfile,
     max_steps: u64,
     stop_on_input_idle: bool,
+    stop_on_dos_ready: bool,
     trace_pc: bool,
     trace_ranges: Vec<AddressRange>,
     trace_until: Option<u16>,
@@ -656,6 +661,7 @@ impl Default for CliOptions {
             execution_profile: ExecutionProfile::OriginalCompiler,
             max_steps: 1_000,
             stop_on_input_idle: false,
+            stop_on_dos_ready: false,
             trace_pc: false,
             trace_ranges: Vec::new(),
             trace_until: None,
@@ -701,6 +707,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
     let mut execution_profile = ExecutionProfile::OriginalCompiler;
     let mut max_steps = 1_000;
     let mut stop_on_input_idle = false;
+    let mut stop_on_dos_ready = false;
     let mut trace_pc = false;
     let mut trace_ranges = Vec::new();
     let mut trace_until = None;
@@ -749,6 +756,9 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
             }
             "--stop-on-input-idle" => {
                 stop_on_input_idle = true;
+            }
+            "--stop-on-dos-ready" => {
+                stop_on_dos_ready = true;
             }
             "--trace-pc" => {
                 trace_pc = true;
@@ -1008,6 +1018,7 @@ fn parse_options(args: Vec<String>) -> Result<CliOptions, String> {
         execution_profile,
         max_steps,
         stop_on_input_idle,
+        stop_on_dos_ready,
         trace_pc,
         trace_ranges,
         trace_until,
@@ -1056,9 +1067,10 @@ fn parse_execution_profile(value: &str) -> Result<ExecutionProfile, String> {
         "original-compiler" => Ok(ExecutionProfile::OriginalCompiler),
         "cartridge-object" => Ok(ExecutionProfile::CartridgeObject),
         "standalone-object" => Ok(ExecutionProfile::StandaloneObject),
+        "disk-boot" => Ok(ExecutionProfile::DiskBoot),
         "synthetic-test" => Ok(ExecutionProfile::SyntheticTest),
         other => Err(format!(
-            "unknown execution profile `{other}`; expected original-compiler, cartridge-object, standalone-object, or synthetic-test"
+            "unknown execution profile `{other}`; expected original-compiler, cartridge-object, standalone-object, disk-boot, or synthetic-test"
         )),
     }
 }
@@ -2619,13 +2631,14 @@ fn print_help() {
          Options:\n  \
          --preset <name>      Mapping preset, currently action-os\n  \
          --profile <name>     Execution profile: original-compiler (default),\n  \
-                              cartridge-object, or standalone-object\n  \
+                              cartridge-object, standalone-object, or disk-boot\n  \
          --cart <path>        Override bundled Action! 3.6 cartridge image\n  \
          --cart-base <addr>   Cartridge base address, default $A000\n  \
          --os <path>          Override bundled AltirraOS with an OS ROM image\n  \
          --os-base <addr>     OS ROM base address, default $C000\n  \
          --max-cycles <n>     Run at most n CPU steps, default 1000\n  \
          --stop-on-input-idle Stop after scripted input is consumed and Action! waits for more\n  \
+         --stop-on-dos-ready Stop after disk boot installs DOS vectors and a D: handler\n  \
          --trace-pc           Print one line per executed instruction\n  \
          --trace-range <a:b>  Print instructions with PC inside the range\n  \
          --trace-until <addr> Stop after executing an instruction at addr\n  \
@@ -2722,6 +2735,13 @@ mod tests {
         let options = parse_options(vec!["--stop-on-input-idle".to_string()]).unwrap();
 
         assert!(options.stop_on_input_idle);
+    }
+
+    #[test]
+    fn parses_stop_on_dos_ready_option() {
+        let options = parse_options(vec!["--stop-on-dos-ready".to_string()]).unwrap();
+
+        assert!(options.stop_on_dos_ready);
     }
 
     #[test]
@@ -3206,6 +3226,16 @@ mod tests {
             ExecutionProfile::StandaloneObject
         );
         validate_cli_execution(&options).unwrap();
+
+        let disk_boot = parse_options(vec![
+            "--profile".to_string(),
+            "disk-boot".to_string(),
+            "--disk".to_string(),
+            "1:mydos.atr".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(disk_boot.execution_profile, ExecutionProfile::DiskBoot);
+        validate_cli_execution(&disk_boot).unwrap();
     }
 
     #[test]
@@ -3225,6 +3255,13 @@ mod tests {
             validate_cli_execution(&options)
                 .unwrap_err()
                 .contains("library-only")
+        );
+
+        options.execution_profile = ExecutionProfile::DiskBoot;
+        assert!(
+            validate_cli_execution(&options)
+                .unwrap_err()
+                .contains("drive 1")
         );
 
         let error =

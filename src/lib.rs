@@ -8,7 +8,7 @@ mod memory;
 mod object;
 mod runner;
 
-pub use atr::{AtrImage, DiskWritePolicy, MountedDisk};
+pub use atr::{AtrImage, BUNDLED_MYDOS_ATR, DiskWritePolicy, MountedDisk};
 use images::{
     BUNDLED_ACTION_CARTRIDGE, BUNDLED_ACTION_CARTRIDGE_LABEL, BUNDLED_ALTIRRA_OS,
     BUNDLED_ALTIRRA_OS_LABEL, checksum16, crc32,
@@ -30,6 +30,7 @@ pub const SELF_TEST_BASE: u16 = 0x5000;
 pub const SELF_TEST_SIZE: usize = 0x0800;
 pub const BOOTQ_SUCCESSFUL_BOOT_FLAG: u16 = 0x0009;
 pub const DOSVEC_START_VECTOR: u16 = 0x000A;
+pub const DOSINI_INITIALIZATION_VECTOR: u16 = 0x000C;
 pub const BRKKEY_BREAK_KEY_FLAG: u16 = 0x0011;
 pub const PORTB: u16 = 0xD301;
 pub const PACTL_PORTA_CONTROL: u16 = 0xD302;
@@ -79,6 +80,7 @@ pub const ACTION_LINE_ALLOC_OVERHEAD: u16 = 7;
 pub const RECVDN_RECEIVE_DONE_FLAG: u16 = 0x0039;
 pub const XMTDON_TRANSMISSION_DONE_FLAG: u16 = 0x003A;
 pub const TIMFLG_TIMEOUT_FLAG: u16 = 0x0317;
+pub const HATABS_HANDLER_TABLE: u16 = 0x031A;
 pub const CONSOL: u16 = 0xD01F;
 pub const CONSOL_NO_KEYS: u8 = 0x07;
 pub const SEROUT_SERIAL_OUTPUT: u16 = 0xD20D;
@@ -153,6 +155,8 @@ pub enum ExecutionProfile {
     CartridgeObject,
     /// Runs an Atari object whose emitted code is self-contained.
     StandaloneObject,
+    /// Boots an Atari DOS from a mounted drive through the installed OS ROM.
+    DiskBoot,
     /// Runs caller-installed memory and register state without external images.
     SyntheticTest,
 }
@@ -170,6 +174,10 @@ pub enum CioFallbackPolicy {
 impl ExecutionProfile {
     fn requires_cartridge_services(self) -> bool {
         matches!(self, Self::OriginalCompiler | Self::CartridgeObject)
+    }
+
+    fn requires_os_rom(self) -> bool {
+        self.requires_cartridge_services() || self == Self::DiskBoot
     }
 }
 
@@ -225,7 +233,12 @@ impl VmConfig {
         self.validate_for_profile(ExecutionProfile::OriginalCompiler)
     }
 
-    pub fn validate_for_profile(&self, _profile: ExecutionProfile) -> Result<(), String> {
+    pub fn validate_for_profile(&self, profile: ExecutionProfile) -> Result<(), String> {
+        if profile == ExecutionProfile::DiskBoot
+            && !self.disks.iter().any(|(unit, _, _)| *unit == 1)
+        {
+            return Err("DiskBoot requires an ATR mounted on drive 1".to_string());
+        }
         Ok(())
     }
 
@@ -267,6 +280,10 @@ impl VmConfig {
             if vm.bus().os_rom().is_none() {
                 vm.load_bundled_altirra_os_at(self.os_base)?;
             }
+        } else if profile.is_some_and(ExecutionProfile::requires_os_rom)
+            && vm.bus().os_rom().is_none()
+        {
+            vm.load_bundled_altirra_os_at(self.os_base)?;
         }
 
         for hotpatch in &self.hotpatches {
@@ -294,6 +311,10 @@ impl VmConfig {
         }
         vm.set_trace_cio(self.trace_cio);
         vm.set_trace_sio(self.trace_sio);
+        if let Some(profile) = profile {
+            vm.apply_execution_profile_policies(profile);
+            vm.validate_execution_profile(profile)?;
+        }
 
         Ok(vm)
     }
@@ -380,6 +401,12 @@ impl CompilerVm {
         if profile.requires_cartridge_services() && self.bus.os_rom().is_none() {
             return Err(format!("{profile:?} requires an Atari OS ROM image"));
         }
+        if profile == ExecutionProfile::DiskBoot && self.bus.os_rom().is_none() {
+            return Err("DiskBoot requires an Atari OS ROM image".to_string());
+        }
+        if profile == ExecutionProfile::DiskBoot && self.bus.mounted_disk(1).is_none() {
+            return Err("DiskBoot requires an ATR mounted on drive 1".to_string());
+        }
         Ok(())
     }
 
@@ -410,8 +437,21 @@ impl CompilerVm {
         if profile.requires_cartridge_services() {
             self.load_bundled_action_cartridge()?;
             self.load_bundled_altirra_os()?;
+        } else if profile.requires_os_rom() {
+            self.load_bundled_altirra_os()?;
         }
+        self.apply_execution_profile_policies(profile);
         self.validate_execution_profile(profile)
+    }
+
+    fn apply_execution_profile_policies(&mut self, profile: ExecutionProfile) {
+        let disk_boot = profile == ExecutionProfile::DiskBoot;
+        self.bus.set_disk_boot_mode(disk_boot);
+        self.bus.set_cio_fallback_policy(if disk_boot {
+            CioFallbackPolicy::NativeOs
+        } else {
+            CioFallbackPolicy::Headless
+        });
     }
 
     pub fn set_pc(&mut self, pc: u16) {
@@ -519,6 +559,10 @@ impl CompilerVm {
         policy: DiskWritePolicy,
     ) -> Result<(), String> {
         self.bus.mount_atr_bytes(unit, bytes, policy)
+    }
+
+    pub fn mount_bundled_mydos(&mut self, unit: u8, policy: DiskWritePolicy) -> Result<(), String> {
+        self.mount_atr_bytes(unit, BUNDLED_MYDOS_ATR.to_vec(), policy)
     }
 
     pub fn mounted_atr_bytes(&self, unit: u8) -> Option<Vec<u8>> {
@@ -2644,6 +2688,7 @@ pub struct Bus {
     sio_observations: VecDeque<SioObservation>,
     sio_timeout_pending: bool,
     redirect_disk_boot_to_cart: bool,
+    disk_boot_mode: bool,
     self_test_rom_enabled: bool,
 }
 
@@ -2681,6 +2726,7 @@ impl Default for Bus {
             sio_observations: VecDeque::new(),
             sio_timeout_pending: false,
             redirect_disk_boot_to_cart: false,
+            disk_boot_mode: false,
             self_test_rom_enabled: true,
         }
     }
@@ -2887,6 +2933,43 @@ impl Bus {
 
     pub fn cio_fallback_policy(&self) -> CioFallbackPolicy {
         self.cio_fallback_policy
+    }
+
+    pub fn disk_boot_mode(&self) -> bool {
+        self.disk_boot_mode
+    }
+
+    pub fn cio_handler_address(&self, device: u8) -> Option<u16> {
+        for index in 0..12u16 {
+            let entry = HATABS_HANDLER_TABLE.wrapping_add(index * 3);
+            let entry_device = self.ram.read(entry);
+            if entry_device == 0 {
+                return None;
+            }
+            if entry_device == device {
+                let address = self.ram.read_word(entry.wrapping_add(1));
+                return (address != 0).then_some(address);
+            }
+        }
+        None
+    }
+
+    /// Reports that a disk boot completed far enough to publish DOS vectors
+    /// and install a native `D:` handler in HATABS.
+    pub fn dos_boot_is_ready(&self) -> bool {
+        self.disk_boot_mode
+            && self.ram.read(BOOTQ_SUCCESSFUL_BOOT_FLAG) == 1
+            && self.ram.read_word(DOSVEC_START_VECTOR) != 0
+            && self.ram.read_word(DOSINI_INITIALIZATION_VECTOR) != 0
+            && self.cio_handler_address(b'D').is_some()
+    }
+
+    fn set_disk_boot_mode(&mut self, enabled: bool) {
+        self.disk_boot_mode = enabled;
+        if enabled {
+            self.sio_timeout_pending = false;
+            self.redirect_disk_boot_to_cart = false;
+        }
     }
 
     pub fn cio_channel0_output(&self) -> &[u8] {
@@ -3233,6 +3316,9 @@ impl Bus {
             self.ram.write(XMTDON_TRANSMISSION_DONE_FLAG, 0xFF);
             self.ram.write(RECVDN_RECEIVE_DONE_FLAG, 0x00);
             self.sio_timeout_pending = true;
+            if self.disk_boot_mode {
+                self.sio_timeout_pending = false;
+            }
         }
         if self.redirect_disk_boot_to_cart
             && (address == BOOTQ_SUCCESSFUL_BOOT_FLAG
@@ -5297,6 +5383,12 @@ mod tests {
         VmConfig::default()
             .validate_for_profile(ExecutionProfile::SyntheticTest)
             .unwrap();
+        assert!(
+            VmConfig::default()
+                .validate_for_profile(ExecutionProfile::DiskBoot)
+                .unwrap_err()
+                .contains("drive 1")
+        );
     }
 
     #[test]
@@ -5352,6 +5444,69 @@ mod tests {
         assert_eq!(vm.images()[1].path, PathBuf::from(BUNDLED_ALTIRRA_OS_LABEL));
         assert_eq!(vm.images()[1].metadata.checksum16, 0x4D75);
         assert_eq!(vm.images()[1].metadata.crc32, 0x5890_AE8E);
+
+        let mut disk_boot = CompilerVm::default();
+        disk_boot
+            .mount_atr_bytes(1, test_atr_bytes(128, 720), DiskWritePolicy::ReadOnly)
+            .unwrap();
+        disk_boot
+            .prepare_execution_profile(ExecutionProfile::DiskBoot)
+            .unwrap();
+        assert!(disk_boot.bus().cartridge().is_none());
+        assert!(disk_boot.bus().os_rom().is_some());
+        assert!(disk_boot.bus().disk_boot_mode());
+        assert_eq!(
+            disk_boot.bus().cio_fallback_policy(),
+            CioFallbackPolicy::NativeOs
+        );
+        assert_eq!(disk_boot.images().len(), 1);
+        assert_eq!(
+            disk_boot.images()[0].path,
+            PathBuf::from(BUNDLED_ALTIRRA_OS_LABEL)
+        );
+    }
+
+    #[test]
+    fn bundled_mydos_reaches_a_reproducible_native_dos_ready_state() {
+        let mut vm = CompilerVm::default();
+        vm.mount_bundled_mydos(1, DiskWritePolicy::ReadOnly)
+            .unwrap();
+        vm.prepare_execution_profile(ExecutionProfile::DiskBoot)
+            .unwrap();
+        vm.reset_cpu();
+
+        let mut steps = 0u64;
+        while steps < 400_000 && !vm.bus().dos_boot_is_ready() {
+            vm.step_cpu().unwrap();
+            steps += 1;
+        }
+
+        assert!(
+            vm.bus().dos_boot_is_ready(),
+            "MyDOS was not ready after {steps} steps"
+        );
+        assert!(vm.bus().cartridge().is_none());
+        assert_eq!(vm.bus().ram().read_word(DOSVEC_START_VECTOR), 0x1B52);
+        assert_eq!(
+            vm.bus().ram().read_word(DOSINI_INITIALIZATION_VECTOR),
+            0x07E0
+        );
+        assert_eq!(vm.bus().cio_handler_address(b'D'), Some(0x07D4));
+        assert!(vm.bus().sio_observations().iter().all(|observation| {
+            matches!(
+                observation.command,
+                SIO_COMMAND_STATUS | SIO_COMMAND_READ_SECTOR
+            ) && matches!(
+                observation.status,
+                SIO_STATUS_SUCCESS | SIO_STATUS_DEVICE_TIMEOUT
+            )
+        }));
+        assert!(
+            vm.bus()
+                .sio_observations()
+                .iter()
+                .any(|observation| observation.command == SIO_COMMAND_READ_SECTOR)
+        );
     }
 
     #[test]
@@ -5381,6 +5536,11 @@ mod tests {
             .unwrap();
         vm.validate_execution_profile(ExecutionProfile::SyntheticTest)
             .unwrap();
+        assert!(
+            vm.validate_execution_profile(ExecutionProfile::DiskBoot)
+                .unwrap_err()
+                .contains("OS ROM")
+        );
         assert!(
             vm.validate_execution_profile(ExecutionProfile::OriginalCompiler)
                 .unwrap_err()

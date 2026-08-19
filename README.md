@@ -43,11 +43,12 @@ Choose the narrowest profile that supplies the services used by the program:
 | `OriginalCompiler` | Bundled Action! 3.6 and AltirraOS | Cartridge boot | Drive and inspect the original Action! compiler |
 | `CartridgeObject` | Bundled Action! 3.6 and AltirraOS | Object `RUNAD` | Run generated code that calls Action! or OS services |
 | `StandaloneObject` | Not required | Object `RUNAD` | Run self-contained generated code |
+| `DiskBoot` | Bundled AltirraOS, no cartridge required | OS reset vector | Boot DOS from an ATR mounted on drive 1 |
 | `SyntheticTest` | Not required | Caller-defined state | Small library-only CPU and bus tests |
 
-The CLI spells the first three profiles as `original-compiler`,
-`cartridge-object`, and `standalone-object`. `original-compiler` is the CLI
-default; `synthetic-test` is library-only.
+The CLI spells these profiles as `original-compiler`, `cartridge-object`,
+`standalone-object`, and `disk-boot`. `original-compiler` is the CLI default;
+`synthetic-test` is library-only.
 
 ## Quick start
 
@@ -90,6 +91,21 @@ cargo run -- run \
   --max-steps 1000 \
   --trace-pc
 ```
+
+Boot a DOS ATR through the high-level SIO disk service:
+
+```sh
+cargo run -- run \
+  --profile disk-boot \
+  --disk 1:path/to/mydos.atr \
+  --max-steps 1000000 \
+  --trace-sio
+```
+
+ATR mounts are read-only by default. The VM services disk status and sector
+reads at the OS `SIOV` boundary, preserving real DOS filesystem behavior
+without emulating serial timing. `--stop-on-dos-ready` stops after DOS publishes
+its vectors and installs a native `D:` handler.
 
 Cartridge-backed profiles use embedded Action! 3.6 and AltirraOS XL/XE 3.11
 images. Pass `--cart path/to/custom-action.rom` or
@@ -134,6 +150,11 @@ fn run_object(object: &[u8]) -> Result<u8, String> {
 Use `CompilerVm::load_bundled_action_cartridge` and
 `CompilerVm::load_bundled_altirra_os` to install the defaults explicitly, or
 `CompilerVm::load_image_bytes` for custom cartridge, OS, and other images.
+`mount_atr_bytes` installs a caller-owned ATR on a numbered drive and exposes
+bounded `SioObservation` records for disk traffic. `mount_bundled_mydos`
+provides the repository's audited MyDOS 4.53/3 fixture; its license,
+provenance, and corresponding source are recorded in
+[`disks/MYDOS-NOTICE.md`](disks/MYDOS-NOTICE.md).
 `add_host_file_bytes`, `add_host_output`, and `host_file_bytes` provide
 in-memory host I/O. `ScheduledActions` supplies PC-triggered keys, CIO data,
 and source injection. `RunOutcome` retains the final VM together with a typed

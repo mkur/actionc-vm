@@ -209,6 +209,9 @@ pub enum StopReason {
     ScriptedInputIdle {
         pc: u16,
     },
+    DosReady {
+        pc: u16,
+    },
     Halted,
     UnsupportedOpcode {
         pc: u16,

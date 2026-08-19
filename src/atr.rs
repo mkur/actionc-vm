@@ -3,6 +3,8 @@ const ATR_MAGIC: u16 = 0x0296;
 const BOOT_SECTOR_COUNT: usize = 3;
 const BOOT_SECTOR_SIZE: usize = 128;
 
+pub static BUNDLED_MYDOS_ATR: &[u8] = include_bytes!("../disks/mydos.atr");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskWritePolicy {
     ReadOnly,
