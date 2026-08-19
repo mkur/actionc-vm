@@ -2226,6 +2226,34 @@ impl Cpu {
     fn adc(&mut self, value: u8) {
         let carry = u8::from(self.flag(StatusFlags::CARRY));
         let lhs = self.registers.a;
+
+        if self.flag(StatusFlags::DECIMAL) {
+            // The Atari uses an NMOS 6502. Its decimal result is BCD-adjusted,
+            // while N, V, and Z retain the original chip's intermediate/binary
+            // behavior rather than describing the final adjusted byte.
+            let binary_result = lhs.wrapping_add(value).wrapping_add(carry);
+            let mut low_nibble = (lhs & 0x0F) + (value & 0x0F) + carry;
+            let low_carry = low_nibble > 9;
+            if low_carry {
+                low_nibble = low_nibble.wrapping_sub(10) & 0x0F;
+            }
+
+            let mut high_nibble = (lhs >> 4) + (value >> 4) + u8::from(low_carry);
+            let negative = high_nibble & 0x08 != 0;
+            let overflow = ((lhs >= 0x80) ^ negative) && ((value >= 0x80) ^ negative);
+            let high_carry = high_nibble > 9;
+            if high_carry {
+                high_nibble = high_nibble.wrapping_sub(10) & 0x0F;
+            }
+
+            self.registers.a = (high_nibble << 4) | low_nibble;
+            self.set_flag(StatusFlags::NEGATIVE, negative);
+            self.set_flag(StatusFlags::OVERFLOW, overflow);
+            self.set_flag(StatusFlags::ZERO, binary_result == 0);
+            self.set_flag(StatusFlags::CARRY, high_carry);
+            return;
+        }
+
         let sum = lhs as u16 + value as u16 + carry as u16;
         let result = sum as u8;
         self.set_flag(StatusFlags::CARRY, sum > 0xFF);
@@ -2240,6 +2268,36 @@ impl Cpu {
     fn sbc(&mut self, value: u8) {
         let borrow = u8::from(!self.flag(StatusFlags::CARRY));
         let lhs = self.registers.a;
+
+        if self.flag(StatusFlags::DECIMAL) {
+            // NMOS decimal subtraction reports N, V, and Z from the binary
+            // subtraction even though the accumulator receives a BCD result.
+            let binary_result = lhs.wrapping_sub(value).wrapping_sub(borrow);
+            let negative = binary_result & 0x80 != 0;
+            let overflow = ((lhs >= 0x80) ^ negative) && ((value < 0x80) ^ negative);
+
+            let mut low_nibble = (lhs & 0x0F).wrapping_sub(value & 0x0F).wrapping_sub(borrow);
+            let low_borrow = low_nibble >= 0x80;
+            if low_borrow {
+                low_nibble = low_nibble.wrapping_add(10) & 0x0F;
+            }
+
+            let mut high_nibble = (lhs >> 4)
+                .wrapping_sub(value >> 4)
+                .wrapping_sub(u8::from(low_borrow));
+            let high_borrow = high_nibble >= 0x80;
+            if high_borrow {
+                high_nibble = high_nibble.wrapping_add(10) & 0x0F;
+            }
+
+            self.registers.a = (high_nibble << 4) | low_nibble;
+            self.set_flag(StatusFlags::NEGATIVE, negative);
+            self.set_flag(StatusFlags::OVERFLOW, overflow);
+            self.set_flag(StatusFlags::ZERO, binary_result == 0);
+            self.set_flag(StatusFlags::CARRY, !high_borrow);
+            return;
+        }
+
         let result = lhs.wrapping_sub(value).wrapping_sub(borrow);
         self.set_flag(
             StatusFlags::CARRY,
@@ -6421,6 +6479,161 @@ mod tests {
         assert_eq!(cpu.registers().pc, 0x2000);
         assert_eq!(bus.cio_channel0_output(), b"OK\x9B");
         assert_eq!(bus.decoded_cio_channel0_output(), "OK\n");
+    }
+
+    fn packed_bcd(value: u16) -> u8 {
+        (((value / 10) << 4) | (value % 10)) as u8
+    }
+
+    #[test]
+    fn cpu_decimal_adc_produces_valid_packed_bcd_results() {
+        for lhs in 0..=99 {
+            for rhs in 0..=99 {
+                for carry_in in [false, true] {
+                    let mut cpu = Cpu::default();
+                    cpu.registers.a = packed_bcd(lhs);
+                    cpu.set_flag(StatusFlags::DECIMAL, true);
+                    cpu.set_flag(StatusFlags::CARRY, carry_in);
+
+                    cpu.adc(packed_bcd(rhs));
+
+                    let sum = lhs + rhs + u16::from(carry_in);
+                    assert_eq!(
+                        cpu.registers.a,
+                        packed_bcd(sum % 100),
+                        "{lhs:02} + {rhs:02} + {}",
+                        u8::from(carry_in)
+                    );
+                    assert_eq!(
+                        cpu.flag(StatusFlags::CARRY),
+                        sum >= 100,
+                        "carry for {lhs:02} + {rhs:02} + {}",
+                        u8::from(carry_in)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_decimal_sbc_produces_valid_packed_bcd_results() {
+        for lhs in 0..=99 {
+            for rhs in 0..=99 {
+                for carry_in in [false, true] {
+                    let mut cpu = Cpu::default();
+                    cpu.registers.a = packed_bcd(lhs);
+                    cpu.set_flag(StatusFlags::DECIMAL, true);
+                    cpu.set_flag(StatusFlags::CARRY, carry_in);
+
+                    cpu.sbc(packed_bcd(rhs));
+
+                    let difference = lhs as i16 - rhs as i16 - i16::from(!carry_in);
+                    let wrapped = difference.rem_euclid(100) as u16;
+                    assert_eq!(
+                        cpu.registers.a,
+                        packed_bcd(wrapped),
+                        "{lhs:02} - {rhs:02} - {}",
+                        u8::from(!carry_in)
+                    );
+                    assert_eq!(
+                        cpu.flag(StatusFlags::CARRY),
+                        difference >= 0,
+                        "carry for {lhs:02} - {rhs:02} - {}",
+                        u8::from(!carry_in)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_decimal_arithmetic_preserves_nmos_flag_behavior() {
+        let mut cpu = Cpu::default();
+        cpu.registers.a = 0x50;
+        cpu.set_flag(StatusFlags::DECIMAL, true);
+        cpu.set_flag(StatusFlags::CARRY, false);
+
+        cpu.adc(0x50);
+
+        assert_eq!(cpu.registers.a, 0x00);
+        assert!(cpu.flag(StatusFlags::CARRY));
+        assert!(cpu.flag(StatusFlags::NEGATIVE));
+        assert!(cpu.flag(StatusFlags::OVERFLOW));
+        assert!(!cpu.flag(StatusFlags::ZERO));
+
+        cpu.registers.a = 0x80;
+        cpu.set_flag(StatusFlags::CARRY, true);
+        cpu.sbc(0x01);
+
+        assert_eq!(cpu.registers.a, 0x79);
+        assert!(cpu.flag(StatusFlags::CARRY));
+        assert!(!cpu.flag(StatusFlags::NEGATIVE));
+        assert!(cpu.flag(StatusFlags::OVERFLOW));
+        assert!(!cpu.flag(StatusFlags::ZERO));
+
+        cpu.registers.a = 0x00;
+        cpu.set_flag(StatusFlags::CARRY, true);
+        cpu.sbc(0x00);
+
+        assert_eq!(cpu.registers.a, 0x00);
+        assert!(cpu.flag(StatusFlags::CARRY));
+        assert!(cpu.flag(StatusFlags::ZERO));
+    }
+
+    #[test]
+    fn bundled_atari_os_converts_integer_to_ascii() {
+        const INTEGER_TO_FLOAT: u16 = 0xD9AA;
+        const FLOAT_TO_ASCII: u16 = 0xD8E6;
+        const FLOAT_REGISTER: u16 = 0x00D4;
+        const ASCII_BUFFER_POINTER: u16 = 0x00F3;
+        const PROGRAM_START: u16 = 0x0200;
+        const PROGRAM_END: u16 = 0x020E;
+
+        let mut bus = Bus::default();
+        bus.map_os_rom(OS_ROM_BASE, BUNDLED_ALTIRRA_OS.to_vec())
+            .unwrap();
+        bus.ram_mut()
+            .map(
+                PROGRAM_START,
+                &[
+                    0xA9,
+                    0xD2, // LDA #<$04D2
+                    0x85,
+                    FLOAT_REGISTER as u8, // STA FR0
+                    0xA9,
+                    0x04, // LDA #>$04D2
+                    0x85,
+                    FLOAT_REGISTER as u8 + 1, // STA FR0+1
+                    0x20,
+                    INTEGER_TO_FLOAT as u8,
+                    (INTEGER_TO_FLOAT >> 8) as u8,
+                    0x20,
+                    FLOAT_TO_ASCII as u8,
+                    (FLOAT_TO_ASCII >> 8) as u8,
+                ],
+            )
+            .unwrap();
+        let mut cpu = Cpu::default();
+        cpu.registers.pc = PROGRAM_START;
+
+        for _ in 0..50_000 {
+            if cpu.registers.pc == PROGRAM_END {
+                break;
+            }
+            cpu.step(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.registers.pc, PROGRAM_END);
+
+        let buffer = bus.ram().read_word(ASCII_BUFFER_POINTER);
+        let mut ascii = Vec::new();
+        for offset in 0..16 {
+            let byte = bus.read(buffer.wrapping_add(offset));
+            ascii.push(byte & 0x7F);
+            if byte & 0x80 != 0 {
+                break;
+            }
+        }
+        assert_eq!(ascii, b"1234");
     }
 
     #[test]
