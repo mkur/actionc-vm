@@ -5223,6 +5223,136 @@ mod tests {
     use super::*;
 
     const TN_STANDALONE_OBJECT: &[u8] = include_bytes!("../tests/fixtures/tn-standalone.com");
+    const TN_FILE_COUNT: u16 = 0x2C61;
+    const TN_NEST_LEVEL: u16 = 0x2C62;
+    const TN_ACTIVE_PANEL: u16 = 0x2C71;
+    const TN_SWAP_RIGHT_KEY: u8 = 0x07;
+    const TN_SWAP_LEFT_KEY: u8 = 0x06;
+    const TN_VIEW_KEY: u8 = 0x50;
+    const TN_COPY_KEY: u8 = 0x52;
+    const TN_KEYBOARD_WAIT_PC: u16 = 0xFE77;
+    const TN_UI_STEP_LIMIT: usize = 15_000_000;
+
+    struct TnHarness {
+        vm: CompilerVm,
+    }
+
+    impl TnHarness {
+        fn boot_bundled(disks: &[(u8, DiskWritePolicy)]) -> Self {
+            let mut vm = CompilerVm::default();
+            for (unit, policy) in disks {
+                vm.mount_bundled_mydos(*unit, *policy).unwrap();
+            }
+            vm.prepare_execution_profile(ExecutionProfile::DiskBoot)
+                .unwrap();
+            vm.reset_cpu();
+            let mut harness = Self { vm };
+            harness.wait_until("MyDOS command prompt", 400_000, |vm| {
+                vm.bus().dos_boot_is_ready() && vm.cpu().registers().pc == 0xEA2D
+            });
+            harness
+        }
+
+        fn launch(&mut self) {
+            self.vm.bus_mut().ram_mut().write(0x070A, 0xFF);
+            let report = self.vm.load_atari_object(TN_STANDALONE_OBJECT).unwrap();
+            self.vm.set_pc(report.run_address.unwrap());
+            self.wait_for_keyboard("TN main screen");
+            self.assert_screen_contains("Toms Navigator");
+        }
+
+        fn wait_until<F>(&mut self, context: &str, max_steps: usize, mut predicate: F)
+        where
+            F: FnMut(&CompilerVm) -> bool,
+        {
+            for _ in 0..max_steps {
+                if predicate(&self.vm) {
+                    return;
+                }
+                self.vm.step_cpu().unwrap();
+            }
+            if predicate(&self.vm) {
+                return;
+            }
+            panic!(
+                "timed out waiting for {context}; PC=${:04X}\n{}",
+                self.vm.cpu().registers().pc,
+                self.screen_text()
+            );
+        }
+
+        fn wait_for_keyboard(&mut self, context: &str) {
+            self.wait_until(context, TN_UI_STEP_LIMIT, |vm| {
+                // The bundled AltirraOS waits for K: input at $FE77. Requiring
+                // both the hardware latch and VM queue to be empty prevents a
+                // multi-key command from looking complete between characters.
+                vm.cpu().registers().pc == TN_KEYBOARD_WAIT_PC
+                    && vm.bus().ram().read(CH_KEY_CODE) == 0xFF
+                    && vm.bus().pending_key_codes.is_empty()
+            });
+        }
+
+        fn send_key(&mut self, key_code: u8, context: &str) {
+            self.vm.bus_mut().queue_key_code(key_code);
+            self.wait_for_keyboard(context);
+        }
+
+        fn send_text(&mut self, characters: &[u8], context: &str) {
+            queue_keyboard_text(&mut self.vm, characters);
+            self.wait_for_keyboard(context);
+        }
+
+        fn switch_panel(&mut self, panel: u8) {
+            assert!(panel <= 1);
+            if self.vm.bus().ram().read(TN_ACTIVE_PANEL) != panel {
+                let key = if panel == 0 {
+                    TN_SWAP_LEFT_KEY
+                } else {
+                    TN_SWAP_RIGHT_KEY
+                };
+                self.send_key(key, "TN panel switch");
+            }
+            assert_eq!(self.vm.bus().ram().read(TN_ACTIVE_PANEL), panel);
+        }
+
+        fn select_drive(&mut self, unit: u8) {
+            assert!((1..=8).contains(&unit));
+            self.send_text(&[b'0' + unit], "TN drive selection");
+            self.assert_screen_contains(&format!("D{unit}>"));
+        }
+
+        fn assert_screen_contains(&self, needle: &str) {
+            assert!(
+                self.vm
+                    .bus()
+                    .text_screen_snapshot(40, 24)
+                    .lines
+                    .iter()
+                    .any(|line| line.contains(needle)),
+                "screen does not contain `{needle}`; PC=${:04X}\n{}",
+                self.vm.cpu().registers().pc,
+                self.screen_text()
+            );
+        }
+
+        fn assert_screen_lacks(&self, needle: &str) {
+            assert!(
+                self.vm
+                    .bus()
+                    .text_screen_snapshot(40, 24)
+                    .lines
+                    .iter()
+                    .all(|line| !line.contains(needle)),
+                "screen still contains `{needle}`; PC=${:04X}\n{}",
+                self.vm.cpu().registers().pc,
+                self.screen_text()
+            );
+        }
+
+        fn screen_text(&self) -> String {
+            self.vm.bus().text_screen_snapshot(40, 24).lines.join("\n")
+        }
+    }
 
     fn test_atr_bytes(sector_size: usize, sectors: usize) -> Vec<u8> {
         let payload = if sector_size == 128 {
@@ -5407,39 +5537,6 @@ mod tests {
         bytes
     }
 
-    fn run_until_screen_contains(vm: &mut CompilerVm, needle: &str, max_steps: usize) -> bool {
-        for step in 0..max_steps {
-            vm.step_cpu().unwrap();
-            if step % 1024 == 0
-                && vm
-                    .bus()
-                    .text_screen_snapshot(40, 24)
-                    .lines
-                    .iter()
-                    .any(|line| line.contains(needle))
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn run_until_cio_output_contains(vm: &mut CompilerVm, needle: &[u8], max_steps: usize) -> bool {
-        for step in 0..max_steps {
-            vm.step_cpu().unwrap();
-            if step % 1024 == 0
-                && vm
-                    .bus()
-                    .cio_channel0_output()
-                    .windows(needle.len())
-                    .any(|window| window == needle)
-            {
-                return true;
-            }
-        }
-        false
-    }
-
     fn queue_keyboard_text(vm: &mut CompilerVm, characters: &[u8]) {
         let table = vm.bus().ram().read_word(0x0079);
         let key_codes = characters
@@ -5455,23 +5552,6 @@ mod tests {
         for key_code in key_codes {
             vm.bus_mut().queue_key_code(key_code);
         }
-    }
-
-    fn run_until_screen_lacks(vm: &mut CompilerVm, needle: &str, max_steps: usize) -> bool {
-        for step in 0..max_steps {
-            vm.step_cpu().unwrap();
-            if step % 1024 == 0
-                && vm
-                    .bus()
-                    .text_screen_snapshot(40, 24)
-                    .lines
-                    .iter()
-                    .all(|line| !line.contains(needle))
-            {
-                return true;
-            }
-        }
-        false
     }
 
     #[test]
@@ -6280,20 +6360,9 @@ mod tests {
 
     #[test]
     fn tn_standalone_renders_a_structurally_valid_main_screen() {
-        let mut vm = boot_bundled_mydos_to_prompt(DiskWritePolicy::ReadOnly);
-        vm.bus_mut().ram_mut().write(0x070A, 0xFF);
-        let report = vm.load_atari_object(TN_STANDALONE_OBJECT).unwrap();
-        vm.set_pc(report.run_address.unwrap());
-
-        assert!(run_until_screen_contains(
-            &mut vm,
-            "Toms Navigator",
-            5_000_000
-        ));
-        for _ in 0..300_000 {
-            vm.step_cpu().unwrap();
-        }
-        let screen = vm.bus().text_screen_snapshot(40, 24);
+        let mut tn = TnHarness::boot_bundled(&[(1, DiskWritePolicy::ReadOnly)]);
+        tn.launch();
+        let screen = tn.vm.bus().text_screen_snapshot(40, 24);
         assert_eq!(screen.columns, 40);
         assert_eq!(screen.rows, 24);
         assert_eq!(screen.lines.len(), 24);
@@ -6353,48 +6422,23 @@ mod tests {
     fn tn_standalone_browses_views_and_copies_a_large_file_through_mydos() {
         const SOURCE_NAME: &[u8] = b"D1:AATEST.TXT\x9B";
         const DESTINATION_NAME: &[u8] = b"D2:AATEST.TXT\x9B";
-        const TN_ACTIVE_PANEL: u16 = 0x2C71;
-        const SWAP_RIGHT_KEY: u8 = 0x07;
-        const SWAP_LEFT_KEY: u8 = 0x06;
-        const DRIVE_2_KEY: u8 = 0x1E;
-        const VIEW_KEY: u8 = 0x50;
-        const COPY_KEY: u8 = 0x52;
-
-        let mut vm = CompilerVm::default();
-        vm.mount_bundled_mydos(1, DiskWritePolicy::CopyOnWrite)
-            .unwrap();
-        vm.mount_bundled_mydos(2, DiskWritePolicy::CopyOnWrite)
-            .unwrap();
-        vm.prepare_execution_profile(ExecutionProfile::DiskBoot)
-            .unwrap();
-        vm.reset_cpu();
-        for _ in 0..400_000 {
-            if vm.bus().dos_boot_is_ready() && vm.cpu().registers().pc == 0xEA2D {
-                break;
-            }
-            vm.step_cpu().unwrap();
-        }
-        assert_eq!(vm.cpu().registers().pc, 0xEA2D);
+        let mut tn = TnHarness::boot_bundled(&[
+            (1, DiskWritePolicy::CopyOnWrite),
+            (2, DiskWritePolicy::CopyOnWrite),
+        ]);
 
         let mut contents = Vec::with_capacity(24_500);
         while contents.len() < 24_350 {
             contents.extend_from_slice(b"TN LARGE FILE EXERCISES BUFFERED CIO\x9B");
         }
         contents.extend_from_slice(b"VIEW-CONTENT-END\x9B");
-        native_write_file(&mut vm, SOURCE_NAME, &contents);
+        native_write_file(&mut tn.vm, SOURCE_NAME, &contents);
+        tn.launch();
+        tn.assert_screen_contains("AATEST");
 
-        // Disable MyDOS's absent D8 RAM disk. TN will initially show D1 in
-        // both panels; the scripted UI then assigns the right panel to D2.
-        vm.bus_mut().ram_mut().write(0x070A, 0xFF);
-        let report = vm.load_atari_object(TN_STANDALONE_OBJECT).unwrap();
-        vm.set_pc(report.run_address.unwrap());
-
-        assert!(run_until_screen_contains(&mut vm, "AATEST", 5_000_000));
-        for _ in 0..300_000 {
-            vm.step_cpu().unwrap();
-        }
-        let tn_buffer = vm.bus().ram().read_word(0x2C4A);
-        let transfer_capacity = vm
+        let tn_buffer = tn.vm.bus().ram().read_word(0x2C4A);
+        let transfer_capacity = tn
+            .vm
             .bus()
             .ram()
             .read_word(MEMTOP_OS_TOP_OF_FREE_MEMORY)
@@ -6405,69 +6449,28 @@ mod tests {
             contents.len()
         );
 
-        vm.bus_mut().queue_key_code(SWAP_RIGHT_KEY);
-        for _ in 0..1_000_000 {
-            vm.step_cpu().unwrap();
-            if vm.bus().ram().read(TN_ACTIVE_PANEL) == 1 {
-                break;
-            }
-        }
-        assert_eq!(vm.bus().ram().read(TN_ACTIVE_PANEL), 1);
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
+        tn.switch_panel(1);
+        tn.select_drive(2);
+        tn.switch_panel(0);
 
-        vm.bus_mut().queue_key_code(DRIVE_2_KEY);
+        tn.send_key(TN_VIEW_KEY, "TN file viewer");
         assert!(
-            run_until_screen_contains(&mut vm, "D2>", 5_000_000),
-            "panel={}, PC=${:04X}\n{}",
-            vm.bus().ram().read(TN_ACTIVE_PANEL),
-            vm.cpu().registers().pc,
-            vm.bus().text_screen_snapshot(40, 24).lines.join("\n")
+            tn.vm
+                .bus()
+                .cio_channel0_output()
+                .windows(b"VIEW-CONTENT-END".len())
+                .any(|window| window == b"VIEW-CONTENT-END"),
+            "captured {} byte(s)",
+            tn.vm.bus().cio_channel0_output().len()
         );
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
+        tn.send_text(b"\x9B", "return from TN file viewer");
+        tn.assert_screen_contains("AATEST");
 
-        vm.bus_mut().queue_key_code(SWAP_LEFT_KEY);
-        for _ in 0..1_000_000 {
-            vm.step_cpu().unwrap();
-            if vm.bus().ram().read(TN_ACTIVE_PANEL) == 0 {
-                break;
-            }
-        }
-        assert_eq!(
-            vm.bus().ram().read(TN_ACTIVE_PANEL),
-            0,
-            "{}",
-            vm.bus().text_screen_snapshot(40, 24).lines.join("\n")
-        );
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
-
-        vm.bus_mut().queue_key_code(VIEW_KEY);
-        assert!(
-            run_until_cio_output_contains(&mut vm, b"VIEW-CONTENT-END", 12_000_000),
-            "PC=${:04X}, captured {} byte(s)",
-            vm.cpu().registers().pc,
-            vm.bus().cio_channel0_output().len()
-        );
-
-        vm.bus_mut().queue_key_code(ATARI_KEY_RETURN);
-        assert!(run_until_screen_contains(&mut vm, "AATEST", 5_000_000));
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
-
-        vm.bus_mut().queue_key_code(COPY_KEY);
-        for _ in 0..12_000_000 {
-            vm.step_cpu().unwrap();
-        }
-        let copied = native_read_file(&mut vm, DESTINATION_NAME, contents.len());
+        tn.send_key(TN_COPY_KEY, "TN cross-drive copy");
+        let copied = native_read_file(&mut tn.vm, DESTINATION_NAME, contents.len());
         assert_eq!(copied, contents);
-        assert!(vm.disk_is_dirty(2));
-        assert!(vm.bus().sio_observations().iter().all(|observation| {
+        assert!(tn.vm.disk_is_dirty(2));
+        assert!(tn.vm.bus().sio_observations().iter().all(|observation| {
             observation.handled
                 && matches!(
                     observation.status,
@@ -6482,164 +6485,50 @@ mod tests {
         const COPIED_NAME: &[u8] = b"D2:TARGET:ACOPY.TXT\x9B";
         const RENAMED_NAME: &[u8] = b"D2:TARGET:RENAMED.TXT\x9B";
         const CONTENTS: &[u8] = b"TN CROSS-DRIVE SUBDIRECTORY WORKFLOW";
-        const TN_FILE_COUNT: u16 = 0x2C61;
-        const TN_NEST_LEVEL: u16 = 0x2C62;
-        const TN_ACTIVE_PANEL: u16 = 0x2C71;
-        const SWAP_RIGHT_KEY: u8 = 0x07;
-        const SWAP_LEFT_KEY: u8 = 0x06;
-        const DRIVE_2_KEY: u8 = 0x1E;
-        const COPY_KEY: u8 = 0x52;
+        let mut tn = TnHarness::boot_bundled(&[
+            (1, DiskWritePolicy::CopyOnWrite),
+            (2, DiskWritePolicy::CopyOnWrite),
+        ]);
+        native_write_file(&mut tn.vm, SOURCE_NAME, CONTENTS);
+        tn.launch();
+        tn.assert_screen_contains("ACOPY");
 
-        let mut vm = CompilerVm::default();
-        vm.mount_bundled_mydos(1, DiskWritePolicy::CopyOnWrite)
-            .unwrap();
-        vm.mount_bundled_mydos(2, DiskWritePolicy::CopyOnWrite)
-            .unwrap();
-        vm.prepare_execution_profile(ExecutionProfile::DiskBoot)
-            .unwrap();
-        vm.reset_cpu();
-        for _ in 0..400_000 {
-            if vm.bus().dos_boot_is_ready() && vm.cpu().registers().pc == 0xEA2D {
-                break;
-            }
-            vm.step_cpu().unwrap();
-        }
-        assert_eq!(vm.cpu().registers().pc, 0xEA2D);
-        native_write_file(&mut vm, SOURCE_NAME, CONTENTS);
+        tn.switch_panel(1);
+        tn.select_drive(2);
+        tn.send_text(b"M", "TN subdirectory dialog");
+        tn.assert_screen_contains("Subdirectory");
+        tn.send_text(b"TARGET\x9B", "TN subdirectory creation");
+        tn.assert_screen_contains("TARGET");
+        tn.send_text(b"\x9B", "enter TN destination subdirectory");
+        assert_eq!(tn.vm.bus().ram().read(TN_NEST_LEVEL), 1);
+        assert_eq!(tn.vm.bus().ram().read(TN_FILE_COUNT), 0);
 
-        vm.bus_mut().ram_mut().write(0x070A, 0xFF);
-        let report = vm.load_atari_object(TN_STANDALONE_OBJECT).unwrap();
-        vm.set_pc(report.run_address.unwrap());
-        assert!(run_until_screen_contains(&mut vm, "ACOPY", 5_000_000));
-        for _ in 0..300_000 {
-            vm.step_cpu().unwrap();
-        }
+        tn.switch_panel(0);
+        tn.send_key(TN_COPY_KEY, "TN subdirectory copy");
 
-        vm.bus_mut().queue_key_code(SWAP_RIGHT_KEY);
-        for _ in 0..1_000_000 {
-            vm.step_cpu().unwrap();
-            if vm.bus().ram().read(TN_ACTIVE_PANEL) == 1 {
-                break;
-            }
-        }
-        assert_eq!(vm.bus().ram().read(TN_ACTIVE_PANEL), 1);
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
-        vm.bus_mut().queue_key_code(DRIVE_2_KEY);
-        assert!(
-            run_until_screen_contains(&mut vm, "D2>", 5_000_000),
-            "PC=${:04X}\n{}",
-            vm.cpu().registers().pc,
-            vm.bus().text_screen_snapshot(40, 24).lines.join("\n")
-        );
-        for _ in 0..200_000 {
-            vm.step_cpu().unwrap();
-        }
-
-        queue_keyboard_text(&mut vm, b"M");
-        assert!(run_until_screen_contains(
-            &mut vm,
-            "Subdirectory",
-            2_000_000
-        ));
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
-        queue_keyboard_text(&mut vm, b"TARGET\x9B");
-        assert!(run_until_screen_contains(&mut vm, "TARGET", 5_000_000));
-        for _ in 0..200_000 {
-            vm.step_cpu().unwrap();
-        }
-
-        queue_keyboard_text(&mut vm, b"\x9B");
-        for _ in 0..5_000_000 {
-            vm.step_cpu().unwrap();
-            if vm.bus().ram().read(TN_NEST_LEVEL) == 1 {
-                break;
-            }
-        }
-        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 1);
-        for _ in 0..200_000 {
-            vm.step_cpu().unwrap();
-        }
-        assert_eq!(vm.bus().ram().read(TN_FILE_COUNT), 0);
-
-        vm.bus_mut().queue_key_code(SWAP_LEFT_KEY);
-        for _ in 0..1_000_000 {
-            vm.step_cpu().unwrap();
-            if vm.bus().ram().read(TN_ACTIVE_PANEL) == 0 {
-                break;
-            }
-        }
-        assert_eq!(vm.bus().ram().read(TN_ACTIVE_PANEL), 0);
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
-        vm.bus_mut().queue_key_code(COPY_KEY);
-        for _ in 0..12_000_000 {
-            vm.step_cpu().unwrap();
-        }
-
-        vm.bus_mut().queue_key_code(SWAP_RIGHT_KEY);
-        for _ in 0..1_000_000 {
-            vm.step_cpu().unwrap();
-            if vm.bus().ram().read(TN_ACTIVE_PANEL) == 1 {
-                break;
-            }
-        }
-        assert_eq!(vm.bus().ram().read(TN_ACTIVE_PANEL), 1);
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
-        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 1);
-
+        tn.switch_panel(1);
+        assert_eq!(tn.vm.bus().ram().read(TN_NEST_LEVEL), 1);
         // The destination panel was empty when it was first opened, before
         // the copy. Return to D2's root and re-enter it to make TN reread it.
-        queue_keyboard_text(&mut vm, b"\x1B");
-        for _ in 0..5_000_000 {
-            vm.step_cpu().unwrap();
-            if vm.bus().ram().read(TN_NEST_LEVEL) == 0 {
-                break;
-            }
-        }
-        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 0);
-        for _ in 0..200_000 {
-            vm.step_cpu().unwrap();
-        }
-        assert!(run_until_screen_contains(&mut vm, "TARGET", 2_000_000));
+        tn.send_text(b"\x1B", "leave TN destination subdirectory");
+        assert_eq!(tn.vm.bus().ram().read(TN_NEST_LEVEL), 0);
+        tn.assert_screen_contains("TARGET");
+        tn.send_text(b"\x9B", "re-enter TN destination subdirectory");
+        assert_eq!(tn.vm.bus().ram().read(TN_NEST_LEVEL), 1);
+        assert_eq!(tn.vm.bus().ram().read(TN_FILE_COUNT), 1);
 
-        queue_keyboard_text(&mut vm, b"\x9B");
-        for _ in 0..5_000_000 {
-            vm.step_cpu().unwrap();
-            if vm.bus().ram().read(TN_NEST_LEVEL) == 1 {
-                break;
-            }
-        }
-        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 1);
-        for _ in 0..200_000 {
-            vm.step_cpu().unwrap();
-        }
-        assert_eq!(vm.bus().ram().read(TN_FILE_COUNT), 1);
+        tn.send_text(b"R", "TN rename dialog");
+        tn.assert_screen_contains("Rename");
+        tn.send_text(b"RENAMED.TXT\x9B", "TN rename completion");
+        tn.assert_screen_contains("RENAMED");
 
-        queue_keyboard_text(&mut vm, b"R");
-        assert!(run_until_screen_contains(&mut vm, "Rename", 2_000_000));
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
-        queue_keyboard_text(&mut vm, b"RENAMED.TXT\x9B");
-        assert!(run_until_screen_contains(&mut vm, "RENAMED", 5_000_000));
-        for _ in 0..200_000 {
-            vm.step_cpu().unwrap();
-        }
-
-        assert!(native_file_open_status(&mut vm, COPIED_NAME) >= 0x80);
+        assert!(native_file_open_status(&mut tn.vm, COPIED_NAME) >= 0x80);
         assert_eq!(
-            native_read_file(&mut vm, RENAMED_NAME, CONTENTS.len()),
+            native_read_file(&mut tn.vm, RENAMED_NAME, CONTENTS.len()),
             CONTENTS
         );
-        assert!(vm.disk_is_dirty(2));
-        assert!(vm.bus().sio_observations().iter().all(|observation| {
+        assert!(tn.vm.disk_is_dirty(2));
+        assert!(tn.vm.bus().sio_observations().iter().all(|observation| {
             observation.handled
                 && matches!(
                     observation.status,
@@ -6650,142 +6539,43 @@ mod tests {
 
     #[test]
     fn tn_standalone_mutates_files_and_directories_through_its_ui() {
-        const TN_NEST_LEVEL: u16 = 0x2C62;
-        const TN_ENTRY_POINTERS: u16 = 0x2C4C;
+        let mut tn = TnHarness::boot_bundled(&[(1, DiskWritePolicy::CopyOnWrite)]);
+        native_write_file(&mut tn.vm, b"D1:AOLD.TXT\x9B", b"TN UI MUTATION");
+        native_write_file(&mut tn.vm, b"D1:BLOCK.TXT\x9B", b"ATTRIBUTE TARGET");
+        tn.launch();
+        tn.assert_screen_contains("AOLD");
 
-        let mut vm = boot_bundled_mydos_to_prompt(DiskWritePolicy::CopyOnWrite);
-        native_write_file(&mut vm, b"D1:AOLD.TXT\x9B", b"TN UI MUTATION");
-        native_write_file(&mut vm, b"D1:BLOCK.TXT\x9B", b"ATTRIBUTE TARGET");
-        vm.bus_mut().ram_mut().write(0x070A, 0xFF);
-        let report = vm.load_atari_object(TN_STANDALONE_OBJECT).unwrap();
-        vm.set_pc(report.run_address.unwrap());
+        tn.send_text(b"R", "TN rename dialog");
+        tn.assert_screen_contains("Rename");
+        tn.send_text(b"ANEW.TXT\x9B", "TN rename completion");
+        tn.assert_screen_contains("ANEW");
 
-        assert!(run_until_screen_contains(&mut vm, "AOLD", 5_000_000));
-        for _ in 0..300_000 {
-            vm.step_cpu().unwrap();
-        }
+        tn.send_text(b"D", "TN delete confirmation");
+        tn.assert_screen_contains("Delete");
+        tn.send_text(b"D", "TN delete completion");
+        tn.assert_screen_lacks("ANEW");
 
-        queue_keyboard_text(&mut vm, b"R");
-        assert!(run_until_screen_contains(&mut vm, "Rename", 2_000_000));
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
-        queue_keyboard_text(&mut vm, b"ANEW.TXT\x9B");
-        assert!(
-            run_until_screen_contains(&mut vm, "ANEW", 5_000_000),
-            "PC=${:04X}\n{}",
-            vm.cpu().registers().pc,
-            vm.bus().text_screen_snapshot(40, 24).lines.join("\n")
-        );
-        for _ in 0..200_000 {
-            vm.step_cpu().unwrap();
-        }
+        tn.send_text(b"A", "TN attribute toggle");
+        tn.assert_screen_contains("*BLOCK");
+        tn.send_text(b"A", "TN attribute restore");
+        tn.assert_screen_lacks("*BLOCK");
 
-        queue_keyboard_text(&mut vm, b"D");
-        assert!(run_until_screen_contains(&mut vm, "Delete", 2_000_000));
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
-        queue_keyboard_text(&mut vm, b"D");
-        assert!(
-            run_until_screen_lacks(&mut vm, "ANEW", 5_000_000),
-            "PC=${:04X}\n{}",
-            vm.cpu().registers().pc,
-            vm.bus().text_screen_snapshot(40, 24).lines.join("\n")
-        );
-        for _ in 0..200_000 {
-            vm.step_cpu().unwrap();
-        }
+        tn.send_text(b"M", "TN subdirectory dialog");
+        tn.assert_screen_contains("Subdirectory");
+        tn.send_text(b"SUBDIR\x9B", "TN subdirectory creation");
+        tn.assert_screen_contains("SUBDIR");
+        tn.send_text(b"\x9B", "enter TN subdirectory");
+        assert_eq!(tn.vm.bus().ram().read(TN_NEST_LEVEL), 1);
+        tn.send_text(b"\x1B", "leave TN subdirectory");
+        assert_eq!(tn.vm.bus().ram().read(TN_NEST_LEVEL), 0);
 
-        let selected_entry = vm
-            .bus()
-            .ram()
-            .read_word(vm.bus().ram().read_word(TN_ENTRY_POINTERS));
-        let original_attribute = vm.bus().ram().read(selected_entry.wrapping_add(1)) & 0x20;
-        queue_keyboard_text(&mut vm, b"A");
-        for _ in 0..5_000_000 {
-            vm.step_cpu().unwrap();
-            let entry = vm
-                .bus()
-                .ram()
-                .read_word(vm.bus().ram().read_word(TN_ENTRY_POINTERS));
-            if vm.bus().ram().read(entry.wrapping_add(1)) & 0x20 != original_attribute {
-                break;
-            }
-        }
-        let selected_entry = vm
-            .bus()
-            .ram()
-            .read_word(vm.bus().ram().read_word(TN_ENTRY_POINTERS));
-        assert_ne!(
-            vm.bus().ram().read(selected_entry.wrapping_add(1)) & 0x20,
-            original_attribute
-        );
-        queue_keyboard_text(&mut vm, b"A");
-        for _ in 0..5_000_000 {
-            vm.step_cpu().unwrap();
-            let entry = vm
-                .bus()
-                .ram()
-                .read_word(vm.bus().ram().read_word(TN_ENTRY_POINTERS));
-            if vm.bus().ram().read(entry.wrapping_add(1)) & 0x20 == original_attribute {
-                break;
-            }
-        }
-        let selected_entry = vm
-            .bus()
-            .ram()
-            .read_word(vm.bus().ram().read_word(TN_ENTRY_POINTERS));
+        assert!(native_file_open_status(&mut tn.vm, b"D1:ANEW.TXT\x9B") >= 0x80);
+        assert_eq!(native_file_open_status(&mut tn.vm, b"D1:BLOCK.TXT\x9B"), 1);
         assert_eq!(
-            vm.bus().ram().read(selected_entry.wrapping_add(1)) & 0x20,
-            original_attribute
-        );
-        for _ in 0..200_000 {
-            vm.step_cpu().unwrap();
-        }
-
-        queue_keyboard_text(&mut vm, b"M");
-        assert!(run_until_screen_contains(
-            &mut vm,
-            "Subdirectory",
-            2_000_000
-        ));
-        for _ in 0..100_000 {
-            vm.step_cpu().unwrap();
-        }
-        queue_keyboard_text(&mut vm, b"SUBDIR\x9B");
-        assert!(run_until_screen_contains(&mut vm, "SUBDIR", 5_000_000));
-        for _ in 0..200_000 {
-            vm.step_cpu().unwrap();
-        }
-
-        queue_keyboard_text(&mut vm, b"\x9B");
-        for _ in 0..5_000_000 {
-            vm.step_cpu().unwrap();
-            if vm.bus().ram().read(TN_NEST_LEVEL) == 1 {
-                break;
-            }
-        }
-        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 1);
-        for _ in 0..200_000 {
-            vm.step_cpu().unwrap();
-        }
-        queue_keyboard_text(&mut vm, b"\x1B");
-        for _ in 0..5_000_000 {
-            vm.step_cpu().unwrap();
-            if vm.bus().ram().read(TN_NEST_LEVEL) == 0 {
-                break;
-            }
-        }
-        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 0);
-
-        assert!(native_file_open_status(&mut vm, b"D1:ANEW.TXT\x9B") >= 0x80);
-        assert_eq!(native_file_open_status(&mut vm, b"D1:BLOCK.TXT\x9B"), 1);
-        assert_eq!(
-            native_cio_filename_command(&mut vm, 41, b"D1:SUBDIR\x9B", 0, 0),
+            native_cio_filename_command(&mut tn.vm, 41, b"D1:SUBDIR\x9B", 0, 0),
             1
         );
-        assert!(vm.disk_is_dirty(1));
+        assert!(tn.vm.disk_is_dirty(1));
     }
 
     #[test]
