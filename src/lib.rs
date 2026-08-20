@@ -6279,6 +6279,77 @@ mod tests {
     }
 
     #[test]
+    fn tn_standalone_renders_a_structurally_valid_main_screen() {
+        let mut vm = boot_bundled_mydos_to_prompt(DiskWritePolicy::ReadOnly);
+        vm.bus_mut().ram_mut().write(0x070A, 0xFF);
+        let report = vm.load_atari_object(TN_STANDALONE_OBJECT).unwrap();
+        vm.set_pc(report.run_address.unwrap());
+
+        assert!(run_until_screen_contains(
+            &mut vm,
+            "Toms Navigator",
+            5_000_000
+        ));
+        for _ in 0..300_000 {
+            vm.step_cpu().unwrap();
+        }
+        let screen = vm.bus().text_screen_snapshot(40, 24);
+        assert_eq!(screen.columns, 40);
+        assert_eq!(screen.rows, 24);
+        assert_eq!(screen.lines.len(), 24);
+        assert!(screen.lines.iter().all(|line| line.len() == 40));
+
+        // Keep the release fields flexible: both the version and copyright
+        // year change independently of the main-screen layout.
+        let release = screen.lines[0]
+            .strip_prefix("Toms Navigator ")
+            .and_then(|line| line.strip_suffix(" M.Kurcewicz"))
+            .expect("TN title should retain its stable name and author");
+        let (version, year) = release
+            .split_once(" (c) ")
+            .expect("TN title should separate version and copyright year");
+        assert!(!version.is_empty());
+        assert!(
+            version
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        );
+        assert_eq!(year.len(), 4);
+        assert!(year.bytes().all(|byte| byte.is_ascii_digit()));
+
+        let expected_body = [
+            "D1:                                     ",
+            ".   D1>         D- ..   D1>         D- .",
+            "........................................",
+            ".  DOS     .SYS.018..  DOS     .SYS.018.",
+            ".  DUP     .SYS.027..  DUP     .SYS.027.",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            ".          .   .   ..          .   .   .",
+            "........................................",
+            ".663 FREE SECTORS  ..663 FREE SECTORS  .",
+            "........................................",
+            "New Copy Del Ren Atr View Mkdir Fmt Quit",
+        ];
+        let actual_body = screen.lines[1..]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(actual_body, expected_body);
+    }
+
+    #[test]
     fn tn_standalone_browses_views_and_copies_a_large_file_through_mydos() {
         const SOURCE_NAME: &[u8] = b"D1:AATEST.TXT\x9B";
         const DESTINATION_NAME: &[u8] = b"D2:AATEST.TXT\x9B";
@@ -6395,6 +6466,178 @@ mod tests {
         }
         let copied = native_read_file(&mut vm, DESTINATION_NAME, contents.len());
         assert_eq!(copied, contents);
+        assert!(vm.disk_is_dirty(2));
+        assert!(vm.bus().sio_observations().iter().all(|observation| {
+            observation.handled
+                && matches!(
+                    observation.status,
+                    SIO_STATUS_SUCCESS | SIO_STATUS_DEVICE_TIMEOUT
+                )
+        }));
+    }
+
+    #[test]
+    fn tn_standalone_creates_d2_subdirectory_copies_and_renames_file() {
+        const SOURCE_NAME: &[u8] = b"D1:ACOPY.TXT\x9B";
+        const COPIED_NAME: &[u8] = b"D2:TARGET:ACOPY.TXT\x9B";
+        const RENAMED_NAME: &[u8] = b"D2:TARGET:RENAMED.TXT\x9B";
+        const CONTENTS: &[u8] = b"TN CROSS-DRIVE SUBDIRECTORY WORKFLOW";
+        const TN_FILE_COUNT: u16 = 0x2C61;
+        const TN_NEST_LEVEL: u16 = 0x2C62;
+        const TN_ACTIVE_PANEL: u16 = 0x2C71;
+        const SWAP_RIGHT_KEY: u8 = 0x07;
+        const SWAP_LEFT_KEY: u8 = 0x06;
+        const DRIVE_2_KEY: u8 = 0x1E;
+        const COPY_KEY: u8 = 0x52;
+
+        let mut vm = CompilerVm::default();
+        vm.mount_bundled_mydos(1, DiskWritePolicy::CopyOnWrite)
+            .unwrap();
+        vm.mount_bundled_mydos(2, DiskWritePolicy::CopyOnWrite)
+            .unwrap();
+        vm.prepare_execution_profile(ExecutionProfile::DiskBoot)
+            .unwrap();
+        vm.reset_cpu();
+        for _ in 0..400_000 {
+            if vm.bus().dos_boot_is_ready() && vm.cpu().registers().pc == 0xEA2D {
+                break;
+            }
+            vm.step_cpu().unwrap();
+        }
+        assert_eq!(vm.cpu().registers().pc, 0xEA2D);
+        native_write_file(&mut vm, SOURCE_NAME, CONTENTS);
+
+        vm.bus_mut().ram_mut().write(0x070A, 0xFF);
+        let report = vm.load_atari_object(TN_STANDALONE_OBJECT).unwrap();
+        vm.set_pc(report.run_address.unwrap());
+        assert!(run_until_screen_contains(&mut vm, "ACOPY", 5_000_000));
+        for _ in 0..300_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        vm.bus_mut().queue_key_code(SWAP_RIGHT_KEY);
+        for _ in 0..1_000_000 {
+            vm.step_cpu().unwrap();
+            if vm.bus().ram().read(TN_ACTIVE_PANEL) == 1 {
+                break;
+            }
+        }
+        assert_eq!(vm.bus().ram().read(TN_ACTIVE_PANEL), 1);
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+        vm.bus_mut().queue_key_code(DRIVE_2_KEY);
+        assert!(
+            run_until_screen_contains(&mut vm, "D2>", 5_000_000),
+            "PC=${:04X}\n{}",
+            vm.cpu().registers().pc,
+            vm.bus().text_screen_snapshot(40, 24).lines.join("\n")
+        );
+        for _ in 0..200_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        queue_keyboard_text(&mut vm, b"M");
+        assert!(run_until_screen_contains(
+            &mut vm,
+            "Subdirectory",
+            2_000_000
+        ));
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+        queue_keyboard_text(&mut vm, b"TARGET\x9B");
+        assert!(run_until_screen_contains(&mut vm, "TARGET", 5_000_000));
+        for _ in 0..200_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        queue_keyboard_text(&mut vm, b"\x9B");
+        for _ in 0..5_000_000 {
+            vm.step_cpu().unwrap();
+            if vm.bus().ram().read(TN_NEST_LEVEL) == 1 {
+                break;
+            }
+        }
+        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 1);
+        for _ in 0..200_000 {
+            vm.step_cpu().unwrap();
+        }
+        assert_eq!(vm.bus().ram().read(TN_FILE_COUNT), 0);
+
+        vm.bus_mut().queue_key_code(SWAP_LEFT_KEY);
+        for _ in 0..1_000_000 {
+            vm.step_cpu().unwrap();
+            if vm.bus().ram().read(TN_ACTIVE_PANEL) == 0 {
+                break;
+            }
+        }
+        assert_eq!(vm.bus().ram().read(TN_ACTIVE_PANEL), 0);
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+        vm.bus_mut().queue_key_code(COPY_KEY);
+        for _ in 0..12_000_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        vm.bus_mut().queue_key_code(SWAP_RIGHT_KEY);
+        for _ in 0..1_000_000 {
+            vm.step_cpu().unwrap();
+            if vm.bus().ram().read(TN_ACTIVE_PANEL) == 1 {
+                break;
+            }
+        }
+        assert_eq!(vm.bus().ram().read(TN_ACTIVE_PANEL), 1);
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 1);
+
+        // The destination panel was empty when it was first opened, before
+        // the copy. Return to D2's root and re-enter it to make TN reread it.
+        queue_keyboard_text(&mut vm, b"\x1B");
+        for _ in 0..5_000_000 {
+            vm.step_cpu().unwrap();
+            if vm.bus().ram().read(TN_NEST_LEVEL) == 0 {
+                break;
+            }
+        }
+        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 0);
+        for _ in 0..200_000 {
+            vm.step_cpu().unwrap();
+        }
+        assert!(run_until_screen_contains(&mut vm, "TARGET", 2_000_000));
+
+        queue_keyboard_text(&mut vm, b"\x9B");
+        for _ in 0..5_000_000 {
+            vm.step_cpu().unwrap();
+            if vm.bus().ram().read(TN_NEST_LEVEL) == 1 {
+                break;
+            }
+        }
+        assert_eq!(vm.bus().ram().read(TN_NEST_LEVEL), 1);
+        for _ in 0..200_000 {
+            vm.step_cpu().unwrap();
+        }
+        assert_eq!(vm.bus().ram().read(TN_FILE_COUNT), 1);
+
+        queue_keyboard_text(&mut vm, b"R");
+        assert!(run_until_screen_contains(&mut vm, "Rename", 2_000_000));
+        for _ in 0..100_000 {
+            vm.step_cpu().unwrap();
+        }
+        queue_keyboard_text(&mut vm, b"RENAMED.TXT\x9B");
+        assert!(run_until_screen_contains(&mut vm, "RENAMED", 5_000_000));
+        for _ in 0..200_000 {
+            vm.step_cpu().unwrap();
+        }
+
+        assert!(native_file_open_status(&mut vm, COPIED_NAME) >= 0x80);
+        assert_eq!(
+            native_read_file(&mut vm, RENAMED_NAME, CONTENTS.len()),
+            CONTENTS
+        );
         assert!(vm.disk_is_dirty(2));
         assert!(vm.bus().sio_observations().iter().all(|observation| {
             observation.handled
