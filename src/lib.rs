@@ -5223,6 +5223,7 @@ mod tests {
     use super::*;
 
     const TN_STANDALONE_OBJECT: &[u8] = include_bytes!("../tests/fixtures/tn-standalone.com");
+    const TN_LAUNCH_MARKER_OBJECT: &[u8] = include_bytes!("../tests/fixtures/tn-launch-marker.com");
     const TN_FILE_COUNT: u16 = 0x2C61;
     const TN_NEST_LEVEL: u16 = 0x2C62;
     const TN_ACTIVE_PANEL: u16 = 0x2C71;
@@ -5319,6 +5320,12 @@ mod tests {
             assert!((1..=8).contains(&unit));
             self.send_text(&[b'0' + unit], "TN drive selection");
             self.assert_screen_contains(&format!("D{unit}>"));
+        }
+
+        fn wait_for_byte(&mut self, address: u16, value: u8, context: &str) {
+            self.wait_until(context, TN_UI_STEP_LIMIT, |vm| {
+                vm.bus().ram().read(address) == value
+            });
         }
 
         fn assert_screen_contains(&self, needle: &str) {
@@ -6477,6 +6484,144 @@ mod tests {
                     SIO_STATUS_SUCCESS | SIO_STATUS_DEVICE_TIMEOUT
                 )
         }));
+    }
+
+    #[test]
+    fn tn_standalone_copies_multiple_tagged_files_to_d2() {
+        const FIRST: &[u8] = b"FIRST TAGGED FILE";
+        const SECOND: &[u8] = b"SECOND TAGGED FILE";
+        let mut tn = TnHarness::boot_bundled(&[
+            (1, DiskWritePolicy::CopyOnWrite),
+            (2, DiskWritePolicy::CopyOnWrite),
+        ]);
+        native_write_file(&mut tn.vm, b"D1:AAONE.TXT\x9B", FIRST);
+        native_write_file(&mut tn.vm, b"D1:AATWO.TXT\x9B", SECOND);
+        tn.launch();
+        tn.assert_screen_contains("AAONE");
+        tn.assert_screen_contains("AATWO");
+
+        tn.switch_panel(1);
+        tn.select_drive(2);
+        tn.switch_panel(0);
+        tn.send_text(b" ", "tag first TN source file");
+        tn.send_text(b" ", "tag second TN source file");
+        tn.send_key(TN_COPY_KEY, "TN tagged multi-file copy");
+
+        assert_eq!(
+            native_read_file(&mut tn.vm, b"D2:AAONE.TXT\x9B", FIRST.len()),
+            FIRST
+        );
+        assert_eq!(
+            native_read_file(&mut tn.vm, b"D2:AATWO.TXT\x9B", SECOND.len()),
+            SECOND
+        );
+    }
+
+    #[test]
+    fn tn_standalone_formats_d2_through_its_ui() {
+        let mut tn = TnHarness::boot_bundled(&[
+            (1, DiskWritePolicy::CopyOnWrite),
+            (2, DiskWritePolicy::CopyOnWrite),
+        ]);
+        native_write_file(&mut tn.vm, b"D2:ERASE.TXT\x9B", b"FORMAT REMOVES THIS");
+        tn.launch();
+        tn.switch_panel(1);
+        tn.select_drive(2);
+        tn.assert_screen_contains("ERASE");
+        let sio_before_format = tn.vm.bus().sio_observations().len();
+
+        tn.send_text(b"F", "TN format density dialog");
+        tn.assert_screen_contains("Select density");
+        tn.send_text(b"D", "TN format confirmation");
+        tn.assert_screen_contains("Format D2:");
+        tn.send_text(b"Y", "TN format completion");
+
+        let format = tn
+            .vm
+            .bus()
+            .sio_observations()
+            .iter()
+            .skip(sio_before_format)
+            .find(|observation| {
+                observation.unit == 2
+                    && matches!(
+                        observation.command,
+                        SIO_COMMAND_FORMAT | SIO_COMMAND_FORMAT_ENHANCED
+                    )
+            })
+            .expect("TN should issue a format request for D2");
+        assert_eq!(format.status, SIO_STATUS_SUCCESS);
+        assert!(native_file_open_status(&mut tn.vm, b"D2:ERASE.TXT\x9B") >= 0x80);
+        assert!(tn.vm.disk_is_dirty(2));
+    }
+
+    #[test]
+    fn tn_standalone_launches_an_actionc_generated_executable() {
+        const MARKER: u16 = 0x4FFF;
+        let mut tn = TnHarness::boot_bundled(&[(1, DiskWritePolicy::CopyOnWrite)]);
+        native_write_file(&mut tn.vm, b"D1:ALAUNCH.COM\x9B", TN_LAUNCH_MARKER_OBJECT);
+        tn.launch();
+        tn.assert_screen_contains("ALAUNCH");
+        tn.vm.bus_mut().ram_mut().write(MARKER, 0);
+
+        queue_keyboard_text(&mut tn.vm, b"\x9B");
+        tn.wait_for_byte(MARKER, 0xA5, "actionc-generated TN executable marker");
+        assert!(tn.vm.bus().sio_observations().iter().all(|observation| {
+            observation.handled
+                && matches!(
+                    observation.status,
+                    SIO_STATUS_SUCCESS | SIO_STATUS_DEVICE_TIMEOUT
+                )
+        }));
+    }
+
+    #[test]
+    fn tn_standalone_reports_a_read_only_destination() {
+        let mut tn = TnHarness::boot_bundled(&[
+            (1, DiskWritePolicy::CopyOnWrite),
+            (2, DiskWritePolicy::ReadOnly),
+        ]);
+        native_write_file(&mut tn.vm, b"D1:AERROR.TXT\x9B", b"READ ONLY ERROR");
+        tn.launch();
+        tn.switch_panel(1);
+        tn.select_drive(2);
+        tn.switch_panel(0);
+        let sio_before_copy = tn.vm.bus().sio_observations().len();
+
+        tn.send_key(TN_COPY_KEY, "TN read-only destination error");
+        tn.assert_screen_contains("I/O error");
+        assert!(
+            tn.vm
+                .bus()
+                .sio_observations()
+                .iter()
+                .skip(sio_before_copy)
+                .any(|observation| {
+                    observation.unit == 2
+                        && matches!(
+                            observation.command,
+                            SIO_COMMAND_PUT_SECTOR | SIO_COMMAND_WRITE_SECTOR
+                        )
+                        && observation.status == SIO_STATUS_DEVICE_ERROR
+                })
+        );
+    }
+
+    #[test]
+    fn tn_standalone_reports_a_disk_full_destination() {
+        let mut tn = TnHarness::boot_bundled(&[
+            (1, DiskWritePolicy::CopyOnWrite),
+            (2, DiskWritePolicy::CopyOnWrite),
+        ]);
+        native_write_file(&mut tn.vm, b"D2:FILLER.BIN\x9B", &vec![0x55; 155_000]);
+        native_write_file(&mut tn.vm, b"D1:AFULL.TXT\x9B", &vec![0xA5; 20_000]);
+        tn.launch();
+        tn.switch_panel(1);
+        tn.select_drive(2);
+        tn.switch_panel(0);
+
+        tn.send_key(TN_COPY_KEY, "TN disk-full destination error");
+        tn.assert_screen_contains("I/O error");
     }
 
     #[test]

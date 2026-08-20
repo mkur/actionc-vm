@@ -40,3 +40,38 @@ SHA-256 2baaf8e1dd6810349f0366fd8b0b37632a149d5ba58ac201b1e124b7bc3a2578
 
 TOMS Navigator and the linked standalone Action! runtime are distributed under
 GPL-3.0-or-later, matching this repository's `LICENSE`.
+
+## Binary-launch marker
+
+`tn-launch-marker.com` is generated from the adjacent
+`tn-launch-marker.act`. TN copies the object to a MyDOS disk and launches it;
+successful execution writes `$A5` to `$4FFF` and enters a stable loop.
+
+The fixture was built with `actionc` commit:
+
+```text
+241ad760ddff2b36cbf28e96bd157bbccb25ce10
+```
+
+Build command, run from the `actionc` repository root:
+
+```sh
+actionc --profile modern --backend mir6502 --runtime standalone \
+  --output ../actionc-vm/tests/fixtures/tn-launch-marker.com \
+  ../actionc-vm/tests/fixtures/tn-launch-marker.act
+```
+
+The compiler identified itself as:
+
+```text
+actionc 0.1.0 (vfs=165b51d70f9829b8eff5c90138eb091b10ca7d7afeffdda1544e54ac33ce6231)
+```
+
+Fixture checksums:
+
+```text
+tn-launch-marker.act
+  SHA-256 73d32316d950bf17d9781e813e63cda6846775d24302c92a659838402e61c751
+tn-launch-marker.com
+  SHA-256 3e57ee98f65f06bec2f96e8bc683df6a1871d73cdd8c47500bf292176de06a94
+```

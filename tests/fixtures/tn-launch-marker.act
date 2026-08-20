@@ -1,0 +1,10 @@
+; Executed by the TN binary-launch integration test.  A successful MyDOS
+; load-and-run writes a marker outside TN and then remains in a stable loop.
+
+BYTE marker=$4FFF
+
+PROC Main()
+  marker=$A5
+  DO
+  OD
+RETURN
